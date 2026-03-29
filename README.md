@@ -27,6 +27,22 @@ darbotdb extends ArangoDB with powerful modern integrations and platform support
 - **Arm64 Architecture**: Complete support for ARM-based systems including Apple Silicon
 - **Enhanced Docker Support**: Optimized containerization with improved Docker images
 - **Complete FastAPI Integration**: Full integration for all tool calls, queries, and functions
+- **58-Tool MCP Server**: Complete Model Context Protocol coverage of the entire API — adaptive cards, memory recall, graph traversal, 3DKG spatial queries, sessions, manifests, AG-UI conversations, and Txt2KG knowledge extraction with full Zod 4 schemas
+- **3D Knowledge Graph (3DKG)**: Spatial graph engine with nearest-neighbor, bounding-box, shortest-path, and layout algorithms
+- **Txt2KG Pipeline**: LLM-powered triple extraction, RAG search, and bidirectional bridge between micro DBs and knowledge graphs
+- **AG-UI Protocol**: Agent-to-UI conversation threading with replay and ingestion
+
+### MCP Server
+
+The DarbotDB MCP server exposes **58 tools** for AI agents and MCP-compatible clients:
+
+```bash
+cd ddb/mcp
+npm run serve        # HTTP on port 3001
+npm run serve:stdio  # stdio for Claude Desktop, VS Code, etc.
+```
+
+Four tools include interactive HTML UIs (card viewer, memory dashboard, graph explorer, 3DKG scene viewer). All schemas are fully typed with Zod 4. See [`ddb/mcp/README.md`](ddb/mcp/README.md) for the complete tool reference.
 
 Getting Started with darbotdb
 ------------------------------

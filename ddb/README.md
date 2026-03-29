@@ -117,49 +117,103 @@ Shared graph state now includes:
 
 ## API surface
 
-### Existing endpoints
+### Core endpoints
 
-- `GET /health` -- basic round-trip to the DarbotDB graph engine
-- `POST /v1/aql` -- run an AQL query with optional bind vars
-- `POST /v1/db/{db}/collections` -- create a document/edge collection
-- `POST /v1/cards` -- build an adaptive card, optionally persisting to a micro DB
-- `POST /v1/memory/recall` -- recall cards, triples, and graph patterns
-- `POST /v1/triad/process` -- process triad events and capture provenance
-- `POST /v1/graph/traverse` -- graph traversal for cards, agents, and manifests
+- `GET /health` — basic round-trip to the DarbotDB graph engine
+- `POST /v1/aql` — run an AQL query with optional bind vars and batch size
+- `POST /v1/db/{db}/collections` — create a document/edge collection
+- `POST /v1/cards` — build an adaptive card, optionally persisting to a micro DB
+- `POST /v1/cards/search` — search cards by query, zone, or type
+- `POST /v1/cards/compose` — compose multiple cards into a composite
+- `GET /v1/cards/{db_id}/{card_id}/tree` — card hierarchy traversal
+- `POST /v1/memory/recall` — recall cards, triples, and graph patterns
+- `POST /v1/memory/store` — store a memory card
+- `GET|POST /v1/memory/zones` — list or create memory zones
+- `POST /v1/triad/process` — process triad events and capture provenance
+- `POST /v1/graph/traverse` — graph traversal for cards, agents, and manifests
+- `POST /v1/graph/link` — create edges between nodes
+- `POST /v1/graph/pattern` — discover patterns
+- `GET /v1/graph/agents` — list agents
+- `GET /v1/graph/manifests` — list manifests with optional filters
+- `GET /v1/graph/zones/{zone_name}` — zone contents
 
-### New 3DKG endpoints
+### Session & manifest endpoints
 
-- `GET /v1/sessions` -- list micro sessions
-- `POST /v1/sessions` -- create or open a session context
-- `GET /v1/sessions/{db_id}` -- session status and counts
-- `GET /v1/manifests` -- list manifests
-- `POST /v1/manifests/project` -- build a manifest from a micro DB
-- `POST /v1/manifests` -- persist a manifest
-- `GET /v1/manifests/{manifest_id}` -- load a manifest
-- `POST /v1/scene/materialize` -- project a micro DB into a scene
-- `GET /v1/scene/{manifest_id}` -- fetch a scene by manifest ID
+- `GET /v1/sessions` — list micro sessions
+- `POST /v1/sessions` — create or open a session context (scope: agent, session, zone, memory)
+- `GET /v1/sessions/{db_id}` — session status and counts
+- `GET /v1/manifests` — list manifests
+- `POST /v1/manifests/project` — build a manifest from a micro DB
+- `POST /v1/manifests` — persist a manifest
+- `GET /v1/manifests/{manifest_id}` — load a manifest
+- `POST /v1/scene/materialize` — project a micro DB into a scene
+- `GET /v1/scene/{manifest_id}` — fetch a scene by manifest ID
 
-## MCP and UI
+### Micro DB endpoints
 
-`mcp/server.ts` exposes:
+- `POST /v1/micro/create` — create a portable micro database
+- `GET /v1/micro/list` — list all micro databases
+- `GET /v1/micro/{db_id}/status` — micro DB status
+- `POST /v1/micro/{db_id}/query` — run SQL against a micro DB
+- `DELETE /v1/micro/{db_id}` — delete a micro DB
 
-- `ddb-card-render`
-- `ddb-memory-recall`
-- `ddb-graph-explore`
-- `ddb-3dkg-render`
-- `ddb-session-list`
-- `ddb-manifest-project`
-- `ddb-micro-create`
-- `ddb-triad-process`
+### 3DKG spatial endpoints
 
-UI resources:
+- `GET /v1/3dkg/snapshot` — spatial graph snapshot
+- `GET /v1/3dkg/node/{node_id}` — get a node
+- `POST /v1/3dkg/nearest` — nearest neighbors in 3D space
+- `POST /v1/3dkg/bbox` — bounding box query
+- `POST /v1/3dkg/path` — shortest path
+- `POST /v1/3dkg/layout` — recompute layout
+- `POST /v1/3dkg/sync` — sync spatial index with ArangoDB
+- `GET /v1/3dkg/stats` — graph statistics
 
-- `mcp/resources/card-viewer.html`
-- `mcp/resources/memory-dashboard.html`
-- `mcp/resources/graph-explorer.html`
-- `mcp/resources/3dkg-viewer.html`
+### AG-UI endpoints
 
-The existing card and memory views remain available. The new `3dkg-viewer.html` is the manifest-driven scene surface.
+- `POST /v1/agui/run` — run an AG-UI agent conversation
+- `POST /v1/agui/replay/{conversation_id}` — replay a conversation
+- `POST /v1/agui/ingest` — ingest messages into a thread
+
+### Txt2KG endpoints
+
+- `GET /v1/txt2kg/status` — pipeline status
+- `GET /v1/txt2kg/models` — available LLM models
+- `GET /v1/txt2kg/stats` — graph statistics
+- `POST /v1/txt2kg/extract` — extract triples from text
+- `POST /v1/txt2kg/store` — store triples
+- `POST /v1/txt2kg/rag` — RAG search
+- `POST /v1/txt2kg/rag/answer` — RAG-generated answer
+- `POST /v1/txt2kg/bridge/push` — push cards to Txt2KG graph
+- `POST /v1/txt2kg/bridge/pull` — pull triples into a micro DB
+- `POST /v1/txt2kg/bridge/recall` — recall from bridge
+- `POST /v1/txt2kg/bridge/thoughts` — bridge thoughts to KG
+
+**59 endpoints across 56 paths.** Full OpenAPI spec at `GET /docs` or `GET /openapi.json`.
+
+## MCP server
+
+`mcp/server.ts` exposes **58 tools** covering the entire API surface. See [mcp/README.md](mcp/README.md) for the complete tool reference.
+
+### Interactive UI apps (4 tools with ext-apps)
+
+- `ddb-card-render` → `card-viewer.html`
+- `ddb-memory-recall` → `memory-dashboard.html`
+- `ddb-graph-explore` → `graph-explorer.html`
+- `ddb-3dkg-render` → `3dkg-viewer.html`
+
+### API-only tools (54 tools)
+
+Organized by domain: Micro DB (5), Cards (3), Memory (4), Graph (6), Triad (4), Sessions (3), Manifests (4), Scene (1), 3DKG Spatial (8), AQL & Collections (2), AG-UI (3), Txt2KG (7), Txt2KG Bridge (4).
+
+All tools use complete Zod 4 schemas with proper types — no JSON-stringified workarounds. Enums, arrays, records, defaults, and nullable optionals match the OpenAPI spec exactly.
+
+```bash
+# Start in HTTP mode (port 3001)
+npm run serve
+
+# Start in stdio mode (for MCP clients)
+npm run serve:stdio
+```
 
 ## Verification
 

@@ -1,6 +1,6 @@
 ## My Environment
 
-* __DarangoDB Version__:        <!-- e.g. 3.9.2 or self-compiled devel branch -->
+* __darbotdb Version__:        <!-- e.g. 3.9.2 or self-compiled devel branch -->
 * __Deployment Mode__:       <!-- Single Server | Leader/Follower | Active Failover | Cluster | DC2DC -->
 * __Deployment Strategy__:   <!-- Manual Start | Docker | Kubernetes -->
 * __Configuration__:               <!-- cluster setup details, notable server settings, etc. -->

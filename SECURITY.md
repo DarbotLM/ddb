@@ -2,11 +2,11 @@
 
 ## Reporting a Vulnerability
 
-Please report (suspected) security vulnerabilities for DarangoDB by opening a security advisory on GitHub:
-**[https://github.com/dayour/DarangoDB/security/advisories/new](https://github.com/dayour/DarangoDB/security/advisories/new)**
+Please report (suspected) security vulnerabilities for darbotdb by opening a security advisory on GitHub:
+**[https://github.com/dayour/darbotdb/security/advisories/new](https://github.com/dayour/darbotdb/security/advisories/new)**
 
 Alternatively, you can report issues at:
-**[https://github.com/dayour/DarangoDB/issues](https://github.com/dayour/DarangoDB/issues)**
+**[https://github.com/dayour/darbotdb/issues](https://github.com/dayour/darbotdb/issues)**
 
 We will review and respond to security reports as quickly as possible.
 

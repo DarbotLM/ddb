@@ -1,7 +1,7 @@
 {
   "name": "@ddb/mcp-server",
-  "version": "0.1.0",
-  "description": "DarbotDB MCP server with interactive Apps for adaptive cards, graph exploration, and memory recall",
+  "version": "0.4.0",
+  "description": "DarbotDB MCP server — 58 tools covering the full darbotdb-api surface with interactive Apps for adaptive cards, graph exploration, memory recall, and 3DKG visualization",
   "type": "module",
   "scripts": {
     "build": "node scripts/build-views.mjs && tsc",
@@ -10,17 +10,18 @@
     "serve:stdio": "npx tsx server.ts --stdio"
   },
   "dependencies": {
-    "@modelcontextprotocol/ext-apps": "^0.1.0",
-    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@modelcontextprotocol/ext-apps": "^1.3.2",
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "cors": "^2.8.5",
     "express": "^5.0.0",
-    "cors": "^2.8.5"
+    "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.0",
+    "@types/express": "^5.0.0",
+    "tsx": "^4.0.0",
     "typescript": "^5.6.0",
     "vite": "^6.0.0",
-    "vite-plugin-singlefile": "^2.0.0",
-    "tsx": "^4.0.0",
-    "@types/express": "^5.0.0",
-    "@types/cors": "^2.8.0"
+    "vite-plugin-singlefile": "^2.0.0"
   }
 }
