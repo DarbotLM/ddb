@@ -1,0 +1,1583 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Andrey Abramov
+/// @author Vasiliy Nabatchikov
+////////////////////////////////////////////////////////////////////////////////
+
+#include "gtest/gtest.h"
+
+#include "velocypack/Iterator.h"
+#include "velocypack/Parser.h"
+
+#include "analysis/analyzers.hpp"
+#include "analysis/token_attributes.hpp"
+
+#include "IResearch/RestHandlerMock.h"
+#include "IResearch/common.h"
+#include "Mocks/LogLevels.h"
+#include "Mocks/Servers.h"
+#include "Mocks/StorageEngineMock.h"
+
+#include "Aql/QueryRegistry.h"
+#include "Auth/UserManagerMock.h"
+#include "Basics/VelocyPackHelper.h"
+#include "GeneralServer/AuthenticationFeature.h"
+#include "IResearch/IResearchAnalyzerFeature.h"
+#include "IResearch/IResearchCommon.h"
+#include "RestHandler/RestAnalyzerHandler.h"
+#include "RestServer/DatabaseFeature.h"
+#ifdef USE_V8
+#include "V8Server/V8DealerFeature.h"
+#endif
+#include "VocBase/LogicalCollection.h"
+#include "VocBase/Methods/Collections.h"
+
+#define ASSERT_DDB_OK(x) \
+  { ASSERT_TRUE(x.ok()) << x.errorMessage(); }
+
+using namespace std::literals::string_literals;
+
+namespace {
+
+class EmptyAnalyzer final : public irs::analysis::TypedAnalyzer<EmptyAnalyzer> {
+ public:
+  static constexpr std::string_view type_name() noexcept {
+    return "rest-analyzer-empty";
+  }
+  EmptyAnalyzer() = default;
+  irs::attribute* get_mutable(irs::type_info::type_id type) noexcept final {
+    if (type == irs::type<irs::frequency>::id()) {
+      return &_attr;
+    }
+
+    return nullptr;
+  }
+  static ptr make(std::string_view) {
+    return std::make_unique<EmptyAnalyzer>();
+  }
+  static bool normalize(std::string_view, std::string& out) {
+    out.resize(VPackSlice::emptyObjectSlice().byteSize());
+    std::memcpy(&out[0], VPackSlice::emptyObjectSlice().begin(), out.size());
+    return true;
+  }
+  bool next() final { return false; }
+  bool reset(std::string_view data) final { return true; }
+
+ private:
+  irs::frequency _attr;
+};
+
+REGISTER_ANALYZER_VPACK(EmptyAnalyzer, EmptyAnalyzer::make,
+                        EmptyAnalyzer::normalize);
+
+}  // namespace
+
+// -----------------------------------------------------------------------------
+// --SECTION--                                                 setup / tear-down
+// -----------------------------------------------------------------------------
+
+class RestAnalyzerHandlerTest
+    : public ::testing::Test,
+      public darbotdb::tests::LogSuppressor<darbotdb::Logger::AUTHENTICATION,
+                                            darbotdb::LogLevel::ERR> {
+ protected:
+  darbotdb::tests::mocks::MockAqlServer server;
+  TRI_vocbase_t& _system_vocbase;
+
+  darbotdb::iresearch::IResearchAnalyzerFeature& analyzers;
+  darbotdb::DatabaseFeature& dbFeature;
+  darbotdb::AuthenticationFeature& authFeature;
+  darbotdb::auth::UserManager* userManager;
+
+  struct ExecContext : public darbotdb::ExecContext {
+    ExecContext()
+        : darbotdb::ExecContext(darbotdb::ExecContext::ConstructorToken{},
+                                darbotdb::ExecContext::Type::Default, "", "",
+                                darbotdb::auth::Level::NONE,
+                                darbotdb::auth::Level::NONE, false) {}
+  };
+  std::shared_ptr<ExecContext> execContext;
+  darbotdb::ExecContextScope execContextScope;  // (execContext);
+  darbotdb::auth::User _user{darbotdb::auth::User::newUser("", "")};
+
+  RestAnalyzerHandlerTest()
+      : server(),
+        _system_vocbase(server.getSystemDatabase()),
+        analyzers(
+            server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>()),
+        dbFeature(server.getFeature<darbotdb::DatabaseFeature>()),
+        authFeature(server.getFeature<darbotdb::AuthenticationFeature>()),
+        userManager(authFeature.userManager()),
+        execContext(std::make_shared<ExecContext>()),
+        execContextScope(execContext) {
+    expectUserManagerCalls();
+    grantOnDb(darbotdb::StaticStrings::SystemDatabase,
+              darbotdb::auth::Level::RW);
+
+    // TODO: This should at the very least happen in the mock
+    // create system vocbase
+    {
+      std::shared_ptr<darbotdb::LogicalCollection> unused;
+      darbotdb::OperationOptions options(darbotdb::ExecContext::current());
+      darbotdb::methods::Collections::createSystem(
+          server.getSystemDatabase(), options,
+          darbotdb::tests::AnalyzerCollectionName, false, unused);
+    }
+    createAnalyzers();
+
+    grantOnDb(darbotdb::StaticStrings::SystemDatabase,
+              darbotdb::auth::Level::NONE);
+  }
+
+  // Creates the analyzers that are used in all the tests
+  void createAnalyzers() {
+    darbotdb::Result res;
+    std::string name;
+    darbotdb::iresearch::IResearchAnalyzerFeature::EmplaceResult result;
+
+    name = darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1";
+
+    ASSERT_DDB_OK(
+        analyzers.emplace(result, name, "identity"s,
+                          VPackParser::fromJson("{\"args\":\"abc\"}"s)->slice(),
+                          darbotdb::transaction::OperationOriginTestCase{}));
+
+    name = darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer2";
+    ASSERT_DDB_OK(
+        analyzers.emplace(result, name, "identity"s,
+                          VPackParser::fromJson("{\"args\":\"abc\"}"s)->slice(),
+                          darbotdb::transaction::OperationOriginTestCase{}));
+
+    name = darbotdb::StaticStrings::SystemDatabase + "::emptyAnalyzer"s;
+    ASSERT_DDB_OK(analyzers.emplace(
+        result, name, "rest-analyzer-empty"s,
+        VPackParser::fromJson("{\"args\":\"en\"}"s)->slice(),
+        darbotdb::transaction::OperationOriginTestCase{},
+        darbotdb::iresearch::Features(irs::IndexFeatures::FREQ)));
+  };
+
+  // Creates a new database
+  void createDatabase(std::string const& name) {
+    darbotdb::iresearch::IResearchAnalyzerFeature::EmplaceResult result;
+    auto const databases = darbotdb::velocypack::Parser::fromJson(
+        std::string("[ { \"name\": \"" + name + "\" } ]"));
+    ASSERT_EQ(TRI_ERROR_NO_ERROR, dbFeature.loadDatabases(databases->slice()));
+
+    grantOnDb(
+        {{name, darbotdb::auth::Level::RW},
+         {darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW}});
+
+    std::shared_ptr<darbotdb::LogicalCollection> ignored;
+    darbotdb::OperationOptions options(darbotdb::ExecContext::current());
+    auto vocbase = dbFeature.useDatabase(name);
+    darbotdb::Result res = darbotdb::methods::Collections::createSystem(
+        *vocbase, options, darbotdb::tests::AnalyzerCollectionName, false,
+        ignored);
+
+    ASSERT_TRUE(res.ok());
+
+    ASSERT_DDB_OK(analyzers.emplace(
+        result, name + "::testAnalyzer1", "identity"s, VPackSlice::noneSlice(),
+        darbotdb::transaction::OperationOriginTestCase{}));
+    ASSERT_DDB_OK(analyzers.emplace(
+        result, name + "::testAnalyzer2", "identity"s, VPackSlice::noneSlice(),
+        darbotdb::transaction::OperationOriginTestCase{}));
+  }
+
+  // Grant permissions on one DB
+  // NOTE that permissions are always overwritten.
+  void grantOnDb(std::string const& dbName,
+                 darbotdb::auth::Level const& level) {
+    _user = darbotdb::auth::User::newUser("", "");
+
+    // for system collections User::collectionAuthLevel(...) returns database
+    // auth::Level
+    _user.grantDatabase(dbName, level);
+  }
+
+  // Grant permissions on multiple DBs
+  // NOTE that permissions are always overwritten.
+  void grantOnDb(
+      std::vector<std::pair<std::string const&,
+                            darbotdb::auth::Level const&>> const& grants) {
+    darbotdb::auth::UserMap userMap;
+    _user = darbotdb::auth::User::newUser("", "");
+
+    for (auto const& [dbName, level] : grants) {
+      _user.grantDatabase(dbName, level);
+    }
+  }
+
+  void expectUserManagerCalls() {
+    using namespace darbotdb;
+    auto* authFeature = AuthenticationFeature::instance();
+    auto* userManager = authFeature->userManager();
+    auto* um =
+        dynamic_cast<testing::StrictMock<auth::UserManagerMock>*>(userManager);
+    EXPECT_NE(um, nullptr);
+
+    using namespace ::testing;
+    EXPECT_CALL(*um, databaseAuthLevel)
+        .Times(AtLeast(1))
+        .WillRepeatedly(WithArgs<0, 1>(
+            [this](std::string const& username, std::string const& dbname) {
+              EXPECT_EQ(username, _user.username());
+              return _user.databaseAuthLevel(dbname);
+            }));
+    EXPECT_CALL(*um, collectionAuthLevel)
+        .Times(AtLeast(1))
+        .WillRepeatedly(WithArgs<0, 1, 2>([this](std::string const& username,
+                                                 std::string const& dbname,
+                                                 std::string_view const cname) {
+          EXPECT_EQ(username, _user.username());
+          return _user.collectionAuthLevel(dbname, cname);
+        }));
+    EXPECT_CALL(*um, updateUser)
+        .Times(AtLeast(1))
+        .WillRepeatedly([this](std::string const& username,
+                               auth::UserManager::UserCallback&& cb,
+                               auth::UserManager::RetryOnConflict const) {
+          EXPECT_EQ(username, _user.username());
+          auto const r = cb(_user);
+          EXPECT_TRUE(r.ok());
+          return Result{};
+        });
+  }
+};
+
+// -----------------------------------------------------------------------------
+// --SECTION--                                                        test suite
+// -----------------------------------------------------------------------------
+
+// invalid params (non-object body)
+TEST_F(RestAnalyzerHandlerTest, test_create_non_object_body) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::POST);
+  request._payload.openArray();
+  request._payload.close();
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::BAD, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::BAD) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_BAD_PARAMETER ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_create_no_name) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::POST);
+  request._payload.openObject();
+  request._payload.add("type", darbotdb::velocypack::Value("identity"));
+  request._payload.add(
+      "properties",
+      darbotdb::velocypack::Value(darbotdb::velocypack::ValueType::Null));
+  request._payload.close();
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::BAD, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::BAD) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_BAD_PARAMETER ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_create_no_permission) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::POST);
+  request._payload.openObject();
+  request._payload.add("name", VPackValue("unknownVocbase::testAnalyzer"));
+  request._payload.add("type", VPackValue("identity"));
+  request._payload.add("properties",
+                       VPackValue(darbotdb::velocypack::ValueType::Null));
+  request._payload.close();
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::FORBIDDEN, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::FORBIDDEN) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_FORBIDDEN ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_create_invalid_symbols) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::POST);
+  request._payload.openObject();
+  request._payload.add(
+      "name",
+      VPackValue(darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer"));
+  request._payload.add("type", VPackValue("identity"));
+  request._payload.add("properties",
+                       VPackValue(darbotdb::velocypack::ValueType::Null));
+  request._payload.close();
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::BAD, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::BAD) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_BAD_PARAMETER ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+// TODO: is this the same test as above?
+TEST_F(RestAnalyzerHandlerTest, test_create_invalid_symbols_2) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::POST);
+  request._payload.openObject();
+  request._payload.add("name", VPackValue("::testAnalyzer"));
+  request._payload.add("type", VPackValue("identity"));
+  request._payload.add("properties",
+                       VPackValue(darbotdb::velocypack::ValueType::Null));
+  request._payload.close();
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::BAD, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::BAD) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_BAD_PARAMETER ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_create_name_collision) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::POST);
+  request._payload.openObject();
+  request._payload.add("name", darbotdb::velocypack::Value("emptyAnalyzer"));
+  request._payload.add("type",
+                       darbotdb::velocypack::Value("rest-analyzer-empty"));
+  request._payload.add("properties",
+                       darbotdb::velocypack::Value("{\"args\":\"abc\"}"));
+  request._payload.close();
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::BAD, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::BAD) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_BAD_PARAMETER ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_create_duplicate_matching) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::POST);
+  request._payload.openObject();
+  request._payload.add("name", VPackValue("testAnalyzer1"));
+  request._payload.add("type", VPackValue("identity"));
+  request._payload.add("properties", VPackSlice::noneSlice());
+  request._payload.close();
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE((slice.hasKey("name") && slice.get("name").isString() &&
+               darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1" ==
+                   slice.get("name").copyString()));
+  EXPECT_TRUE(slice.hasKey("type") && slice.get("type").isString());
+  EXPECT_TRUE(slice.hasKey("properties") && slice.get("properties").isObject());
+  EXPECT_TRUE(slice.hasKey("features") && slice.get("features").isArray());
+  auto analyzer =
+      analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                    darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                    darbotdb::transaction::OperationOriginTestCase{});
+  EXPECT_NE(nullptr, analyzer);
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_create_not_authorized) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::POST);
+  request._payload.openObject();
+  request._payload.add("name", VPackValue("testAnalyzer2"));
+  request._payload.add("type", VPackValue("identity"));
+  request._payload.add("properties",
+                       darbotdb::velocypack::Value("{\"args\":\"abc\"}"));
+  request._payload.close();
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::FORBIDDEN, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::FORBIDDEN) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_FORBIDDEN ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_create_success) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::POST);
+  request._payload.openObject();
+  request._payload.add("name", darbotdb::velocypack::Value("testAnalyzer3"));
+  request._payload.add("type", darbotdb::velocypack::Value("identity"));
+  request._payload.add("properties",
+                       darbotdb::velocypack::Value("{\"args\":\"abc\"}"));
+  request._payload.close();
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::CREATED, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE((slice.hasKey("name") && slice.get("name").isString() &&
+               darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer3" ==
+                   slice.get("name").copyString()));
+  EXPECT_TRUE(slice.hasKey("type") && slice.get("type").isString());
+  EXPECT_TRUE(slice.hasKey("properties") && slice.get("properties").isObject());
+  EXPECT_TRUE(slice.hasKey("features") && slice.get("features").isArray());
+  auto analyzer =
+      analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                    darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                    darbotdb::transaction::OperationOriginTestCase{});
+  EXPECT_NE(nullptr, analyzer);
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_get_static_known) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+  request.addSuffix("identity");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::OK) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Error) &&
+       slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+       false == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE((slice.hasKey("name") && slice.get("name").isString() &&
+               std::string("identity") == slice.get("name").copyString()));
+  EXPECT_TRUE(slice.hasKey("type") && slice.get("type").isString());
+  EXPECT_TRUE(slice.hasKey("properties") && slice.get("properties").isObject());
+  EXPECT_TRUE(slice.hasKey("features") && slice.get("features").isArray());
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_get_static_unknown) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  TRI_ASSERT(requestPtr != nullptr);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  TRI_ASSERT(responcePtr != nullptr);
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+  request.addSuffix("unknown");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::NOT_FOUND, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::NOT_FOUND) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_DDB_DOCUMENT_NOT_FOUND ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_get_known) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+  request.addSuffix(darbotdb::StaticStrings::SystemDatabase +
+                    "::testAnalyzer1");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::OK) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Error) &&
+       slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+       false == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE((slice.hasKey("name") && slice.get("name").isString() &&
+               darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1" ==
+                   slice.get("name").copyString()));
+  EXPECT_TRUE(slice.hasKey("type") && slice.get("type").isString());
+  EXPECT_TRUE(slice.hasKey("properties") && slice.get("properties").isObject());
+  EXPECT_TRUE(slice.hasKey("features") && slice.get("features").isArray());
+}
+
+// TODO: This test needs some love (i.e. probably splitting)
+TEST_F(RestAnalyzerHandlerTest, test_get_custom) {
+  createDatabase("FooDb"s);
+  createDatabase("FooDb2"s);
+
+  grantOnDb(
+      {{"FooDb"s, darbotdb::auth::Level::RW},
+       {"FooDb2"s, darbotdb::auth::Level::RW},
+       {darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO}});
+
+  {
+    auto vocbase = dbFeature.useDatabase("FooDb2");
+    auto requestPtr = std::make_unique<GeneralRequestMock>(*vocbase);
+    auto& request = *requestPtr;
+    auto responcePtr = std::make_unique<GeneralResponseMock>();
+    auto& responce = *responcePtr;
+    darbotdb::iresearch::RestAnalyzerHandler handler(
+        server.server(), requestPtr.release(), responcePtr.release());
+    request.setRequestType(darbotdb::rest::RequestType::GET);
+    request.addSuffix("FooDb::testAnalyzer1");
+
+    auto status = handler.execute();
+    EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+    // user has access but analyzer should not be visible
+    EXPECT_EQ(darbotdb::rest::ResponseCode::FORBIDDEN, responce.responseCode());
+  }
+  {
+    auto vocbase = dbFeature.useDatabase("FooDb2");
+    auto requestPtr = std::make_unique<GeneralRequestMock>(*vocbase);
+    auto& request = *requestPtr;
+    auto responcePtr = std::make_unique<GeneralResponseMock>();
+    auto& responce = *responcePtr;
+    darbotdb::iresearch::RestAnalyzerHandler handler(
+        server.server(), requestPtr.release(), responcePtr.release());
+    request.setRequestType(darbotdb::rest::RequestType::GET);
+    request.addSuffix(darbotdb::StaticStrings::SystemDatabase +
+                      "::testAnalyzer1");
+    auto status = handler.execute();
+    EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+    // system should be visible
+    EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  }
+  {
+    auto vocbase = dbFeature.useDatabase("FooDb2");
+    auto requestPtr = std::make_unique<GeneralRequestMock>(*vocbase);
+    auto& request = *requestPtr;
+    auto responcePtr = std::make_unique<GeneralResponseMock>();
+    auto& responce = *responcePtr;
+    darbotdb::iresearch::RestAnalyzerHandler handler(
+        server.server(), requestPtr.release(), responcePtr.release());
+    request.setRequestType(darbotdb::rest::RequestType::GET);
+    request.addSuffix("::testAnalyzer1");
+    auto status = handler.execute();
+    EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+    // system should be visible
+    EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  }
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_get_known_not_authorized) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase,
+            darbotdb::auth::Level::NONE);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+  request.addSuffix("testAnalyzer1");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::FORBIDDEN, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::FORBIDDEN) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_FORBIDDEN ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_get_unknown_authorized) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+  request.addSuffix("unknown");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::NOT_FOUND, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::NOT_FOUND) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_DDB_DOCUMENT_NOT_FOUND ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_get_unknown_not_authorized) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase,
+            darbotdb::auth::Level::NONE);
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+  request.addSuffix("unknown");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::FORBIDDEN, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::FORBIDDEN) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_FORBIDDEN ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest,
+       test_get_unknown_analyzer_unknown_vocbase_authorized) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO);
+
+  // TODO
+  TRI_vocbase_t vocbase(unknownDBInfo(server.server()));
+  auto requestPtr = std::make_unique<GeneralRequestMock>(vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+  request.addSuffix("unknown");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::NOT_FOUND, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::NOT_FOUND) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_DDB_DOCUMENT_NOT_FOUND ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest,
+       test_get_unknown_analyzer_unknown_vocbase_not_authorized) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase,
+            darbotdb::auth::Level::NONE);
+
+  // TODO
+  TRI_vocbase_t vocbase(unknownDBInfo(server.server()));
+  auto requestPtr = std::make_unique<GeneralRequestMock>(vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+  request.addSuffix("unknown");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::FORBIDDEN, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::FORBIDDEN) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_FORBIDDEN ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_list_system_database_authorized) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+
+  std::set<std::string> expected = {
+      "identity",
+      "text_de",
+      "text_en",
+      "text_es",
+      "text_fi",
+      "text_fr",
+      "text_it",
+      "text_nl",
+      "text_no",
+      "text_pt",
+      "text_ru",
+      "text_sv",
+      "text_zh",
+      darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+      darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer2",
+      darbotdb::StaticStrings::SystemDatabase + "::emptyAnalyzer",
+  };
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::OK) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Error) &&
+       slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+       false == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+
+  for (darbotdb::velocypack::ArrayIterator itr(slice.get("result"));
+       itr.valid(); ++itr) {
+    auto subSlice = *itr;
+    EXPECT_TRUE(subSlice.isObject());
+    EXPECT_TRUE(subSlice.hasKey("name") && subSlice.get("name").isString());
+    EXPECT_TRUE(subSlice.hasKey("type") && subSlice.get("type").isString());
+    EXPECT_TRUE((subSlice.hasKey("properties") &&
+                 (subSlice.get("properties").isObject() ||
+                  subSlice.get("properties").isNull())));
+    EXPECT_TRUE(subSlice.hasKey("features") &&
+                subSlice.get("features").isArray());
+    EXPECT_EQ(1, expected.erase(subSlice.get("name").copyString()));
+  }
+
+  EXPECT_TRUE(expected.empty());
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_list_system_database_not_authorized) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase,
+            darbotdb::auth::Level::NONE);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+
+  std::set<std::string> expected = {
+      "identity", "text_de", "text_en", "text_es", "text_fi",
+      "text_fr",  "text_it", "text_nl", "text_no", "text_pt",
+      "text_ru",  "text_sv", "text_zh",
+  };
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::OK) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Error) &&
+       slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+       false == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE((slice.hasKey("result") && slice.get("result").isArray() &&
+               expected.size() == slice.get("result").length()));
+
+  for (darbotdb::velocypack::ArrayIterator itr(slice.get("result"));
+       itr.valid(); ++itr) {
+    auto subSlice = *itr;
+    EXPECT_TRUE(subSlice.isObject());
+    EXPECT_TRUE(subSlice.hasKey("name") && subSlice.get("name").isString());
+    EXPECT_TRUE(subSlice.hasKey("type") && subSlice.get("type").isString());
+    EXPECT_TRUE((subSlice.hasKey("properties") &&
+                 (subSlice.get("properties").isObject() ||
+                  subSlice.get("properties").isNull())));
+    EXPECT_TRUE(subSlice.hasKey("features") &&
+                subSlice.get("features").isArray());
+    EXPECT_EQ(1, expected.erase(subSlice.get("name").copyString()));
+  }
+
+  EXPECT_TRUE(expected.empty());
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_list_non_system_database_authorized) {
+  createDatabase("testVocbase"s);
+
+  darbotdb::auth::UserMap userMap;
+
+  grantOnDb(
+      {{"testVocbase"s, darbotdb::auth::Level::RW},
+       {darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO}});
+
+  auto vocbase = dbFeature.useDatabase("testVocbase");
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(*vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+  grantOnDb(
+      {{"testVocbase"s, darbotdb::auth::Level::RO},
+       {darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO}});
+  std::set<std::string> expected = {
+      "identity",
+      "text_de",
+      "text_en",
+      "text_es",
+      "text_fi",
+      "text_fr",
+      "text_it",
+      "text_nl",
+      "text_no",
+      "text_pt",
+      "text_ru",
+      "text_sv",
+      "text_zh",
+      "testVocbase::testAnalyzer1",
+      "testVocbase::testAnalyzer2",
+      darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+      darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer2",
+      darbotdb::StaticStrings::SystemDatabase + "::emptyAnalyzer",
+  };
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::OK) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Error) &&
+       slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+       false == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE((slice.hasKey("result") && slice.get("result").isArray() &&
+               expected.size() == slice.get("result").length()));
+
+  for (darbotdb::velocypack::ArrayIterator itr(slice.get("result"));
+       itr.valid(); ++itr) {
+    auto subSlice = *itr;
+    EXPECT_TRUE(subSlice.isObject());
+    EXPECT_TRUE(subSlice.hasKey("name") && subSlice.get("name").isString());
+    EXPECT_TRUE(subSlice.hasKey("type") && subSlice.get("type").isString());
+    EXPECT_TRUE((subSlice.hasKey("properties") &&
+                 (subSlice.get("properties").isObject() ||
+                  subSlice.get("properties").isNull())));
+    EXPECT_TRUE(subSlice.hasKey("features") &&
+                subSlice.get("features").isArray());
+    EXPECT_EQ(1, expected.erase(subSlice.get("name").copyString()));
+  }
+
+  EXPECT_TRUE(expected.empty());
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_list_non_system_database_not_authorized) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  createDatabase("testVocbase"s);
+
+  auto vocbase = dbFeature.useDatabase("testVocbase");
+  auto requestPtr = std::make_unique<GeneralRequestMock>(*vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+
+  grantOnDb(
+      {{"testVocbase"s, darbotdb::auth::Level::NONE},
+       {darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO}});
+
+  std::set<std::string> expected = {
+      "identity",
+      "text_de",
+      "text_en",
+      "text_es",
+      "text_fi",
+      "text_fr",
+      "text_it",
+      "text_nl",
+      "text_no",
+      "text_pt",
+      "text_ru",
+      "text_sv",
+      "text_zh",
+      darbotdb::StaticStrings::SystemDatabase + "::emptyAnalyzer",
+      darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+      darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer2",
+  };
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::OK) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Error) &&
+       slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+       false == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE((slice.hasKey("result") && slice.get("result").isArray() &&
+               expected.size() == slice.get("result").length()));
+
+  for (darbotdb::velocypack::ArrayIterator itr(slice.get("result"));
+       itr.valid(); ++itr) {
+    auto subSlice = *itr;
+    EXPECT_TRUE(subSlice.isObject());
+    EXPECT_TRUE(subSlice.hasKey("name") && subSlice.get("name").isString());
+    EXPECT_TRUE(subSlice.hasKey("type") && subSlice.get("type").isString());
+    EXPECT_TRUE((subSlice.hasKey("properties") &&
+                 (subSlice.get("properties").isObject() ||
+                  subSlice.get("properties").isNull())));
+    EXPECT_TRUE(subSlice.hasKey("features") &&
+                subSlice.get("features").isArray());
+    EXPECT_EQ(1, expected.erase(subSlice.get("name").copyString()));
+  }
+
+  EXPECT_TRUE(expected.empty());
+}
+
+TEST_F(RestAnalyzerHandlerTest,
+       test_list_non_system_database_system_not_authorized) {
+  createDatabase("testVocbase"s);
+
+  auto vocbase = dbFeature.useDatabase("testVocbase");
+  auto requestPtr = std::make_unique<GeneralRequestMock>(*vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+
+  grantOnDb(
+      {{"testVocbase"s, darbotdb::auth::Level::RO},
+       {darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::NONE}});
+
+  std::set<std::string> expected = {
+      "identity",
+      "text_de",
+      "text_en",
+      "text_es",
+      "text_fi",
+      "text_fr",
+      "text_it",
+      "text_nl",
+      "text_no",
+      "text_pt",
+      "text_ru",
+      "text_sv",
+      "text_zh",
+      "testVocbase::testAnalyzer1",
+      "testVocbase::testAnalyzer2",
+  };
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::OK) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Error) &&
+       slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+       false == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE((slice.hasKey("result") && slice.get("result").isArray() &&
+               expected.size() == slice.get("result").length()));
+
+  for (darbotdb::velocypack::ArrayIterator itr(slice.get("result"));
+       itr.valid(); ++itr) {
+    auto subSlice = *itr;
+    EXPECT_TRUE(subSlice.isObject());
+    EXPECT_TRUE(subSlice.hasKey("name") && subSlice.get("name").isString());
+    EXPECT_TRUE(subSlice.hasKey("type") && subSlice.get("type").isString());
+    EXPECT_TRUE((subSlice.hasKey("properties") &&
+                 (subSlice.get("properties").isObject() ||
+                  subSlice.get("properties").isNull())));
+    EXPECT_TRUE(subSlice.hasKey("features") &&
+                subSlice.get("features").isArray());
+    EXPECT_EQ(1, expected.erase(subSlice.get("name").copyString()));
+  }
+  EXPECT_TRUE(expected.empty());
+}
+
+TEST_F(RestAnalyzerHandlerTest,
+       test_list_non_system_database_system_not_authorized_not_authorized) {
+  createDatabase("testVocbase"s);
+
+  auto vocbase = dbFeature.useDatabase("testVocbase");
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(*vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::GET);
+
+  grantOnDb(
+      {{darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::NONE},
+       {"testVocbase"s, darbotdb::auth::Level::NONE}});
+
+  std::set<std::string> expected = {
+      "identity", "text_de", "text_en", "text_es", "text_fi",
+      "text_fr",  "text_it", "text_nl", "text_no", "text_pt",
+      "text_ru",  "text_sv", "text_zh",
+  };
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::OK) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Error) &&
+       slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+       false == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE((slice.hasKey("result") && slice.get("result").isArray() &&
+               expected.size() == slice.get("result").length()));
+
+  for (darbotdb::velocypack::ArrayIterator itr(slice.get("result"));
+       itr.valid(); ++itr) {
+    auto subSlice = *itr;
+    EXPECT_TRUE(subSlice.isObject());
+    EXPECT_TRUE(subSlice.hasKey("name") && subSlice.get("name").isString());
+    EXPECT_TRUE(subSlice.hasKey("type") && subSlice.get("type").isString());
+    EXPECT_TRUE((subSlice.hasKey("properties") &&
+                 (subSlice.get("properties").isObject() ||
+                  subSlice.get("properties").isNull())));
+    EXPECT_TRUE(subSlice.hasKey("features") &&
+                subSlice.get("features").isArray());
+    EXPECT_EQ(1, expected.erase(subSlice.get("name").copyString()));
+  }
+
+  EXPECT_TRUE(expected.empty());
+}
+
+// invalid params (no name)
+TEST_F(RestAnalyzerHandlerTest, test_remove_invalid_params) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::DELETE_REQ);
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::BAD, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::BAD) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_BAD_PARAMETER ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+// unknown analyzer
+TEST_F(RestAnalyzerHandlerTest, test_remove_unknown_analyzer) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::DELETE_REQ);
+  request.addSuffix("unknown");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::NOT_FOUND, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::NOT_FOUND) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_DDB_DOCUMENT_NOT_FOUND ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+}
+
+// not authorised
+TEST_F(RestAnalyzerHandlerTest, test_remove_not_authorized) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RO);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::DELETE_REQ);
+  request.addSuffix("testAnalyzer1");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::FORBIDDEN, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::FORBIDDEN) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_FORBIDDEN ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+
+  // Check it's not gone
+  auto analyzer =
+      analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                    darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                    darbotdb::transaction::OperationOriginTestCase{});
+  ASSERT_NE(analyzer, nullptr);
+}
+
+// still in use (fail)
+TEST_F(RestAnalyzerHandlerTest, test_remove_still_in_use) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::DELETE_REQ);
+  request.addSuffix("testAnalyzer2");
+  request.values().emplace("force", "false");
+
+  // Hold a reference to mark analyzer in use
+  auto inUseAnalyzer =
+      analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer2",
+                    darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                    darbotdb::transaction::OperationOriginTestCase{});
+  ASSERT_NE(nullptr, inUseAnalyzer);
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::CONFLICT, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::CONFLICT) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE((slice.hasKey(darbotdb::StaticStrings::Error) &&
+               slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+               true == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+       slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+       TRI_ERROR_DDB_CONFLICT ==
+           ErrorCode{
+               slice.get(darbotdb::StaticStrings::ErrorNum).getNumber<int>()}));
+  auto analyzer =
+      analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer2",
+                    darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                    darbotdb::transaction::OperationOriginTestCase{});
+  // Check it's not gone
+  ASSERT_NE(analyzer, nullptr);
+}
+
+// still in use + force (success)
+TEST_F(RestAnalyzerHandlerTest, test_remove_still_in_use_force) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::DELETE_REQ);
+  request.addSuffix("testAnalyzer2");
+  request.values().emplace("force", "true");
+
+  // hold ref to mark in-use
+  auto inUseAnalyzer =
+      analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer2",
+                    darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                    darbotdb::transaction::OperationOriginTestCase{});
+  ASSERT_NE(nullptr, inUseAnalyzer);
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::OK) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Error) &&
+       slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+       false == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE((slice.hasKey("name") && slice.get("name").isString() &&
+               darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer2" ==
+                   slice.get("name").copyString()));
+  auto analyzer =
+      analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer2",
+                    darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                    darbotdb::transaction::OperationOriginTestCase{});
+  ASSERT_EQ(nullptr, analyzer);
+}
+
+//  removal with  db name in analyzer name
+TEST_F(RestAnalyzerHandlerTest, test_remove_with_db_name) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::DELETE_REQ);
+  request.addSuffix(darbotdb::StaticStrings::SystemDatabase +
+                    "::testAnalyzer1");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto analyzer =
+      analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                    darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                    darbotdb::transaction::OperationOriginTestCase{});
+  EXPECT_EQ(nullptr, analyzer);
+}
+
+TEST_F(RestAnalyzerHandlerTest, test_remove_success) {
+  grantOnDb(darbotdb::StaticStrings::SystemDatabase, darbotdb::auth::Level::RW);
+
+  auto requestPtr = std::make_unique<GeneralRequestMock>(_system_vocbase);
+  auto& request = *requestPtr;
+  auto responcePtr = std::make_unique<GeneralResponseMock>();
+  auto& responce = *responcePtr;
+  darbotdb::iresearch::RestAnalyzerHandler handler(
+      server.server(), requestPtr.release(), responcePtr.release());
+  request.setRequestType(darbotdb::rest::RequestType::DELETE_REQ);
+  request.addSuffix("testAnalyzer1");
+
+  auto status = handler.execute();
+  EXPECT_EQ(darbotdb::RestStatus::DONE, status);
+  EXPECT_EQ(darbotdb::rest::ResponseCode::OK, responce.responseCode());
+  auto slice = responce._payload.slice();
+  EXPECT_TRUE(slice.isObject());
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Code) &&
+       slice.get(darbotdb::StaticStrings::Code).isNumber<size_t>() &&
+       size_t(darbotdb::rest::ResponseCode::OK) ==
+           slice.get(darbotdb::StaticStrings::Code).getNumber<size_t>()));
+  EXPECT_TRUE(
+      (slice.hasKey(darbotdb::StaticStrings::Error) &&
+       slice.get(darbotdb::StaticStrings::Error).isBoolean() &&
+       false == slice.get(darbotdb::StaticStrings::Error).getBoolean()));
+  EXPECT_TRUE((slice.hasKey("name") && slice.get("name").isString() &&
+               darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1" ==
+                   slice.get("name").copyString()));
+  auto analyzer =
+      analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                    darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                    darbotdb::transaction::OperationOriginTestCase{});
+  ASSERT_EQ(nullptr, analyzer);
+}

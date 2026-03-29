@@ -1,0 +1,3824 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Andrey Abramov
+/// @author Vasiliy Nabatchikov
+////////////////////////////////////////////////////////////////////////////////
+
+#include <memory>
+
+#include "gtest/gtest.h"
+
+#include "velocypack/Builder.h"
+#include "velocypack/Iterator.h"
+#include "velocypack/Parser.h"
+
+#include "analysis/analyzers.hpp"
+#include "analysis/token_streams.hpp"
+#include "index/directory_reader.hpp"
+#include "index/index_writer.hpp"
+#include "store/memory_directory.hpp"
+
+#include "IResearch/common.h"
+#include "Mocks/LogLevels.h"
+#include "Mocks/Servers.h"
+
+#include "Aql/AqlFunctionFeature.h"
+#include "Cluster/ClusterFeature.h"
+#include "GeneralServer/AuthenticationFeature.h"
+#include "IResearch/IResearchAnalyzerFeature.h"
+#include "IResearch/IResearchCommon.h"
+#include "IResearch/IResearchDocument.h"
+#include "IResearch/IResearchFilterFactory.h"
+#include "IResearch/IResearchIdentityAnalyzer.h"
+#include "IResearch/IResearchKludge.h"
+#include "IResearch/IResearchLinkMeta.h"
+#include "IResearch/IResearchPrimaryKeyFilter.h"
+#include "IResearch/IResearchVPackTermAttribute.h"
+#include "IResearch/GeoAnalyzer.h"
+#include "Logger/LogTopic.h"
+#include "Logger/Logger.h"
+#include "RestServer/DatabaseFeature.h"
+#include "RestServer/QueryRegistryFeature.h"
+#include "RestServer/SystemDatabaseFeature.h"
+#include "RestServer/AqlFeature.h"
+#include "Sharding/ShardingFeature.h"
+#include "StorageEngine/EngineSelectorFeature.h"
+#include "Transaction/BatchOptions.h"
+#include "Transaction/Helpers.h"
+#include "Transaction/Methods.h"
+#include "Transaction/StandaloneContext.h"
+#include "Utils/OperationOptions.h"
+#ifdef USE_V8
+#include "V8Server/V8DealerFeature.h"
+#endif
+#include "VocBase/Methods/Collections.h"
+
+namespace {
+
+using IResearchLinkIterator =
+    darbotdb::iresearch::FieldIterator<darbotdb::iresearch::FieldMeta>;
+
+using InvertedIndexFieldIterator = darbotdb::iresearch::FieldIterator<
+    darbotdb::iresearch::IResearchInvertedIndexMetaIndexingContext>;
+
+static const VPackBuilder systemDatabaseBuilder = dbArgsBuilder();
+static const VPackSlice systemDatabaseArgs = systemDatabaseBuilder.slice();
+
+using AssertFieldFunc = void(darbotdb::tests::mocks::MockAqlServer&,
+                             IResearchLinkIterator const&);
+
+using AssertInvertedIndexFieldFunc = void(
+    darbotdb::tests::mocks::MockAqlServer&, InvertedIndexFieldIterator const&);
+
+using IdentityAnalyzer = darbotdb::iresearch::IdentityAnalyzer;
+
+template<typename Analyzer, bool inverted = false>
+void assertField(darbotdb::tests::mocks::MockAqlServer& server,
+                 darbotdb::iresearch::Field const& value,
+                 std::string const& expectedName,
+                 std::string_view explicitAnalyzerName = std::string_view{}) {
+  SCOPED_TRACE(testing::Message("Expected name: ") << expectedName);
+
+  auto* analyzer = dynamic_cast<Analyzer*>(&value.get_tokens());
+  ASSERT_NE(nullptr, analyzer);
+  if constexpr (std::is_same_v<irs::null_token_stream, Analyzer> ||
+                std::is_same_v<irs::string_token_stream, Analyzer> ||
+                std::is_same_v<irs::numeric_token_stream, Analyzer> ||
+                std::is_same_v<irs::boolean_token_stream, Analyzer>) {
+    ASSERT_EQ(expectedName, value.name());
+  } else if (std::is_base_of_v<irs::analysis::analyzer, Analyzer>) {
+    auto analyzerName = irs::IsNull(explicitAnalyzerName)
+                            ? std::string(irs::type<Analyzer>::name())
+                            : std::string(explicitAnalyzerName);
+    if constexpr (inverted) {
+      ASSERT_EQ(expectedName, value.name());
+    } else {
+      ASSERT_EQ(mangleString(expectedName, analyzerName), value.name());
+    }
+    auto& analyzers = server.template getFeature<
+        darbotdb::iresearch::IResearchAnalyzerFeature>();
+    const auto expectedAnalyzerPtr = irs::analysis::analyzers::get(
+        irs::type<Analyzer>::name(), irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    ASSERT_NE(nullptr, expectedAnalyzerPtr);
+
+    const auto prefix =
+        !std::is_same_v<darbotdb::iresearch::IdentityAnalyzer, Analyzer>
+            ? darbotdb::StaticStrings::SystemDatabase + "::"
+            : "";
+
+    auto const expectedArangoSearchAnalyzerPtr = analyzers.get(
+        prefix + analyzerName, darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+        darbotdb::transaction::OperationOriginTestCase{}, true);
+    ASSERT_NE(nullptr, expectedArangoSearchAnalyzerPtr);
+
+    ASSERT_EQ(expectedAnalyzerPtr->type(), analyzer->type());
+    ASSERT_EQ(expectedArangoSearchAnalyzerPtr->features().fieldFeatures(
+                  inverted ? darbotdb::iresearch::LinkVersion::MAX
+                           : darbotdb::iresearch::LinkVersion::MIN),
+              value.features());
+    ASSERT_EQ(expectedArangoSearchAnalyzerPtr->features().indexFeatures(),
+              value.index_features());
+  } else if constexpr (std::is_base_of_v<irs::token_stream, Analyzer>) {
+    ASSERT_EQ(expectedName, value.name());
+  }
+}
+
+struct TestAttribute : public irs::attribute {
+  static constexpr std::string_view type_name() noexcept {
+    return "TestAttribute";
+  }
+};
+
+class EmptyAnalyzer final : public irs::analysis::TypedAnalyzer<EmptyAnalyzer> {
+ public:
+  static constexpr std::string_view type_name() noexcept {
+    return "iresearch-document-empty";
+  }
+  static ptr make(std::string_view) {
+    return std::make_unique<EmptyAnalyzer>();
+  }
+  static bool normalize(std::string_view, std::string& out) {
+    out.resize(VPackSlice::emptyObjectSlice().byteSize());
+    std::memcpy(&out[0], VPackSlice::emptyObjectSlice().begin(), out.size());
+    return true;
+  }
+
+  EmptyAnalyzer() = default;
+  irs::attribute* get_mutable(irs::type_info::type_id type) noexcept final {
+    if (type == irs::type<irs::frequency>::id()) {
+      return &_attr;
+    }
+    return nullptr;
+  }
+  bool next() final { return false; }
+  bool reset(std::string_view) final { return true; }
+
+ private:
+  irs::frequency _attr;
+};
+
+REGISTER_ANALYZER_VPACK(EmptyAnalyzer, EmptyAnalyzer::make,
+                        EmptyAnalyzer::normalize);
+
+class VPackAnalyzer final : public irs::analysis::TypedAnalyzer<VPackAnalyzer> {
+ public:
+  static constexpr std::string_view type_name() noexcept {
+    return "iresearch-vpack-analyzer";
+  }
+  static ptr make(std::string_view) {
+    return std::make_unique<VPackAnalyzer>();
+  }
+  static bool normalize(std::string_view, std::string& out) {
+    out.resize(VPackSlice::emptyObjectSlice().byteSize());
+    std::memcpy(&out[0], VPackSlice::emptyObjectSlice().begin(), out.size());
+    return true;
+  }
+
+  VPackAnalyzer() = default;
+  irs::attribute* get_mutable(irs::type_info::type_id type) noexcept final {
+    if (type == irs::type<irs::term_attribute>::id()) {
+      return &_term;
+    }
+    if (type == irs::type<irs::increment>::id()) {
+      return &_inc;
+    }
+    return nullptr;
+  }
+  bool next() final {
+    if (!irs::IsNull(_term.value)) {
+      return false;
+    }
+    _term.value = irs::ViewCast<irs::byte_type>(std::string_view{_buf});
+    return true;
+  }
+  bool reset(std::string_view data) final {
+    _buf = darbotdb::iresearch::slice(data).toString();
+    _term.value = irs::bytes_view{};
+    return true;
+  }
+
+ private:
+  std::string _buf;
+  irs::term_attribute _term;
+  irs::increment _inc;
+};
+
+REGISTER_ANALYZER_VPACK(VPackAnalyzer, VPackAnalyzer::make,
+                        VPackAnalyzer::normalize);
+
+class InvalidAnalyzer final
+    : public irs::analysis::TypedAnalyzer<InvalidAnalyzer> {
+ public:
+  static bool returnNullFromMake;
+  static bool returnFalseFromToString;
+
+  static constexpr std::string_view type_name() noexcept {
+    return "iresearch-document-invalid";
+  }
+
+  static ptr make(std::string_view) {
+    if (returnNullFromMake) {
+      return nullptr;
+    }
+    return std::make_unique<InvalidAnalyzer>();
+  }
+
+  static bool normalize(std::string_view, std::string& out) {
+    out.resize(VPackSlice::emptyObjectSlice().byteSize());
+    std::memcpy(&out[0], VPackSlice::emptyObjectSlice().begin(), out.size());
+    return !returnFalseFromToString;
+  }
+
+  InvalidAnalyzer() = default;
+  irs::attribute* get_mutable(irs::type_info::type_id type) noexcept final {
+    if (type == irs::type<TestAttribute>::id()) {
+      return &_attr;
+    }
+    return nullptr;
+  }
+  bool next() final { return false; }
+  bool reset(std::string_view) final { return true; }
+
+ private:
+  TestAttribute _attr;
+};
+
+bool InvalidAnalyzer::returnNullFromMake = false;
+bool InvalidAnalyzer::returnFalseFromToString = false;
+
+REGISTER_ANALYZER_VPACK(InvalidAnalyzer, InvalidAnalyzer::make,
+                        InvalidAnalyzer::normalize);
+
+class TypedAnalyzer final : public irs::analysis::TypedAnalyzer<TypedAnalyzer> {
+ public:
+  static constexpr std::string_view type_name() noexcept {
+    return "iresearch-document-typed";
+  }
+
+  static ptr make(std::string_view args) {
+    return std::make_unique<TypedAnalyzer>(args);
+  }
+
+  static bool normalize(std::string_view args, std::string& out) {
+    out.assign(args.data(), args.size());
+    return true;
+  }
+
+  explicit TypedAnalyzer(std::string_view args) {
+    VPackSlice slice(irs::ViewCast<irs::byte_type>(args).data());
+    if (slice.hasKey("type")) {
+      auto type = slice.get("type").stringView();
+      if (type == "number") {
+        _returnType.value = darbotdb::iresearch::AnalyzerValueType::Number;
+        _typedValue =
+            darbotdb::aql::AqlValue(darbotdb::aql::AqlValueHintDouble(1));
+        _vpackTerm.value = _typedValue.slice();
+      } else if (type == "bool") {
+        _returnType.value = darbotdb::iresearch::AnalyzerValueType::Bool;
+        _typedValue =
+            darbotdb::aql::AqlValue(darbotdb::aql::AqlValueHintBool(true));
+        _vpackTerm.value = _typedValue.slice();
+      } else if (type == "string") {
+        _returnType.value = darbotdb::iresearch::AnalyzerValueType::String;
+        _term.value = irs::ViewCast<irs::byte_type>(std::string_view{_strVal});
+      } else {
+        // Failure here means we have unexpected type
+        EXPECT_TRUE(false);
+      }
+    }
+  }
+
+  bool reset(std::string_view) final {
+    _resetted = true;
+    return true;
+  }
+
+  bool next() final {
+    if (_resetted) {
+      _resetted = false;
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  irs::attribute* get_mutable(irs::type_info::type_id type) noexcept final {
+    if (type == irs::type<irs::term_attribute>::id()) {
+      return &_term;
+    }
+    if (type == irs::type<irs::increment>::id()) {
+      return &_inc;
+    }
+    if (type ==
+        irs::type<darbotdb::iresearch::AnalyzerValueTypeAttribute>::id()) {
+      return &_returnType;
+    }
+    if (type == irs::type<darbotdb::iresearch::VPackTermAttribute>::id()) {
+      return &_vpackTerm;
+    }
+    return nullptr;
+  }
+
+ private:
+  std::string _strVal;
+  irs::term_attribute _term;
+  darbotdb::iresearch::VPackTermAttribute _vpackTerm;
+  irs::increment _inc;
+  bool _resetted{false};
+  darbotdb::iresearch::AnalyzerValueTypeAttribute _returnType;
+  darbotdb::aql::AqlValue _typedValue;
+};
+
+REGISTER_ANALYZER_VPACK(TypedAnalyzer, TypedAnalyzer::make,
+                        TypedAnalyzer::normalize);
+
+class TypedArrayAnalyzer final
+    : public irs::analysis::TypedAnalyzer<TypedArrayAnalyzer> {
+ public:
+  static constexpr std::string_view type_name() noexcept {
+    return "iresearch-document-typed-array";
+  }
+
+  static ptr make(std::string_view args) {
+    return std::make_unique<TypedArrayAnalyzer>(args);
+  }
+
+  static bool normalize(std::string_view args, std::string& out) {
+    out.assign(args.data(), args.size());
+    return true;
+  }
+
+  explicit TypedArrayAnalyzer(std::string_view) {
+    _returnType.value = darbotdb::iresearch::AnalyzerValueType::Number;
+  }
+
+  bool reset(std::string_view data) final {
+    auto value = std::string(data);
+    _values.clear();
+    _current = 0;
+    for (double d = 1; d < std::atoi(value.c_str()); ++d) {
+      _values.push_back(d);
+    }
+    return true;
+  }
+
+  bool next() final {
+    if (_current < _values.size()) {
+      _typedValue = darbotdb::aql::AqlValue(
+          darbotdb::aql::AqlValueHintDouble(_values[_current++]));
+      _vpackTerm.value = _typedValue.slice();
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  irs::attribute* get_mutable(irs::type_info::type_id type) noexcept final {
+    if (type == irs::type<irs::increment>::id()) {
+      return &_inc;
+    }
+    if (type ==
+        irs::type<darbotdb::iresearch::AnalyzerValueTypeAttribute>::id()) {
+      return &_returnType;
+    }
+    if (type == irs::type<darbotdb::iresearch::VPackTermAttribute>::id()) {
+      return &_vpackTerm;
+    }
+    return nullptr;
+  }
+
+ private:
+  darbotdb::iresearch::VPackTermAttribute _vpackTerm;
+  irs::increment _inc;
+  std::vector<double> _values;
+  size_t _current{0};
+  darbotdb::iresearch::AnalyzerValueTypeAttribute _returnType;
+  darbotdb::aql::AqlValue _typedValue;
+};
+
+REGISTER_ANALYZER_VPACK(TypedArrayAnalyzer, TypedArrayAnalyzer::make,
+                        TypedArrayAnalyzer::normalize);
+
+}  // namespace
+
+namespace std {
+// helper for checking features transfer from analyzer to the field
+bool operator==(std::vector<irs::type_info::type_id> const& analyzer,
+                irs::features_t const& field) {
+  if (field.size() != analyzer.size()) {
+    return false;
+  }
+  for (auto t : field) {
+    if (find(analyzer.begin(), analyzer.end(), t().id()) == analyzer.end()) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace std
+// -----------------------------------------------------------------------------
+// --SECTION--                                                 setup / tear-down
+// -----------------------------------------------------------------------------
+
+class IResearchDocumentTest
+    : public ::testing::Test,
+      public darbotdb::tests::LogSuppressor<darbotdb::Logger::AUTHENTICATION,
+                                            darbotdb::LogLevel::ERR> {
+ protected:
+  darbotdb::tests::mocks::MockAqlServer server;
+
+  IResearchDocumentTest() {
+    darbotdb::tests::init();
+
+    {
+      auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+      auto vocbase = sysDatabase.use();
+      std::shared_ptr<darbotdb::LogicalCollection> unused;
+      darbotdb::OperationOptions options(darbotdb::ExecContext::current());
+      darbotdb::methods::Collections::createSystem(
+          *vocbase, options, darbotdb::tests::AnalyzerCollectionName, false,
+          unused);
+    }
+
+    auto& analyzers =
+        server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+    darbotdb::iresearch::IResearchAnalyzerFeature::EmplaceResult result;
+
+    // ensure that there will be no exception on 'emplace'
+    InvalidAnalyzer::returnNullFromMake = false;
+    InvalidAnalyzer::returnFalseFromToString = false;
+
+    auto res = analyzers.emplace(
+        result,
+        darbotdb::StaticStrings::SystemDatabase + "::iresearch-document-empty",
+        "iresearch-document-empty",
+        darbotdb::velocypack::Parser::fromJson("{ \"args\": \"en\" }")->slice(),
+        darbotdb::transaction::OperationOriginTestCase{},
+        darbotdb::iresearch::Features(irs::IndexFeatures::FREQ));
+    EXPECT_TRUE(res.ok());
+
+    res = analyzers.emplace(
+        result,
+        darbotdb::StaticStrings::SystemDatabase +
+            "::iresearch-document-invalid",
+        "iresearch-document-invalid",
+        darbotdb::velocypack::Parser::fromJson("{ \"args\": \"en\" }")->slice(),
+        darbotdb::transaction::OperationOriginTestCase{},
+        darbotdb::iresearch::Features(irs::IndexFeatures::FREQ));
+    EXPECT_TRUE(res.ok());
+
+    res = analyzers.emplace(
+        result,
+        darbotdb::StaticStrings::SystemDatabase + "::iresearch-vpack-analyzer",
+        "iresearch-vpack-analyzer", VPackSlice::emptyObjectSlice(),
+        darbotdb::transaction::OperationOriginTestCase{},
+        darbotdb::iresearch::Features{});
+    EXPECT_TRUE(res.ok());
+
+    res = analyzers.emplace(
+        result,
+        darbotdb::StaticStrings::SystemDatabase + "::iresearch-document-number",
+        "iresearch-document-typed",
+        darbotdb::velocypack::Parser::fromJson("{ \"type\": \"number\" }")
+            ->slice(),
+        darbotdb::transaction::OperationOriginTestCase{},
+        darbotdb::iresearch::Features{});
+    EXPECT_TRUE(res.ok());
+    res = analyzers.emplace(
+        result,
+        darbotdb::StaticStrings::SystemDatabase + "::iresearch-document-bool",
+        "iresearch-document-typed",
+        darbotdb::velocypack::Parser::fromJson("{ \"type\": \"bool\" }")
+            ->slice(),
+        darbotdb::transaction::OperationOriginTestCase{},
+        darbotdb::iresearch::Features{});
+    EXPECT_TRUE(res.ok());
+    res = analyzers.emplace(
+        result,
+        darbotdb::StaticStrings::SystemDatabase + "::iresearch-document-string",
+        "iresearch-document-typed",
+        darbotdb::velocypack::Parser::fromJson("{ \"type\": \"string\" }")
+            ->slice(),
+        darbotdb::transaction::OperationOriginTestCase{},
+        darbotdb::iresearch::Features{});
+    EXPECT_TRUE(res.ok());
+
+    res = analyzers.emplace(
+        result,
+        darbotdb::StaticStrings::SystemDatabase +
+            "::iresearch-document-number-array",
+        "iresearch-document-typed-array",
+        darbotdb::velocypack::Parser::fromJson("{ \"type\": \"number\" }")
+            ->slice(),
+        darbotdb::transaction::OperationOriginTestCase{},
+        darbotdb::iresearch::Features{});
+    EXPECT_TRUE(res.ok());
+
+    res = analyzers.emplace(
+        result, darbotdb::StaticStrings::SystemDatabase + "::my_geo", "geojson",
+        darbotdb::velocypack::Parser::fromJson("{\"type\": \"point\"}")
+            ->slice(),
+        darbotdb::transaction::OperationOriginTestCase{},
+        darbotdb::iresearch::Features{});
+    EXPECT_TRUE(res.ok());
+  }
+};
+
+// -----------------------------------------------------------------------------
+// --SECTION--                                                        test suite
+// -----------------------------------------------------------------------------
+TEST_F(IResearchDocumentTest, FieldIterator_construct) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  EXPECT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest, FieldIterator_empty_object) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._includeAllFields = true;  // include all fields
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(VPackSlice::emptyObjectSlice(), linkMeta);
+  EXPECT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest,
+       FieldIterator_traverse_complex_object_custom_nested_delimiter) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"nested\": { \"foo\": \"str\" }, \
+    \"keys\": [ \"1\",\"2\",\"3\",\"4\" ], \
+    \"analyzers\": [], \
+    \"boost\": \"10\", \
+    \"depth\": \"20\", \
+    \"fields\": { \"fieldA\" : { \"name\" : \"a\" }, \"fieldB\" : { \"name\" : \"b\" } }, \
+    \"listValuation\": \"ignored\", \
+    \"locale\": \"ru_RU.KOI8-R\", \
+    \"array\" : [ \
+      { \"id\" : \"1\", \"subarr\" : [ \"1\", \"2\", \"3\" ], \"subobj\" : { \"id\" : \"1\" } }, \
+      { \"subarr\" : [ \"4\", \"5\", \"6\" ], \"subobj\" : { \"name\" : \"foo\" }, \"id\" : \"2\" }, \
+      { \"id\" : \"3\", \"subarr\" : [ \"7\", \"8\", \"9\" ], \"subobj\" : { \"id\" : \"2\" } } \
+    ] \
+  }");
+
+  std::unordered_map<std::string, size_t> expectedValues{
+      {mangleStringIdentity("nested.foo"), 1},
+      {mangleStringIdentity("keys"), 4},
+      {mangleStringIdentity("boost"), 1},
+      {mangleStringIdentity("depth"), 1},
+      {mangleStringIdentity("fields.fieldA.name"), 1},
+      {mangleStringIdentity("fields.fieldB.name"), 1},
+      {mangleStringIdentity("listValuation"), 1},
+      {mangleStringIdentity("locale"), 1},
+      {mangleStringIdentity("array.id"), 3},
+      {mangleStringIdentity("array.subarr"), 9},
+      {mangleStringIdentity("array.subobj.id"), 2},
+      {mangleStringIdentity("array.subobj.name"), 1},
+      {mangleStringIdentity("array.id"), 2}};
+
+  auto const slice = json->slice();
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._includeAllFields = true;  // include all fields
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(slice, linkMeta);
+
+  // default analyzer
+  auto const expected_analyzer = irs::analysis::analyzers::get(
+      "identity", irs::type<irs::text_format::vpack>::get(),
+      darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+  auto& analyzers =
+      server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+  auto const expected_features =
+      analyzers
+          .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+               darbotdb::transaction::OperationOriginTestCase{})
+          ->features();
+
+  while (it.valid()) {
+    auto& field = *it;
+    std::string const actualName = std::string(field.name());
+    auto const expectedValue = expectedValues.find(actualName);
+    ASSERT_NE(expectedValues.end(), expectedValue);
+
+    auto& refs = expectedValue->second;
+    if (!--refs) {
+      expectedValues.erase(expectedValue);
+    }
+
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(field.get_tokens());
+    SCOPED_TRACE(field._name);
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        field.features());
+    EXPECT_EQ(expected_features.indexFeatures(), field.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+
+    ++it;
+  }
+
+  EXPECT_TRUE(expectedValues.empty());
+}
+
+TEST_F(IResearchDocumentTest,
+       FieldIterator_traverse_complex_object_all_fields) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"nested\": { \"foo\": \"str\" }, \
+    \"keys\": [ \"1\",\"2\",\"3\",\"4\" ], \
+    \"analyzers\": [], \
+    \"boost\": \"10\", \
+    \"depth\": \"20\", \
+    \"fields\": { \"fieldA\" : { \"name\" : \"a\" }, \"fieldB\" : { \"name\" : \"b\" } }, \
+    \"listValuation\": \"ignored\", \
+    \"locale\": \"ru_RU.KOI8-R\", \
+    \"array\" : [ \
+      { \"id\" : \"1\", \"subarr\" : [ \"1\", \"2\", \"3\" ], \"subobj\" : { \"id\" : \"1\" } }, \
+      { \"subarr\" : [ \"4\", \"5\", \"6\" ], \"subobj\" : { \"name\" : \"foo\" }, \"id\" : \"2\" }, \
+      { \"id\" : \"3\", \"subarr\" : [ \"7\", \"8\", \"9\" ], \"subobj\" : { \"id\" : \"2\" } } \
+    ] \
+  }");
+
+  std::unordered_map<std::string, size_t> expectedValues{
+      {mangleStringIdentity("nested.foo"), 1},
+      {mangleStringIdentity("keys"), 4},
+      {mangleStringIdentity("boost"), 1},
+      {mangleStringIdentity("depth"), 1},
+      {mangleStringIdentity("fields.fieldA.name"), 1},
+      {mangleStringIdentity("fields.fieldB.name"), 1},
+      {mangleStringIdentity("listValuation"), 1},
+      {mangleStringIdentity("locale"), 1},
+      {mangleStringIdentity("array.id"), 3},
+      {mangleStringIdentity("array.subarr"), 9},
+      {mangleStringIdentity("array.subobj.id"), 2},
+      {mangleStringIdentity("array.subobj.name"), 1}};
+
+  auto const slice = json->slice();
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._includeAllFields = true;
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(slice, linkMeta);
+
+  // default analyzer
+  auto const expected_analyzer = irs::analysis::analyzers::get(
+      "identity", irs::type<irs::text_format::vpack>::get(),
+      darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+  auto& analyzers =
+      server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+  auto const expected_features =
+      analyzers
+          .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+               darbotdb::transaction::OperationOriginTestCase{})
+          ->features();
+
+  while (it.valid()) {
+    auto& field = *it;
+    std::string const actualName = std::string(field.name());
+    auto const expectedValue = expectedValues.find(actualName);
+    ASSERT_NE(expectedValues.end(), expectedValue);
+
+    auto& refs = expectedValue->second;
+    if (!--refs) {
+      expectedValues.erase(expectedValue);
+    }
+
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(field.get_tokens());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        field.features());
+    EXPECT_EQ(expected_features.indexFeatures(), field.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+
+    ++it;
+  }
+
+  EXPECT_TRUE(expectedValues.empty());
+}
+
+TEST_F(IResearchDocumentTest,
+       FieldIterator_traverse_complex_object_ordered_all_fields) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"nested\": { \"foo\": \"str\" }, \
+    \"keys\": [ \"1\",\"2\",\"3\",\"4\" ], \
+    \"analyzers\": [], \
+    \"boost\": \"10\", \
+    \"depth\": \"20\", \
+    \"fields\": { \"fieldA\" : { \"name\" : \"a\" }, \"fieldB\" : { \"name\" : \"b\" } }, \
+    \"listValuation\": \"ignored\", \
+    \"locale\": \"ru_RU.KOI8-R\", \
+    \"array\" : [ \
+      { \"id\" : \"1\", \"subarr\" : [ \"1\", \"2\", \"3\" ], \"subobj\" : { \"id\" : \"1\" } }, \
+      { \"subarr\" : [ \"4\", \"5\", \"6\" ], \"subobj\" : { \"name\" : \"foo\" }, \"id\" : \"2\" }, \
+      { \"id\" : \"3\", \"subarr\" : [ \"7\", \"8\", \"9\" ], \"subobj\" : { \"id\" : \"2\" } } \
+    ] \
+  }");
+
+  std::unordered_multiset<std::string> expectedValues{
+      mangleStringIdentity("nested.foo"),
+      mangleStringIdentity("keys[0]"),
+      mangleStringIdentity("keys[1]"),
+      mangleStringIdentity("keys[2]"),
+      mangleStringIdentity("keys[3]"),
+      mangleStringIdentity("boost"),
+      mangleStringIdentity("depth"),
+      mangleStringIdentity("fields.fieldA.name"),
+      mangleStringIdentity("fields.fieldB.name"),
+      mangleStringIdentity("listValuation"),
+      mangleStringIdentity("locale"),
+
+      mangleStringIdentity("array[0].id"),
+      mangleStringIdentity("array[0].subarr[0]"),
+      mangleStringIdentity("array[0].subarr[1]"),
+      mangleStringIdentity("array[0].subarr[2]"),
+      mangleStringIdentity("array[0].subobj.id"),
+
+      mangleStringIdentity("array[1].subarr[0]"),
+      mangleStringIdentity("array[1].subarr[1]"),
+      mangleStringIdentity("array[1].subarr[2]"),
+      mangleStringIdentity("array[1].subobj.name"),
+      mangleStringIdentity("array[1].id"),
+
+      mangleStringIdentity("array[2].id"),
+      mangleStringIdentity("array[2].subarr[0]"),
+      mangleStringIdentity("array[2].subarr[1]"),
+      mangleStringIdentity("array[2].subarr[2]"),
+      mangleStringIdentity("array[2].subobj.id")};
+
+  auto const slice = json->slice();
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._includeAllFields = true;    // include all fields
+  linkMeta._trackListPositions = true;  // allow indexes in field names
+
+  // default analyzer
+  auto const expected_analyzer = irs::analysis::analyzers::get(
+      "identity", irs::type<irs::text_format::vpack>::get(),
+      darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+  auto& analyzers =
+      server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+  auto const expected_features =
+      analyzers
+          .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+               darbotdb::transaction::OperationOriginTestCase{})
+          ->features();
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  IResearchLinkIterator doc(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  doc.reset(slice, linkMeta);
+  for (; doc.valid(); ++doc) {
+    auto& field = *doc;
+    std::string const actualName = std::string(field.name());
+    EXPECT_EQ(1, expectedValues.erase(actualName));
+
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(field.get_tokens());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        field.features());
+    EXPECT_EQ(expected_features.indexFeatures(), field.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+  }
+
+  EXPECT_TRUE(expectedValues.empty());
+}
+
+TEST_F(IResearchDocumentTest,
+       FieldIterator_traverse_complex_object_ordered_filtered) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"nested\": { \"foo\": \"str\" }, \
+    \"keys\": [ \"1\",\"2\",\"3\",\"4\" ], \
+    \"analyzers\": [], \
+    \"boost\": \"10\", \
+    \"depth\": \"20\", \
+    \"fields\": { \"fieldA\" : { \"name\" : \"a\" }, \"fieldB\" : { \"name\" : \"b\" } }, \
+    \"listValuation\": \"ignored\", \
+    \"locale\": \"ru_RU.KOI8-R\", \
+    \"array\" : [ \
+      { \"id\" : \"1\", \"subarr\" : [ \"1\", \"2\", \"3\" ], \"subobj\" : { \"id\" : \"1\" } }, \
+      { \"subarr\" : [ \"4\", \"5\", \"6\" ], \"subobj\" : { \"name\" : \"foo\" }, \"id\" : \"2\" }, \
+      { \"id\" : \"3\", \"subarr\" : [ \"7\", \"8\", \"9\" ], \"subobj\" : { \"id\" : \"2\" } } \
+    ] \
+  }");
+
+  auto linkMetaJson = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"includeAllFields\" : false, \
+    \"trackListPositions\" : true, \
+    \"fields\" : { \"boost\" : { } }, \
+    \"analyzers\": [ \"identity\" ] \
+  }");
+
+  auto const slice = json->slice();
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+
+  std::string error;
+  ASSERT_TRUE(linkMeta.init(server.server(), linkMetaJson->slice(), error));
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(slice, linkMeta);
+  ASSERT_TRUE(it.valid());
+
+  auto& value = *it;
+  EXPECT_EQ(mangleStringIdentity("boost"), value.name());
+  const auto expected_analyzer = irs::analysis::analyzers::get(
+      "identity", irs::type<irs::text_format::vpack>::get(),
+      darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+  auto& analyzers =
+      server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+  auto const expected_features =
+      analyzers
+          .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+               darbotdb::transaction::OperationOriginTestCase{})
+          ->features();
+  auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+  EXPECT_EQ(
+      expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+      value.features());
+  EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+  EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+
+  ++it;
+  EXPECT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest,
+       FieldIterator_traverse_complex_object_ordered_filtered_2) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"nested\": { \"foo\": \"str\" }, \
+    \"keys\": [ \"1\",\"2\",\"3\",\"4\" ], \
+    \"analyzers\": [], \
+    \"boost\": \"10\", \
+    \"depth\": \"20\", \
+    \"fields\": { \"fieldA\" : { \"name\" : \"a\" }, \"fieldB\" : { \"name\" : \"b\" } }, \
+    \"listValuation\": \"ignored\", \
+    \"locale\": \"ru_RU.KOI8-R\", \
+    \"array\" : [ \
+      { \"id\" : \"1\", \"subarr\" : [ \"1\", \"2\", \"3\" ], \"subobj\" : { \"id\" : \"1\" } }, \
+      { \"subarr\" : [ \"4\", \"5\", \"6\" ], \"subobj\" : { \"name\" : \"foo\" }, \"id\" : \"2\" }, \
+      { \"id\" : \"3\", \"subarr\" : [ \"7\", \"8\", \"9\" ], \"subobj\" : { \"id\" : \"2\" } } \
+    ] \
+  }");
+
+  auto const slice = json->slice();
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._includeAllFields = false;   // ignore all fields
+  linkMeta._trackListPositions = true;  // allow indexes in field names
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(slice, linkMeta);
+  EXPECT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest,
+       FieldIterator_traverse_complex_object_ordered_empty_analyzers) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"nested\": { \"foo\": \"str\" }, \
+    \"keys\": [ \"1\",\"2\",\"3\",\"4\" ], \
+    \"analyzers\": [], \
+    \"boost\": \"10\", \
+    \"depth\": \"20\", \
+    \"fields\": { \"fieldA\" : { \"name\" : \"a\" }, \"fieldB\" : { \"name\" : \"b\" } }, \
+    \"listValuation\": \"ignored\", \
+    \"locale\": \"ru_RU.KOI8-R\", \
+    \"array\" : [ \
+      { \"id\" : \"1\", \"subarr\" : [ \"1\", \"2\", \"3\" ], \"subobj\" : { \"id\" : \"1\" } }, \
+      { \"subarr\" : [ \"4\", \"5\", \"6\" ], \"subobj\" : { \"name\" : \"foo\" }, \"id\" : \"2\" }, \
+      { \"id\" : \"3\", \"subarr\" : [ \"7\", \"8\", \"9\" ], \"subobj\" : { \"id\" : \"2\" } } \
+    ] \
+  }");
+
+  auto const slice = json->slice();
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._analyzers.clear();  // clear all analyzers
+  linkMeta._primitiveOffset = 0;
+  linkMeta._includeAllFields = true;  // include all fields
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(slice, linkMeta);
+  EXPECT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest,
+       FieldIterator_traverse_complex_object_ordered_check_value_types) {
+  auto& analyzers =
+      server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"mustBeSkipped\" : {}, \
+    \"stringValue\": \"string\", \
+    \"nullValue\": null, \
+    \"trueValue\": true, \
+    \"falseValue\": false, \
+    \"mustBeSkipped2\" : {}, \
+    \"smallIntValue\": 10, \
+    \"smallNegativeIntValue\": -5, \
+    \"bigIntValue\": 2147483647, \
+    \"bigNegativeIntValue\": -2147483648, \
+    \"smallDoubleValue\": 20.123, \
+    \"bigDoubleValue\": 1.79769e+308, \
+    \"bigNegativeDoubleValue\": -1.79769e+308 \
+  }");
+  auto const slice = json->slice();
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._analyzers.emplace_back(darbotdb::iresearch::FieldMeta::Analyzer(
+      analyzers.get(darbotdb::StaticStrings::SystemDatabase +
+                        "::iresearch-document-empty",
+                    darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                    darbotdb::transaction::OperationOriginTestCase{}),
+      "iresearch-document-empty"));   // add analyzer
+  linkMeta._includeAllFields = true;  // include all fields
+  linkMeta._primitiveOffset = linkMeta._analyzers.size();
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(slice, linkMeta);
+
+  // stringValue (with IdentityAnalyzer)
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleStringIdentity("stringValue"), field.name());
+    auto const expected_analyzer = irs::analysis::analyzers::get(
+        "identity", irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    auto& analyzers =
+        server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+    auto const expected_features =
+        analyzers
+            .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                 darbotdb::transaction::OperationOriginTestCase{})
+            ->features();
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(field.get_tokens());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        field.features());
+    EXPECT_EQ(expected_features.indexFeatures(), field.index_features());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // stringValue (with EmptyAnalyzer)
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleString("stringValue", "iresearch-document-empty"),
+              field.name());
+    auto const expected_analyzer = irs::analysis::analyzers::get(
+        "iresearch-document-empty", irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    auto& analyzer = dynamic_cast<EmptyAnalyzer&>(field.get_tokens());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+    auto expectedFeatures =
+        darbotdb::iresearch::Features(irs::IndexFeatures::FREQ);
+    EXPECT_EQ(
+        expectedFeatures.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        field.features());
+    EXPECT_EQ(expectedFeatures.indexFeatures(), field.index_features());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // nullValue
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleNull("nullValue"), field.name());
+    auto& analyzer = dynamic_cast<irs::null_token_stream&>(field.get_tokens());
+    auto expectedFeatures =
+        darbotdb::iresearch::Features({}, irs::IndexFeatures::NONE);
+    EXPECT_EQ(
+        expectedFeatures.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        field.features());
+    EXPECT_EQ(expectedFeatures.indexFeatures(), field.index_features());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // trueValue
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleBool("trueValue"), field.name());
+    auto& analyzer =
+        dynamic_cast<irs::boolean_token_stream&>(field.get_tokens());
+    auto expectedFeatures =
+        darbotdb::iresearch::Features({}, irs::IndexFeatures::NONE);
+    EXPECT_EQ(
+        expectedFeatures.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        field.features());
+    EXPECT_EQ(expectedFeatures.indexFeatures(), field.index_features());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // falseValue
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleBool("falseValue"), field.name());
+    auto& analyzer =
+        dynamic_cast<irs::boolean_token_stream&>(field.get_tokens());
+    auto expectedFeatures =
+        darbotdb::iresearch::Features({}, irs::IndexFeatures::NONE);
+    EXPECT_EQ(
+        expectedFeatures.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        field.features());
+    EXPECT_EQ(expectedFeatures.indexFeatures(), field.index_features());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // smallIntValue
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleNumeric("smallIntValue"), field.name());
+    auto& analyzer =
+        dynamic_cast<irs::numeric_token_stream&>(field.get_tokens());
+    irs::type_info::type_id const expected[]{
+        irs::type<irs::granularity_prefix>::id()};
+    auto features = field.features();
+    EXPECT_TRUE(
+        std::equal(expected, expected + 1, features.begin(), features.end()));
+    EXPECT_EQ(irs::IndexFeatures::NONE, field.index_features());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // smallNegativeIntValue
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleNumeric("smallNegativeIntValue"), field.name());
+    auto& analyzer =
+        dynamic_cast<irs::numeric_token_stream&>(field.get_tokens());
+    irs::type_info::type_id const expected[]{
+        irs::type<irs::granularity_prefix>::id()};
+    auto features = field.features();
+    EXPECT_TRUE(
+        std::equal(expected, expected + 1, features.begin(), features.end()));
+    EXPECT_EQ(irs::IndexFeatures::NONE, field.index_features());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // bigIntValue
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleNumeric("bigIntValue"), field.name());
+    auto& analyzer =
+        dynamic_cast<irs::numeric_token_stream&>(field.get_tokens());
+    irs::type_info::type_id const expected[]{
+        irs::type<irs::granularity_prefix>::id()};
+    auto features = field.features();
+    EXPECT_TRUE(
+        std::equal(expected, expected + 1, features.begin(), features.end()));
+    EXPECT_EQ(irs::IndexFeatures::NONE, field.index_features());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // bigNegativeIntValue
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleNumeric("bigNegativeIntValue"), field.name());
+    auto& analyzer =
+        dynamic_cast<irs::numeric_token_stream&>(field.get_tokens());
+    irs::type_info::type_id const expected[]{
+        irs::type<irs::granularity_prefix>::id()};
+    auto features = field.features();
+    EXPECT_TRUE(
+        std::equal(expected, expected + 1, features.begin(), features.end()));
+    EXPECT_EQ(irs::IndexFeatures::NONE, field.index_features());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // smallDoubleValue
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleNumeric("smallDoubleValue"), field.name());
+    auto& analyzer =
+        dynamic_cast<irs::numeric_token_stream&>(field.get_tokens());
+    irs::type_info::type_id const expected[]{
+        irs::type<irs::granularity_prefix>::id()};
+    auto features = field.features();
+    EXPECT_TRUE(
+        std::equal(expected, expected + 1, features.begin(), features.end()));
+    EXPECT_EQ(irs::IndexFeatures::NONE, field.index_features());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // bigDoubleValue
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleNumeric("bigDoubleValue"), field.name());
+    auto& analyzer =
+        dynamic_cast<irs::numeric_token_stream&>(field.get_tokens());
+    irs::type_info::type_id const expected[]{
+        irs::type<irs::granularity_prefix>::id()};
+    auto features = field.features();
+    EXPECT_TRUE(
+        std::equal(expected, expected + 1, features.begin(), features.end()));
+    EXPECT_EQ(irs::IndexFeatures::NONE, field.index_features());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // bigNegativeDoubleValue
+  {
+    auto& field = *it;
+    EXPECT_EQ(mangleNumeric("bigNegativeDoubleValue"), field.name());
+    auto& analyzer =
+        dynamic_cast<irs::numeric_token_stream&>(field.get_tokens());
+    irs::type_info::type_id const expected[]{
+        irs::type<irs::granularity_prefix>::id()};
+    auto features = field.features();
+    EXPECT_TRUE(
+        std::equal(expected, expected + 1, features.begin(), features.end()));
+    EXPECT_EQ(irs::IndexFeatures::NONE, field.index_features());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  EXPECT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest, FieldIterator_reset) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  auto json0 = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"boost\": \"10\", \
+    \"depth\": \"20\" \
+  }");
+
+  auto json1 = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"name\": \"foo\" \
+  }");
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._includeAllFields = true;  // include all fields
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(json0->slice(), linkMeta);
+  ASSERT_TRUE(it.valid());
+
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleStringIdentity("boost"), value.name());
+    const auto expected_analyzer = irs::analysis::analyzers::get(
+        "identity", irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    auto& analyzers =
+        server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+    auto const expected_features =
+        analyzers
+            .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                 darbotdb::transaction::OperationOriginTestCase{})
+            ->features();
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        value.features());
+    EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // depth (with IdentityAnalyzer)
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleStringIdentity("depth"), value.name());
+    const auto expected_analyzer = irs::analysis::analyzers::get(
+        "identity", irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    auto& analyzers =
+        server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+    auto const expected_features =
+        analyzers
+            .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                 darbotdb::transaction::OperationOriginTestCase{})
+            ->features();
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        value.features());
+    EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+  }
+
+  ++it;
+  ASSERT_FALSE(it.valid());
+
+  it.reset(json1->slice(), linkMeta);
+  ASSERT_TRUE(it.valid());
+
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleStringIdentity("name"), value.name());
+    const auto expected_analyzer = irs::analysis::analyzers::get(
+        "identity", irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    auto& analyzers =
+        server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+    auto const expected_features =
+        analyzers
+            .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                 darbotdb::transaction::OperationOriginTestCase{})
+            ->features();
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        value.features());
+    EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+  }
+
+  ++it;
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(
+    IResearchDocumentTest,
+    FieldIterator_traverse_complex_object_ordered_all_fields_custom_list_offset_prefix_suffix) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"nested\": { \"foo\": \"str\" }, \
+    \"keys\": [ \"1\",\"2\",\"3\",\"4\" ], \
+    \"analyzers\": [], \
+    \"boost\": \"10\", \
+    \"depth\": \"20\", \
+    \"fields\": { \"fieldA\" : { \"name\" : \"a\" }, \"fieldB\" : { \"name\" : \"b\" } }, \
+    \"listValuation\": \"ignored\", \
+    \"locale\": \"ru_RU.KOI8-R\", \
+    \"array\" : [ \
+      { \"id\" : \"1\", \"subarr\" : [ \"1\", \"2\", \"3\" ], \"subobj\" : { \"id\" : \"1\" } }, \
+      { \"subarr\" : [ \"4\", \"5\", \"6\" ], \"subobj\" : { \"name\" : \"foo\" }, \"id\" : \"2\" }, \
+      { \"id\" : \"3\", \"subarr\" : [ \"7\", \"8\", \"9\" ], \"subobj\" : { \"id\" : \"2\" } } \
+    ] \
+  }");
+
+  std::unordered_multiset<std::string> expectedValues{
+      mangleStringIdentity("nested.foo"),
+      mangleStringIdentity("keys[0]"),
+      mangleStringIdentity("keys[1]"),
+      mangleStringIdentity("keys[2]"),
+      mangleStringIdentity("keys[3]"),
+      mangleStringIdentity("boost"),
+      mangleStringIdentity("depth"),
+      mangleStringIdentity("fields.fieldA.name"),
+      mangleStringIdentity("fields.fieldB.name"),
+      mangleStringIdentity("listValuation"),
+      mangleStringIdentity("locale"),
+
+      mangleStringIdentity("array[0].id"),
+      mangleStringIdentity("array[0].subarr[0]"),
+      mangleStringIdentity("array[0].subarr[1]"),
+      mangleStringIdentity("array[0].subarr[2]"),
+      mangleStringIdentity("array[0].subobj.id"),
+
+      mangleStringIdentity("array[1].subarr[0]"),
+      mangleStringIdentity("array[1].subarr[1]"),
+      mangleStringIdentity("array[1].subarr[2]"),
+      mangleStringIdentity("array[1].subobj.name"),
+      mangleStringIdentity("array[1].id"),
+
+      mangleStringIdentity("array[2].id"),
+      mangleStringIdentity("array[2].subarr[0]"),
+      mangleStringIdentity("array[2].subarr[1]"),
+      mangleStringIdentity("array[2].subarr[2]"),
+      mangleStringIdentity("array[2].subobj.id")};
+
+  auto const slice = json->slice();
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._includeAllFields = true;    // include all fields
+  linkMeta._trackListPositions = true;  // allow indexes in field names
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(slice, linkMeta);
+
+  // default analyzer
+  auto const expected_analyzer = irs::analysis::analyzers::get(
+      "identity", irs::type<irs::text_format::vpack>::get(),
+      darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+  auto& analyzers =
+      server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+  auto const expected_features =
+      analyzers
+          .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+               darbotdb::transaction::OperationOriginTestCase{})
+          ->features();
+
+  for (; it.valid(); ++it) {
+    auto& field = *it;
+    std::string const actualName = std::string(field.name());
+    EXPECT_EQ(1, expectedValues.erase(actualName));
+
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(field.get_tokens());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        field.features());
+    EXPECT_EQ(expected_features.indexFeatures(), field.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+  }
+
+  EXPECT_TRUE(expectedValues.empty());
+}
+
+TEST_F(IResearchDocumentTest,
+       FieldIterator_traverse_complex_object_check_meta_inheritance) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"nested\": { \"foo\": \"str\" }, \
+    \"keys\": [ \"1\",\"2\",\"3\",\"4\" ], \
+    \"analyzers\": [], \
+    \"boost\": \"10\", \
+    \"depth\": 20, \
+    \"fields\": { \"fieldA\" : { \"name\" : \"a\" }, \"fieldB\" : { \"name\" : \"b\" } }, \
+    \"listValuation\": \"ignored\", \
+    \"locale\": null, \
+    \"array\" : [ \
+      { \"id\" : 1, \"subarr\" : [ \"1\", \"2\", \"3\" ], \"subobj\" : { \"id\" : 1 } }, \
+      { \"subarr\" : [ \"4\", \"5\", \"6\" ], \"subobj\" : { \"name\" : \"foo\" }, \"id\" : \"2\" }, \
+      { \"id\" : 3, \"subarr\" : [ \"7\", \"8\", \"9\" ], \"subobj\" : { \"id\" : 2 } } \
+    ] \
+  }");
+
+  auto const slice = json->slice();
+
+  auto linkMetaJson = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"includeAllFields\" : true, \
+    \"trackListPositions\" : true, \
+    \"fields\" : { \
+       \"boost\" : { \"analyzers\": [ \"identity\" ] }, \
+       \"keys\" : { \"trackListPositions\" : false, \"analyzers\": [ \"identity\" ] }, \
+       \"depth\" : { \"trackListPositions\" : true }, \
+       \"fields\" : { \"includeAllFields\" : false, \"fields\" : { \"fieldA\" : { \"includeAllFields\" : true } } }, \
+       \"listValuation\" : { \"includeAllFields\" : false }, \
+       \"array\" : { \
+         \"fields\" : { \"subarr\" : { \"trackListPositions\" : false }, \"subobj\": { \"includeAllFields\" : false }, \"id\" : { } } \
+       } \
+     }, \
+    \"analyzers\": [ \"identity\", \"iresearch-document-empty\" ] \
+  }");
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+
+  std::string error;
+  ASSERT_TRUE(linkMeta.init(server.server(), linkMetaJson->slice(), error,
+                            sysVocbase.get()->name()));
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(slice, linkMeta);
+  ASSERT_TRUE(it.valid());
+
+  // nested.foo (with IdentityAnalyzer)
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleStringIdentity("nested.foo"), value.name());
+    const auto expected_analyzer = irs::analysis::analyzers::get(
+        "identity", irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+    auto& analyzers =
+        server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+    auto const expected_features =
+        analyzers
+            .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                 darbotdb::transaction::OperationOriginTestCase{})
+            ->features();
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        value.features());
+    EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // nested.foo (with EmptyAnalyzer)
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleString("nested.foo", "iresearch-document-empty"),
+              value.name());
+    auto& analyzer = dynamic_cast<EmptyAnalyzer&>(value.get_tokens());
+    EXPECT_FALSE(analyzer.next());
+  }
+
+  // keys[]
+  for (size_t i = 0; i < 4; ++i) {
+    ++it;
+    ASSERT_TRUE(it.valid());
+
+    auto& value = *it;
+    EXPECT_EQ(mangleStringIdentity("keys"), value.name());
+    const auto expected_analyzer = irs::analysis::analyzers::get(
+        "identity", irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    auto& analyzers =
+        server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+    auto const expected_features =
+        analyzers
+            .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                 darbotdb::transaction::OperationOriginTestCase{})
+            ->features();
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        value.features());
+    EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // boost
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleStringIdentity("boost"), value.name());
+    const auto expected_analyzer = irs::analysis::analyzers::get(
+        "identity", irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    auto& analyzers =
+        server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+    auto const expected_features =
+        analyzers
+            .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                 darbotdb::transaction::OperationOriginTestCase{})
+            ->features();
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        value.features());
+    EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // depth
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleNumeric("depth"), value.name());
+    auto& analyzer =
+        dynamic_cast<irs::numeric_token_stream&>(value.get_tokens());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // fields.fieldA (with IdenityAnalyzer)
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleStringIdentity("fields.fieldA.name"), value.name());
+    const auto expected_analyzer = irs::analysis::analyzers::get(
+        "identity", irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    auto& analyzers =
+        server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+    auto const expected_features =
+        analyzers
+            .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                 darbotdb::transaction::OperationOriginTestCase{})
+            ->features();
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        value.features());
+    EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // fields.fieldA (with EmptyAnalyzer)
+  {
+    auto& value = *it;
+    EXPECT_TRUE(mangleString("fields.fieldA.name",
+                             "iresearch-document-empty") == value.name());
+    auto& analyzer = dynamic_cast<EmptyAnalyzer&>(value.get_tokens());
+    EXPECT_FALSE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // listValuation (with IdenityAnalyzer)
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleStringIdentity("listValuation"), value.name());
+    const auto expected_analyzer = irs::analysis::analyzers::get(
+        "identity", irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    auto& analyzers =
+        server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+    auto const expected_features =
+        analyzers
+            .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                 darbotdb::transaction::OperationOriginTestCase{})
+            ->features();
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        value.features());
+    EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // listValuation (with EmptyAnalyzer)
+  {
+    auto& value = *it;
+    EXPECT_TRUE(mangleString("listValuation", "iresearch-document-empty") ==
+                value.name());
+    auto& analyzer = dynamic_cast<EmptyAnalyzer&>(value.get_tokens());
+    EXPECT_FALSE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // locale
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleNull("locale"), value.name());
+    auto& analyzer = dynamic_cast<irs::null_token_stream&>(value.get_tokens());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // array[0].id
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleNumeric("array[0].id"), value.name());
+    auto& analyzer =
+        dynamic_cast<irs::numeric_token_stream&>(value.get_tokens());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  // array[0].subarr[0-2]
+  for (size_t i = 0; i < 3; ++i) {
+    ++it;
+    ASSERT_TRUE(it.valid());
+
+    // IdentityAnalyzer
+    {
+      auto& value = *it;
+      EXPECT_EQ(mangleStringIdentity("array[0].subarr"), value.name());
+      const auto expected_analyzer = irs::analysis::analyzers::get(
+          "identity", irs::type<irs::text_format::vpack>::get(),
+          darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+      auto& analyzers =
+          server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+      auto const expected_features =
+          analyzers
+              .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                   darbotdb::transaction::OperationOriginTestCase{})
+              ->features();
+      auto& analyzer =
+          dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+      EXPECT_EQ(expected_features.fieldFeatures(
+                    darbotdb::iresearch::LinkVersion::MIN),
+                value.features());
+      EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+      EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+    }
+
+    ++it;
+    ASSERT_TRUE(it.valid());
+
+    // EmptyAnalyzer
+    {
+      auto& value = *it;
+      EXPECT_TRUE(mangleString("array[0].subarr", "iresearch-document-empty") ==
+                  value.name());
+      auto& analyzer = dynamic_cast<EmptyAnalyzer&>(value.get_tokens());
+      EXPECT_FALSE(analyzer.next());
+    }
+  }
+
+  // array[1].subarr[0-2]
+  for (size_t i = 0; i < 3; ++i) {
+    ++it;
+    ASSERT_TRUE(it.valid());
+
+    // IdentityAnalyzer
+    {
+      auto& value = *it;
+      EXPECT_EQ(mangleStringIdentity("array[1].subarr"), value.name());
+      const auto expected_analyzer = irs::analysis::analyzers::get(
+          "identity", irs::type<irs::text_format::vpack>::get(),
+          darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+      auto& analyzers =
+          server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+      auto const expected_features =
+          analyzers
+              .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                   darbotdb::transaction::OperationOriginTestCase{})
+              ->features();
+      auto& analyzer =
+          dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+      EXPECT_EQ(expected_features.fieldFeatures(
+                    darbotdb::iresearch::LinkVersion::MIN),
+                value.features());
+      EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+      EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+    }
+
+    ++it;
+    ASSERT_TRUE(it.valid());
+
+    // EmptyAnalyzer
+    {
+      auto& value = *it;
+      EXPECT_TRUE(mangleString("array[1].subarr", "iresearch-document-empty") ==
+                  value.name());
+      auto& analyzer = dynamic_cast<EmptyAnalyzer&>(value.get_tokens());
+      EXPECT_FALSE(analyzer.next());
+    }
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // array[1].id (IdentityAnalyzer)
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleStringIdentity("array[1].id"), value.name());
+    const auto expected_analyzer = irs::analysis::analyzers::get(
+        "identity", irs::type<irs::text_format::vpack>::get(),
+        darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+    auto& analyzers =
+        server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+    auto const expected_features =
+        analyzers
+            .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                 darbotdb::transaction::OperationOriginTestCase{})
+            ->features();
+    auto& analyzer = dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+    EXPECT_EQ(
+        expected_features.fieldFeatures(darbotdb::iresearch::LinkVersion::MIN),
+        value.features());
+    EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+    EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // array[1].id (EmptyAnalyzer)
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleString("array[1].id", "iresearch-document-empty"),
+              value.name());
+    auto& analyzer = dynamic_cast<EmptyAnalyzer&>(value.get_tokens());
+    EXPECT_FALSE(analyzer.next());
+  }
+
+  ++it;
+  ASSERT_TRUE(it.valid());
+
+  // array[2].id (IdentityAnalyzer)
+  {
+    auto& value = *it;
+    EXPECT_EQ(mangleNumeric("array[2].id"), value.name());
+    auto& analyzer =
+        dynamic_cast<irs::numeric_token_stream&>(value.get_tokens());
+    EXPECT_TRUE(analyzer.next());
+  }
+
+  // array[2].subarr[0-2]
+  for (size_t i = 0; i < 3; ++i) {
+    ++it;
+    ASSERT_TRUE(it.valid());
+
+    // IdentityAnalyzer
+    {
+      auto& value = *it;
+      EXPECT_EQ(mangleStringIdentity("array[2].subarr"), value.name());
+      const auto expected_analyzer = irs::analysis::analyzers::get(
+          "identity", irs::type<irs::text_format::vpack>::get(),
+          darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+      auto& analyzers =
+          server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+      auto const expected_features =
+          analyzers
+              .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                   darbotdb::transaction::OperationOriginTestCase{})
+              ->features();
+      auto& analyzer =
+          dynamic_cast<irs::analysis::analyzer&>(value.get_tokens());
+      EXPECT_EQ(expected_features.fieldFeatures(
+                    darbotdb::iresearch::LinkVersion::MIN),
+                value.features());
+      EXPECT_EQ(expected_features.indexFeatures(), value.index_features());
+      EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+    }
+
+    ++it;
+    ASSERT_TRUE(it.valid());
+
+    // EmptyAnalyzer
+    {
+      auto& value = *it;
+      EXPECT_TRUE(mangleString("array[2].subarr", "iresearch-document-empty") ==
+                  value.name());
+      auto& analyzer = dynamic_cast<EmptyAnalyzer&>(value.get_tokens());
+      EXPECT_FALSE(analyzer.next());
+    }
+  }
+
+  ++it;
+  EXPECT_FALSE(it.valid());
+}
+
+TEST_F(
+    IResearchDocumentTest,
+    FieldIterator_traverse_complex_object_check_meta_inheritance_object_analyzer) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  auto const json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"nested\": { \"foo\": \"str\" }, \
+    \"keys\": [ \"1\",\"2\",\"3\",\"4\" ], \
+    \"analyzers\": [], \
+    \"boost\": \"10\", \
+    \"depth\": 20, \
+    \"fields\": { \"fieldA\" : { \"name\" : \"a\" }, \"fieldB\" : { \"name\" : \"b\" } }, \
+    \"listValuation\": \"ignored\", \
+    \"locale\": null, \
+    \"array\" : [ \
+      { \"id\" : 1, \"subarr\" : [ \"1\", \"2\", \"3\" ], \"subobj\" : { \"id\" : 1 } }, \
+      { \"subarr\" : [ \"4\", \"5\", \"6\" ], \"subobj\" : { \"name\" : \"foo\" }, \"id\" : \"2\" }, \
+      { \"id\" : 3, \"subarr\" : [ \"7\", \"8\", \"9\" ], \"subobj\" : { \"id\" : 2 } } \
+    ] \
+  }");
+
+  auto const linkMetaJson = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"includeAllFields\" : true, \
+    \"trackListPositions\" : true, \
+    \"fields\" : { \
+       \"boost\" : { \"analyzers\": [ \"identity\" ] }, \
+       \"keys\" : { \"trackListPositions\" : false, \"analyzers\": [ \"identity\", \"iresearch-vpack-analyzer\" ] }, \
+       \"depth\" : { \"trackListPositions\" : true }, \
+       \"fields\" : { \"includeAllFields\" : false, \"fields\" : { \"fieldA\" : { \"includeAllFields\" : true } } }, \
+       \"listValuation\" : { \"includeAllFields\" : false }, \
+       \"array\" : { \
+         \"fields\" : { \"subarr\" : { \"trackListPositions\" : false }, \"subobj\": { \"includeAllFields\" : false }, \"id\" : { } } \
+       } \
+     }, \
+    \"analyzers\": [ \"identity\", \"iresearch-document-empty\", \"iresearch-vpack-analyzer\" ] \
+  }");
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  std::string error;
+  ASSERT_TRUE(linkMeta.init(server.server(), linkMetaJson->slice(), error,
+                            sysVocbase.get()->name()));
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  std::function<AssertFieldFunc> const assertFields[] = {
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "nested");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "nested.foo");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "nested.foo");
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "keys");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "keys");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "keys");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "keys");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "keys");
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "analyzers");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "boost");
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(server, *it,
+                                               mangleNumeric("depth"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "fields");
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "fields.fieldA");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "fields.fieldA.name");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "fields.fieldA.name");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "listValuation");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "listValuation");
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::null_token_stream>(server, *it, mangleNull("locale"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "array");
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "array[0]");
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(server, *it,
+                                               mangleNumeric("array[0].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "array[0].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "array[0].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "array[0].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "array[0].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "array[0].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "array[0].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "array[0].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "array[0].subobj");
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "array[1]");
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "array[1].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "array[1].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "array[1].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "array[1].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "array[1].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "array[1].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "array[1].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "array[1].subobj");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "array[1].id");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "array[1].id");
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "array[2]");
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(server, *it,
+                                               mangleNumeric("array[2].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "array[2].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "array[2].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "array[2].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "array[2].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "array[2].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "array[2].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<EmptyAnalyzer>(server, *it, "array[2].subarr");
+      },
+      [](auto& server, auto const& it) {
+        assertField<VPackAnalyzer>(server, *it, "array[2].subobj");
+      },
+  };
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(json->slice(), linkMeta);
+
+  for (auto& assertField : assertFields) {
+    ASSERT_TRUE(it.valid());
+    assertField(server, it);
+    ++it;
+  }
+
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest, FieldIterator_nullptr_analyzer) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  darbotdb::iresearch::IResearchAnalyzerFeature analyzers(server.server());
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"stringValue\": \"string\" \
+  }");
+  auto const slice = json->slice();
+
+  // register analizers with feature
+  {
+    // ensure there will be no exception on 'start'
+    InvalidAnalyzer::returnNullFromMake = false;
+    InvalidAnalyzer::returnFalseFromToString = false;
+    analyzers.start();
+
+    analyzers.remove("empty", darbotdb::transaction::OperationOriginTestCase{});
+    analyzers.remove("invalid",
+                     darbotdb::transaction::OperationOriginTestCase{});
+
+    darbotdb::iresearch::IResearchAnalyzerFeature::EmplaceResult result;
+    ASSERT_TRUE(
+        analyzers
+            .emplace(
+                result, darbotdb::StaticStrings::SystemDatabase + "::empty",
+                "iresearch-document-empty",
+                darbotdb::velocypack::Parser::fromJson("{ \"args\":\"en\" }")
+                    ->slice(),
+                darbotdb::transaction::OperationOriginTestCase{},
+                darbotdb::iresearch::Features(irs::IndexFeatures::FREQ))
+            .ok());
+
+    // valid duplicate (same properties)
+    ASSERT_TRUE(
+        analyzers
+            .emplace(
+                result, darbotdb::StaticStrings::SystemDatabase + "::empty",
+                "iresearch-document-empty",
+                darbotdb::velocypack::Parser::fromJson("{ \"args\":\"en\" }")
+                    ->slice(),
+                darbotdb::transaction::OperationOriginTestCase{},
+                darbotdb::iresearch::Features(irs::IndexFeatures::FREQ))
+            .ok());
+
+    // ensure there will be no exception on 'emplace'
+    InvalidAnalyzer::returnFalseFromToString = true;
+    ASSERT_FALSE(
+        analyzers
+            .emplace(
+                result, darbotdb::StaticStrings::SystemDatabase + "::invalid",
+                "iresearch-document-invalid",
+                darbotdb::velocypack::Parser::fromJson("{ \"args\":\"en\" }")
+                    ->slice(),
+                darbotdb::transaction::OperationOriginTestCase{},
+                darbotdb::iresearch::Features(irs::IndexFeatures::FREQ))
+            .ok());
+    InvalidAnalyzer::returnFalseFromToString = false;
+
+    // ensure that there will be no exception on 'emplace'
+    InvalidAnalyzer::returnNullFromMake = true;
+    ASSERT_FALSE(
+        analyzers
+            .emplace(
+                result, darbotdb::StaticStrings::SystemDatabase + "::invalid",
+                "iresearch-document-invalid",
+                darbotdb::velocypack::Parser::fromJson("{ \"args\":\"en\" }")
+                    ->slice(),
+                darbotdb::transaction::OperationOriginTestCase{},
+                darbotdb::iresearch::Features(irs::IndexFeatures::FREQ))
+            .ok());
+    InvalidAnalyzer::returnNullFromMake = false;
+
+    ASSERT_TRUE(
+        analyzers
+            .emplace(
+                result, darbotdb::StaticStrings::SystemDatabase + "::invalid",
+                "iresearch-document-invalid",
+                darbotdb::velocypack::Parser::fromJson("{ \"args\":\"en\" }")
+                    ->slice(),
+                darbotdb::transaction::OperationOriginTestCase{},
+                darbotdb::iresearch::Features(irs::IndexFeatures::FREQ))
+            .ok());
+  }
+
+  // last analyzer invalid
+  {
+    darbotdb::iresearch::IResearchLinkMeta linkMeta;
+    linkMeta._analyzers.emplace_back(darbotdb::iresearch::FieldMeta::Analyzer(
+        analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::empty",
+                      darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                      darbotdb::transaction::OperationOriginTestCase{}),
+        "empty"));  // add analyzer
+
+    InvalidAnalyzer::returnNullFromMake = false;
+    linkMeta._analyzers.emplace_back(darbotdb::iresearch::FieldMeta::Analyzer(
+        analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::invalid",
+                      darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                      darbotdb::transaction::OperationOriginTestCase{}),
+        "invalid"));                    // add analyzer
+    linkMeta._includeAllFields = true;  // include all fields
+    linkMeta._primitiveOffset = linkMeta._analyzers.size();
+
+    // acquire analyzer, another one should be created
+    auto analyzer =
+        linkMeta._analyzers.back()
+            ._pool->get();  // cached instance should have been acquired
+
+    InvalidAnalyzer::returnNullFromMake = true;
+
+    std::vector<std::string> EMPTY;
+    darbotdb::transaction::Methods trx(
+        darbotdb::transaction::StandaloneContext::create(
+            *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+        EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+    IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+    it.reset(slice, linkMeta);
+    ASSERT_TRUE(it.valid());
+
+    // stringValue (with IdentityAnalyzer)
+    {
+      auto& field = *it;
+      EXPECT_EQ(mangleStringIdentity("stringValue"), field.name());
+      auto const expected_analyzer = irs::analysis::analyzers::get(
+          "identity", irs::type<irs::text_format::vpack>::get(),
+          darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+      auto& analyzers =
+          server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+      auto const expected_features =
+          analyzers
+              .get("identity", darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                   darbotdb::transaction::OperationOriginTestCase{})
+              ->features();
+      auto& analyzer =
+          dynamic_cast<irs::analysis::analyzer&>(field.get_tokens());
+      EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+      EXPECT_EQ(expected_features.fieldFeatures(
+                    darbotdb::iresearch::LinkVersion::MIN),
+                field.features());
+      EXPECT_EQ(expected_features.indexFeatures(), field.index_features());
+    }
+
+    ++it;
+    ASSERT_TRUE(it.valid());
+
+    // stringValue (with EmptyAnalyzer)
+    {
+      auto& field = *it;
+      EXPECT_EQ(mangleString("stringValue", "empty"), field.name());
+      auto const expected_analyzer = irs::analysis::analyzers::get(
+          "iresearch-document-empty", irs::type<irs::text_format::vpack>::get(),
+          darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+      auto& analyzer = dynamic_cast<EmptyAnalyzer&>(field.get_tokens());
+      EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+    }
+
+    ++it;
+    ASSERT_FALSE(it.valid());
+
+    analyzer->reset(std::string_view{});  // ensure that acquired 'analyzer'
+                                          // will not be optimized out
+  }
+
+  // first analyzer is invalid
+  {
+    darbotdb::iresearch::IResearchLinkMeta linkMeta;
+    linkMeta._analyzers.clear();
+
+    InvalidAnalyzer::returnNullFromMake = false;
+    linkMeta._analyzers.emplace_back(darbotdb::iresearch::FieldMeta::Analyzer(
+        analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::invalid",
+                      darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                      darbotdb::transaction::OperationOriginTestCase{}),
+        "invalid"));  // add analyzer
+    linkMeta._analyzers.emplace_back(darbotdb::iresearch::FieldMeta::Analyzer(
+        analyzers.get(darbotdb::StaticStrings::SystemDatabase + "::empty",
+                      darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                      darbotdb::transaction::OperationOriginTestCase{}),
+        "empty"));                      // add analyzer
+    linkMeta._includeAllFields = true;  // include all fields
+    linkMeta._primitiveOffset = linkMeta._analyzers.size();
+
+    // acquire analyzer, another one should be created
+    auto analyzer =
+        linkMeta._analyzers.front()
+            ._pool->get();  // cached instance should have been acquired
+    InvalidAnalyzer::returnNullFromMake = true;
+
+    std::vector<std::string> EMPTY;
+    darbotdb::transaction::Methods trx(
+        darbotdb::transaction::StandaloneContext::create(
+            *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+        EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+    IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+    it.reset(slice, linkMeta);
+    ASSERT_TRUE(it.valid());
+
+    // stringValue (with EmptyAnalyzer)
+    {
+      auto& field = *it;
+      EXPECT_EQ(mangleString("stringValue", "empty"), field.name());
+      auto const expected_analyzer = irs::analysis::analyzers::get(
+          "iresearch-document-empty", irs::type<irs::text_format::vpack>::get(),
+          darbotdb::iresearch::ref<char>(VPackSlice::emptyObjectSlice()));
+      auto& analyzer = dynamic_cast<EmptyAnalyzer&>(field.get_tokens());
+      EXPECT_EQ(expected_analyzer->type(), analyzer.type());
+    }
+
+    ++it;
+    ASSERT_FALSE(it.valid());
+
+    analyzer->reset(std::string_view{});  // ensure that acquired 'analyzer'
+                                          // will not be optimized out
+  }
+}
+
+TEST_F(IResearchDocumentTest,
+       FieldIterator_traverse_complex_object_primitive_type_sub_analyzers) {
+  auto const linkMetaJson = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"includeAllFields\" : true, \
+    \"trackListPositions\" : true, \
+    \"fields\" : { \
+       \"boost\" : { \"analyzers\": [ \"iresearch-document-number\" ] }, \
+       \"keys\" : { \"trackListPositions\" : false, \"analyzers\": [ \"iresearch-document-number\", \"iresearch-document-bool\" ] }, \
+       \"depth\" : { \"trackListPositions\" : true, \"analyzers\": [ \"iresearch-document-string\"] }, \
+       \"fields\" : { \"analyzers\": [ \"iresearch-document-number\", \"iresearch-document-bool\" ],\
+                      \"includeAllFields\" : false, \"fields\" :\
+                        { \"fieldA\" : { \"includeAllFields\" : true } } }, \
+       \"listValuation\" : { \"includeAllFields\" : false }, \
+       \"array\" : { \
+         \"analyzers\": [ \"iresearch-document-number\", \"iresearch-document-bool\" ],\
+         \"trackListPositions\":true,\
+         \"fields\" : { \"subarr\" : { \"trackListPositions\" : false }, \"subobj\": { \"includeAllFields\" : false, \"fields\":{\"id\" : {}} }, \"id\" : { } } \
+       } \
+     }, \
+    \"analyzers\": [ \"identity\"] \
+  }");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  std::string error;
+  ASSERT_TRUE(linkMeta.init(server.server(), linkMetaJson->slice(), error,
+                            sysVocbase.get()->name()));
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      "{ \
+    \"nested\": { \"foo\": \"str\" }, \
+    \"keys\": [ \"1\",\"2\"], \
+    \"analyzers\": [], \
+    \"boost\": \"10\", \
+    \"depth\": \"20\", \
+    \"fields\": { \"fieldA\" : { \"name\" : \"a\" }, \"fieldB\" : { \"name\" : \"b\" } }, \
+    \"listValuation\": \"ignored\", \
+    \"array\" : [ \
+      { \"id\" : \"1\", \"subarr\" : [ \"1\", \"2\", \"3\" ], \"subobj\" : { \"id\" : \"1\" } }, \
+      { \"subarr\" : [ \"4\", \"5\", \"6\" ], \"subobj\" : { \"name\" : \"foo\" }, \"id\" : \"2\" }, \
+      { \"id\" : \"3\", \"subarr\" : [ \"7\", \"8\", \"9\" ], \"subobj\" : { \"id\" : \"2\" } } \
+    ] \
+  }");
+
+  std::function<AssertFieldFunc> const assertFields[] = {
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "nested.foo");
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(server, *it,
+                                               mangleNumeric("keys"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it, mangleBool("keys"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(server, *it,
+                                               mangleNumeric("keys"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it, mangleBool("keys"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(server, *it,
+                                               mangleNumeric("boost"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<TypedAnalyzer>(server, *it, "depth",
+                                   "iresearch-document-string");
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("fields.fieldA.name"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(
+            server, *it, mangleBool("fields.fieldA.name"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer>(server, *it, "listValuation");
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(server, *it,
+                                               mangleNumeric("array[0].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[0].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("array[0].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[0].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("array[0].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[0].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("array[0].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[0].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("array[0].subobj.id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(
+            server, *it, mangleBool("array[0].subobj.id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("array[1].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[1].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("array[1].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[1].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("array[1].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[1].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(server, *it,
+                                               mangleNumeric("array[1].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[1].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(server, *it,
+                                               mangleNumeric("array[2].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[2].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("array[2].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[2].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("array[2].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[2].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("array[2].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(server, *it,
+                                               mangleBool("array[2].subarr"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream>(
+            server, *it, mangleNumeric("array[2].subobj.id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::boolean_token_stream>(
+            server, *it, mangleBool("array[2].subobj.id"));
+      },
+  };
+
+  IResearchLinkIterator it(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it.reset(json->slice(), linkMeta);
+
+  for (auto& assertField : assertFields) {
+    ASSERT_TRUE(it.valid());
+    assertField(server, it);
+    ++it;
+  }
+
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest, test_rid_encoding) {
+  auto data = darbotdb::velocypack::Parser::fromJson(
+      "[{ \"rid\": 1605879230128717824},"
+      "{  \"rid\": 1605879230128717826},"
+      "{  \"rid\": 1605879230129766400},"
+      "{  \"rid\": 1605879230130814976},"
+      "{  \"rid\": 1605879230130814978},"
+      "{  \"rid\": 1605879230131863552},"
+      "{  \"rid\": 1605879230131863554},"
+      "{  \"rid\": 1605879230132912128},"
+      "{  \"rid\": 1605879230133960704},"
+      "{  \"rid\": 1605879230133960706},"
+      "{  \"rid\": 1605879230135009280},"
+      "{  \"rid\": 1605879230136057856},"
+      "{  \"rid\": 1605879230136057858},"
+      "{  \"rid\": 1605879230137106432},"
+      "{  \"rid\": 1605879230137106434},"
+      "{  \"rid\": 1605879230138155008},"
+      "{  \"rid\": 1605879230138155010},"
+      "{  \"rid\": 1605879230139203584},"
+      "{  \"rid\": 1605879230139203586},"
+      "{  \"rid\": 1605879230140252160},"
+      "{  \"rid\": 1605879230140252162},"
+      "{  \"rid\": 1605879230141300736},"
+      "{  \"rid\": 1605879230142349312},"
+      "{  \"rid\": 1605879230142349314},"
+      "{  \"rid\": 1605879230142349316},"
+      "{  \"rid\": 1605879230143397888},"
+      "{  \"rid\": 1605879230143397890},"
+      "{  \"rid\": 1605879230144446464},"
+      "{  \"rid\": 1605879230144446466},"
+      "{  \"rid\": 1605879230144446468},"
+      "{  \"rid\": 1605879230145495040},"
+      "{  \"rid\": 1605879230145495042},"
+      "{  \"rid\": 1605879230145495044},"
+      "{  \"rid\": 1605879230146543616},"
+      "{  \"rid\": 1605879230146543618},"
+      "{  \"rid\": 1605879230146543620},"
+      "{  \"rid\": 1605879230147592192}]");
+
+  struct DataStore {
+    irs::memory_directory dir;
+    irs::DirectoryReader reader;
+    irs::IndexWriter::ptr writer;
+
+    DataStore() {
+      writer =
+          irs::IndexWriter::Make(dir, irs::formats::get("1_0"), irs::OM_CREATE);
+      EXPECT_TRUE(writer);
+      writer->Commit();
+
+      reader = irs::DirectoryReader(dir);
+    }
+  };
+
+  DataStore store0, store1;
+
+  auto const dataSlice = data->slice();
+
+  darbotdb::iresearch::Field field;
+  uint64_t rid;
+
+  size_t size = 0;
+  for (auto const docSlice : darbotdb::velocypack::ArrayIterator(dataSlice)) {
+    auto const ridSlice = docSlice.get("rid");
+    EXPECT_TRUE(ridSlice.isNumber());
+
+    rid = ridSlice.getNumber<uint64_t>();
+
+    auto pk = darbotdb::iresearch::DocumentPrimaryKey::encode(
+        darbotdb::LocalDocumentId(rid));
+    auto& writer = store0.writer;
+
+    // insert document
+    {
+      auto ctx = writer->GetBatch();
+      auto doc = ctx.Insert();
+      darbotdb::iresearch::Field::setPkValue(field, pk);
+      EXPECT_TRUE(doc.Insert<irs::Action::INDEX | irs::Action::STORE>(field));
+      EXPECT_TRUE(doc);
+    }
+    writer->Commit();
+
+    ++size;
+  }
+
+  store0.reader = store0.reader->Reopen();
+  EXPECT_EQ(size, store0.reader->size());
+  EXPECT_EQ(size, store0.reader->docs_count());
+
+  store1.writer->Import(*store0.reader);
+  store1.writer->Commit();
+
+  auto reader = store1.reader->Reopen();
+  ASSERT_TRUE(reader);
+  EXPECT_EQ(1, reader->size());
+  EXPECT_EQ(size, reader->docs_count());
+
+  size_t found = 0;
+  for (auto const docSlice : darbotdb::velocypack::ArrayIterator(dataSlice)) {
+    auto const ridSlice = docSlice.get("rid");
+    EXPECT_TRUE(ridSlice.isNumber());
+
+    rid = ridSlice.getNumber<uint64_t>();
+
+    auto& segment = (*reader)[0];
+
+    auto* pkField =
+        segment.field(darbotdb::iresearch::DocumentPrimaryKey::PK());
+    EXPECT_TRUE(pkField);
+    EXPECT_EQ(size, pkField->docs_count());
+
+    darbotdb::iresearch::PrimaryKeysFilter<false> filters{
+        irs::IResourceManager::kNoop};
+    EXPECT_TRUE(filters.empty());
+    filters.emplace(darbotdb::LocalDocumentId(rid));
+    EXPECT_FALSE(filters.empty());
+
+    // first execution
+    {
+      auto prepared =
+          static_cast<irs::filter&>(filters).prepare({.index = *reader});
+      ASSERT_TRUE(prepared);
+
+      for (auto& segment : *reader) {
+        auto docs = prepared->execute({.segment = segment});
+        ASSERT_TRUE(docs);
+        EXPECT_TRUE(docs->next());
+        auto const id = docs->value();
+        ++found;
+        EXPECT_FALSE(docs->next());
+        EXPECT_TRUE(irs::doc_limits::eof(docs->value()));
+        EXPECT_FALSE(docs->next());
+        EXPECT_TRUE(irs::doc_limits::eof(docs->value()));
+
+        auto column =
+            segment.column(darbotdb::iresearch::DocumentPrimaryKey::PK());
+        ASSERT_TRUE(column);
+
+        auto values = column->iterator(irs::ColumnHint::kNormal);
+        ASSERT_NE(nullptr, values);
+        auto* value = irs::get<irs::payload>(*values);
+        ASSERT_NE(nullptr, value);
+
+        EXPECT_EQ(id, values->seek(id));
+
+        darbotdb::LocalDocumentId pk;
+        EXPECT_TRUE(
+            darbotdb::iresearch::DocumentPrimaryKey::read(pk, value->value));
+        EXPECT_EQ(rid, pk.id());
+      }
+    }
+
+    // FIXME uncomment after fix
+    //// can't prepare twice
+    //{
+    //  auto prepared = filter.prepare(*reader);
+    //  ASSERT_TRUE(prepared);
+    //  EXPECT_EQ(prepared, filter.prepare(*reader)); // same object
+
+    //  for (auto& segment : *reader) {
+    //    auto docs = prepared->execute(segment);
+    //    ASSERT_TRUE(docs);
+    //    EXPECT_EQ(docs, prepared->execute(segment)); // same object
+    //    EXPECT_FALSE(docs->next());
+    //    EXPECT_TRUE(irs::doc_limits::eof(docs->value()));
+    //  }
+    //}
+  }
+
+  EXPECT_EQ(found, size);
+}
+
+TEST_F(IResearchDocumentTest, test_rid_filter) {
+  auto data = darbotdb::velocypack::Parser::fromJson(
+      "[{ \"rid\": 1605879230128717824},"
+      "{  \"rid\": 1605879230128717826},"
+      "{  \"rid\": 1605879230129766400},"
+      "{  \"rid\": 1605879230130814976},"
+      "{  \"rid\": 1605879230130814978},"
+      "{  \"rid\": 1605879230131863552},"
+      "{  \"rid\": 1605879230131863554},"
+      "{  \"rid\": 1605879230132912128},"
+      "{  \"rid\": 1605879230133960704},"
+      "{  \"rid\": 1605879230133960706},"
+      "{  \"rid\": 1605879230135009280},"
+      "{  \"rid\": 1605879230136057856},"
+      "{  \"rid\": 1605879230136057858},"
+      "{  \"rid\": 1605879230137106432},"
+      "{  \"rid\": 1605879230137106434},"
+      "{  \"rid\": 1605879230138155008},"
+      "{  \"rid\": 1605879230138155010},"
+      "{  \"rid\": 1605879230139203584},"
+      "{  \"rid\": 1605879230139203586},"
+      "{  \"rid\": 1605879230140252160},"
+      "{  \"rid\": 1605879230140252162},"
+      "{  \"rid\": 1605879230141300736},"
+      "{  \"rid\": 1605879230142349312},"
+      "{  \"rid\": 1605879230142349314},"
+      "{  \"rid\": 1605879230142349316},"
+      "{  \"rid\": 1605879230143397888},"
+      "{  \"rid\": 1605879230143397890},"
+      "{  \"rid\": 1605879230144446464},"
+      "{  \"rid\": 1605879230144446466},"
+      "{  \"rid\": 1605879230144446468},"
+      "{  \"rid\": 1605879230145495040},"
+      "{  \"rid\": 1605879230145495042},"
+      "{  \"rid\": 1605879230145495044},"
+      "{  \"rid\": 1605879230146543616},"
+      "{  \"rid\": 1605879230146543618},"
+      "{  \"rid\": 1605879230146543620},"
+      "{  \"rid\": 1605879230147592192}]");
+  auto data1 =
+      darbotdb::velocypack::Parser::fromJson("{ \"rid\": 2605879230128717824}");
+
+  struct DataStore {
+    irs::memory_directory dir;
+    irs::DirectoryReader reader;
+    irs::IndexWriter::ptr writer;
+
+    DataStore() {
+      writer =
+          irs::IndexWriter::Make(dir, irs::formats::get("1_0"), irs::OM_CREATE);
+      EXPECT_TRUE(writer);
+      writer->Commit();
+
+      reader = irs::DirectoryReader(dir);
+    }
+  };
+
+  auto const dataSlice = data->slice();
+  size_t expectedDocs = 0;
+  size_t expectedLiveDocs = 0;
+  DataStore store;
+
+  // initial population
+  for (auto const docSlice : darbotdb::velocypack::ArrayIterator(dataSlice)) {
+    auto const ridSlice = docSlice.get("rid");
+    EXPECT_TRUE(ridSlice.isNumber<uint64_t>());
+
+    auto rid = ridSlice.getNumber<uint64_t>();
+    darbotdb::iresearch::Field field;
+    auto pk = darbotdb::iresearch::DocumentPrimaryKey::encode(
+        darbotdb::LocalDocumentId(rid));
+
+    // insert document
+    {
+      auto ctx = store.writer->GetBatch();
+      auto doc = ctx.Insert();
+      darbotdb::iresearch::Field::setPkValue(field, pk);
+      EXPECT_TRUE(doc.Insert<irs::Action::INDEX | irs::Action::STORE>(field));
+      EXPECT_TRUE(doc);
+      ++expectedDocs;
+      ++expectedLiveDocs;
+    }
+  }
+
+  // add extra doc to hold segment after others are removed
+  {
+    darbotdb::iresearch::Field field;
+    auto pk = darbotdb::iresearch::DocumentPrimaryKey::encode(
+        darbotdb::LocalDocumentId(12345));
+    auto ctx = store.writer->GetBatch();
+    auto doc = ctx.Insert();
+    darbotdb::iresearch::Field::setPkValue(field, pk);
+    EXPECT_TRUE(doc.Insert<irs::Action::INDEX | irs::Action::STORE>(field));
+    EXPECT_TRUE(doc);
+  }
+
+  store.writer->Commit();
+  store.reader = store.reader->Reopen();
+  EXPECT_EQ(1, store.reader->size());
+  EXPECT_EQ(expectedDocs + 1,
+            store.reader->docs_count());  // +1 for keep-alive doc
+  EXPECT_EQ(expectedLiveDocs + 1,
+            store.reader->live_docs_count());  // +1 for keep-alive doc
+
+  // check regular filter case (unique rid)
+  {
+    size_t actualDocs = 0;
+
+    for (auto const docSlice : darbotdb::velocypack::ArrayIterator(dataSlice)) {
+      auto const ridSlice = docSlice.get("rid");
+      EXPECT_TRUE(ridSlice.isNumber<uint64_t>());
+
+      auto rid = ridSlice.getNumber<uint64_t>();
+      darbotdb::iresearch::PrimaryKeysFilter<false> filters{
+          irs::IResourceManager::kNoop};
+      EXPECT_TRUE(filters.empty());
+      filters.emplace(darbotdb::LocalDocumentId(rid));
+      EXPECT_FALSE(filters.empty());
+
+      auto prepared =
+          static_cast<irs::filter&>(filters).prepare({.index = *store.reader});
+      ASSERT_TRUE(prepared);
+
+      for (auto& segment : *store.reader) {
+        auto docs = prepared->execute({.segment = segment});
+        ASSERT_TRUE(docs);
+        EXPECT_TRUE(docs->next());
+        auto const id = docs->value();
+        ++actualDocs;
+        EXPECT_FALSE(docs->next());
+        EXPECT_TRUE(irs::doc_limits::eof(docs->value()));
+        EXPECT_FALSE(docs->next());
+        EXPECT_FALSE(docs->next());
+        EXPECT_TRUE(irs::doc_limits::eof(docs->value()));
+
+        auto column =
+            segment.column(darbotdb::iresearch::DocumentPrimaryKey::PK());
+        ASSERT_TRUE(column);
+
+        auto values = column->iterator(irs::ColumnHint::kNormal);
+        ASSERT_NE(nullptr, values);
+        auto* value = irs::get<irs::payload>(*values);
+        ASSERT_NE(nullptr, value);
+
+        EXPECT_EQ(id, values->seek(id));
+
+        darbotdb::LocalDocumentId pk;
+        EXPECT_TRUE(
+            darbotdb::iresearch::DocumentPrimaryKey::read(pk, value->value));
+        EXPECT_EQ(rid, pk.id());
+      }
+    }
+
+    EXPECT_EQ(expectedDocs, actualDocs);
+  }
+}
+
+TEST_F(IResearchDocumentTest, FieldIterator_index_id_attr) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._includeAllFields = true;  // include all fields
+
+  darbotdb::RevisionId rev;
+  VPackBuilder document;
+  {
+    auto analyzersCollection = sysVocbase->useCollection(
+        darbotdb::StaticStrings::AnalyzersCollection, false);
+    ASSERT_TRUE(analyzersCollection);
+    VPackBuilder builder;
+    builder.openObject();
+    builder.add(darbotdb::StaticStrings::KeyString, VPackValue("test"));
+    builder.close();
+
+    darbotdb::transaction::BatchOptions batchOptions;
+    darbotdb::OperationOptions options;
+    ASSERT_TRUE(darbotdb::transaction::helpers::newObjectForInsert(
+                    trx, *analyzersCollection, "test", builder.slice(), rev,
+                    document, options, batchOptions)
+                    .ok());
+    sysVocbase->releaseCollection(analyzersCollection.get());
+  }
+
+  auto mangledId = mangleStringIdentity(darbotdb::StaticStrings::IdString);
+  {
+    IResearchLinkIterator it_name("test", darbotdb::IndexId(1));
+    EXPECT_FALSE(it_name.valid());
+    it_name.reset(document.slice(), linkMeta);
+    ASSERT_TRUE(it_name.valid());
+    bool id_indexed{false};
+    while (it_name.valid()) {
+      auto& field = *it_name;
+      std::string const actualName = std::string(field.name());
+      id_indexed = actualName == mangledId;
+      if (id_indexed) {
+        break;
+      }
+      ++it_name;
+    }
+    ASSERT_TRUE(id_indexed);
+  }
+}
+
+TEST_F(IResearchDocumentTest, FieldIterator_dbServer_index_id_attr) {
+  auto oldRole = darbotdb::ServerState::instance()->getRole();
+  darbotdb::ServerState::instance()->setRole(
+      darbotdb::ServerState::RoleEnum::ROLE_DBSERVER);
+  irs::Finally roleRestorer = [oldRole]() noexcept {
+    darbotdb::ServerState::instance()->setRole(oldRole);
+  };
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._includeAllFields = true;  // include all fields
+
+  darbotdb::RevisionId rev;
+  VPackBuilder document;
+  {
+    auto analyzersCollection = sysVocbase->useCollection(
+        darbotdb::StaticStrings::AnalyzersCollection, false);
+    ASSERT_TRUE(analyzersCollection);
+    VPackBuilder builder;
+    builder.openObject();
+    builder.add(darbotdb::StaticStrings::KeyString, VPackValue("test"));
+    builder.close();
+
+    darbotdb::transaction::BatchOptions batchOptions;
+    darbotdb::OperationOptions options;
+    ASSERT_TRUE(darbotdb::transaction::helpers::newObjectForInsert(
+                    trx, *analyzersCollection, "test", builder.slice(), rev,
+                    document, options, batchOptions)
+                    .ok());
+    sysVocbase->releaseCollection(analyzersCollection.get());
+  }
+
+  auto mangledId = mangleStringIdentity(darbotdb::StaticStrings::IdString);
+  {
+    IResearchLinkIterator it_no_name(irs::kEmptyStringView<char>,
+                                     darbotdb::IndexId(0));
+    EXPECT_FALSE(it_no_name.valid());
+    it_no_name.reset(document.slice(), linkMeta);
+    ASSERT_TRUE(it_no_name.valid());
+    bool id_indexed{false};
+    while (it_no_name.valid()) {
+      auto& field = *it_no_name;
+      std::string const actualName = std::string(field.name());
+      id_indexed = actualName == mangledId;
+      if (id_indexed) {
+        break;
+      }
+      ++it_no_name;
+    }
+    ASSERT_FALSE(id_indexed);
+  }
+  {
+    IResearchLinkIterator it_name("test", darbotdb::IndexId(1));
+    EXPECT_FALSE(it_name.valid());
+    it_name.reset(document.slice(), linkMeta);
+    ASSERT_TRUE(it_name.valid());
+    bool id_indexed{false};
+    while (it_name.valid()) {
+      auto& field = *it_name;
+      std::string const actualName = std::string(field.name());
+      id_indexed = actualName == mangledId;
+      if (id_indexed) {
+        break;
+      }
+      ++it_name;
+    }
+    ASSERT_TRUE(id_indexed);
+  }
+}
+
+TEST_F(IResearchDocumentTest, FieldIterator_concurrent_use_typed_analyzer) {
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  auto& analyzers =
+      server
+          .template getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+  darbotdb::iresearch::IResearchLinkMeta linkMeta;
+  linkMeta._analyzers.clear();
+  linkMeta._analyzers.emplace_back(darbotdb::iresearch::FieldMeta::Analyzer(
+      analyzers.get(darbotdb::StaticStrings::SystemDatabase +
+                        "::iresearch-document-number-array",
+                    darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                    darbotdb::transaction::OperationOriginTestCase{}),
+      "iresearch-document-number-array"));  // add analyzer
+  ASSERT_TRUE(linkMeta._analyzers.front()._pool);
+  linkMeta._includeAllFields = true;  // include all fields
+  linkMeta._primitiveOffset = linkMeta._analyzers.size();
+  std::string error;
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+  IResearchLinkIterator it1(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+
+  auto json = darbotdb::velocypack::Parser::fromJson("{\"value\":\"3\"}");
+  auto json2 = darbotdb::velocypack::Parser::fromJson("{\"value\":\"4\"}");
+
+  it1.reset(json->slice(), linkMeta);
+  ASSERT_TRUE(it1.valid());
+
+  IResearchLinkIterator it2(irs::kEmptyStringView<char>, darbotdb::IndexId(0));
+  it2.reset(json2->slice(), linkMeta);
+  ASSERT_TRUE(it2.valid());
+
+  // exhaust first array member (1) of it1
+  {
+    irs::numeric_token_stream expected_tokens;
+    expected_tokens.reset(1.);
+    auto& actual_tokens = (*it1).get_tokens();
+    auto actual_value = irs::get<irs::term_attribute>(actual_tokens);
+    auto expected_value = irs::get<irs::term_attribute>(expected_tokens);
+    while (actual_tokens.next()) {
+      ASSERT_TRUE(expected_tokens.next());
+      ASSERT_EQ(actual_value->value, expected_value->value);
+    }
+    ASSERT_FALSE(expected_tokens.next());
+  }
+  // exhaust first array member (1) of it2
+  {
+    irs::numeric_token_stream expected_tokens;
+    expected_tokens.reset(1.);
+    auto& actual_tokens = (*it2).get_tokens();
+    auto actual_value = irs::get<irs::term_attribute>(actual_tokens);
+    auto expected_value = irs::get<irs::term_attribute>(expected_tokens);
+    while (actual_tokens.next()) {
+      ASSERT_TRUE(expected_tokens.next());
+      ASSERT_EQ(actual_value->value, expected_value->value);
+    }
+    ASSERT_FALSE(expected_tokens.next());
+  }
+  ++it1;  // now it1 should have it`s typed iterator pointing to 2
+  ++it2;  // now it2 should have it`s typed iterator pointing to 2  (not to 3!)
+  ASSERT_TRUE(it1.valid());
+  {
+    irs::numeric_token_stream expected_tokens;
+    expected_tokens.reset(2.);
+    auto& actual_tokens = (*it1).get_tokens();
+    auto actual_value = irs::get<irs::term_attribute>(actual_tokens);
+    auto expected_value = irs::get<irs::term_attribute>(expected_tokens);
+    while (actual_tokens.next()) {
+      ASSERT_TRUE(expected_tokens.next());
+      ASSERT_EQ(actual_value->value, expected_value->value);
+    }
+    ASSERT_FALSE(expected_tokens.next());
+  }
+  ASSERT_TRUE(it2.valid());
+  {
+    irs::numeric_token_stream expected_tokens;
+    expected_tokens.reset(2.);
+    auto& actual_tokens = (*it2).get_tokens();
+    auto actual_value = irs::get<irs::term_attribute>(actual_tokens);
+    auto expected_value = irs::get<irs::term_attribute>(expected_tokens);
+    while (actual_tokens.next()) {
+      ASSERT_TRUE(expected_tokens.next());
+      ASSERT_EQ(actual_value->value, expected_value->value);
+    }
+    ASSERT_FALSE(expected_tokens.next());
+  }
+}
+
+TEST_F(
+    IResearchDocumentTest,
+    InvertedFieldIterator_traverse_simple_object_primitive_type_sub_analyzers) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"fields" : [{"name": "boost"},
+                  {"name": "keys"},
+                  {"name": "keys2", "analyzer": "iresearch-document-number"}]})");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({
+    "nested": {"foo": "str"},
+    "keys": "1",
+    "keys2": "2",
+    "boost": 10,
+    "depth": [20, 30, 40],
+    "fields": {"fieldA" : {"name" : 1}, "fieldB" : {"name" : "b"}},
+    "listValuation": "ignored",
+    "array": [
+      {"id": 1, "subobj": {"id": "10" }},
+      {"subobj": {"name": "foo" }, "id": "2"},
+      {"id": "3", "subobj": {"id": "22" }}],
+    "last_not_present": "ignored"})");
+
+  std::function<AssertInvertedIndexFieldFunc> const assertFields[] = {
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer, true>(
+            server, *it, mangleInvertedIndexStringIdentity("keys"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("keys2"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("boost"));
+      },
+  };
+
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+
+  for (auto& assertField : assertFields) {
+    ASSERT_TRUE(it.valid());
+    assertField(server, it);
+    ++it;
+  }
+
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(
+    IResearchDocumentTest,
+    InvertedFieldIterator_traverse_complex_object_primitive_type_sub_analyzers) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"fields" : [{"name": "boost"},
+                  {"name": "never_present"},
+                  {"name": "keys[*]"},
+                  {"name": "keys2[*]", "analyzer": "iresearch-document-number"},
+                  {"name": "depth[*]"},
+                  {"name": "fields.fieldA.name", "analyzer": "iresearch-document-number"},
+                  {"name": "array[*].id"},
+                  {"name": "array[*].subobj.id"}]})");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({
+    "nested": {"foo": "str"},
+    "keys": ["1", "2"],
+    "keys2": ["1", "2"],
+    "boost": 10,
+    "depth": [20, 30, 40],
+    "fields": {"fieldA" : {"name" : "1"}, "fieldB" : {"name" : "b"}},
+    "listValuation": "ignored",
+    "array": [
+      {"id": 1, "subobj": {"id": "10" }},
+      {"subobj": {"name": "foo" }, "id": "2"},
+      {"id": "3", "subobj": {"id": "22" }},
+      {"No_id": "3", "subobj": {"id": 22 }}],
+    "last_not_present": "ignored"})");
+
+  std::function<AssertInvertedIndexFieldFunc> const assertFields[] = {
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer, true>(
+            server, *it, mangleInvertedIndexStringIdentity("keys"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer, true>(
+            server, *it, mangleInvertedIndexStringIdentity("keys"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("keys2"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("keys2"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("boost"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("depth"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("depth"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("depth"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(
+            server, *it, mangleNumeric("fields.fieldA.name"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(
+            server, *it, mangleNumeric("array[*].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer, true>(
+            server, *it,
+            mangleInvertedIndexStringIdentity("array[*].subobj.id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer, true>(
+            server, *it, mangleInvertedIndexStringIdentity("array[*].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::null_token_stream>(server, *it,
+                                            mangleNull("array[*].subobj.id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer, true>(
+            server, *it, mangleInvertedIndexStringIdentity("array[*].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer, true>(
+            server, *it,
+            mangleInvertedIndexStringIdentity("array[*].subobj.id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(
+            server, *it, mangleNumeric("array[*].subobj.id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::null_token_stream>(server, *it,
+                                            mangleNull("array[*].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::null_token_stream>(server, *it,
+                                            mangleNull("never_present"));
+      }};
+
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+
+  size_t fieldIdx{};
+  for (auto& assertField : assertFields) {
+    SCOPED_TRACE(testing::Message("Field Idx: ") << (fieldIdx++));
+    ASSERT_TRUE(it.valid());
+    assertField(server, it);
+    ++it;
+  }
+
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest, InvertedFieldIterator_traverse_complex_with_geo) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"fields" : [{"name": "boost"},
+                  {"name": "never_present", "analyzer": "my_geo"},
+                  {"name": "keys[*]"},
+                  {"name": "geo_field", "analyzer": "my_geo"},
+                  {"name": "keys2[*]", "analyzer": "my_geo"},
+                  {"name": "depth[*]"},
+                  {"name": "fields.fieldA.name", "analyzer": "iresearch-document-number"},
+                  {"name": "array[*].id"},
+                  {"name": "array[*].subobj.id", "analyzer": "my_geo"}]})");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({
+    "nested": {"foo": "str"},
+    "keys": ["1", "2"],
+    "geo_field": { "type": "Point", "coordinates": [ 37.615895, 55.7039]},
+    "keys2": [{ "type": "Point", "coordinates": [37.615895, 55.7039]},
+              { "type": "Point", "coordinates": [37.615895, 55.7039]}],
+    "boost": 10,
+    "depth": [20, 30, 40],
+    "fields": {"fieldA" : {"name" : "1"}, "fieldB" : {"name" : "b"}},
+    "listValuation": "ignored",
+    "array": [
+      {"id": 1, "subobj": {"id": { "type": "Point", "coordinates": [ 37.615895, 55.7039]} }},
+      {"subobj": {"name": "foo" }, "id": "2"},
+      {"id": "3", "subobj": {"id": { "type": "Point", "coordinates": [ 37.615895, 55.7039]} }},
+      {"No_id": "3", "subobj": {"id": { "type": "Point", "coordinates": [ 37.615895, 55.7039]} }}],
+    "last_not_present": "ignored"})");
+
+  std::function<AssertInvertedIndexFieldFunc> const assertFields[] = {
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer, true>(
+            server, *it, mangleInvertedIndexStringIdentity("keys"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer, true>(
+            server, *it, mangleInvertedIndexStringIdentity("keys"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<darbotdb::iresearch::GeoVPackAnalyzer, false>(
+            server, *it, "geo_field", "my_geo");
+      },
+      [](auto& server, auto const& it) {
+        assertField<darbotdb::iresearch::GeoVPackAnalyzer, false>(
+            server, *it, "keys2", "my_geo");
+      },
+      [](auto& server, auto const& it) {
+        assertField<darbotdb::iresearch::GeoVPackAnalyzer, false>(
+            server, *it, "keys2", "my_geo");
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("boost"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("depth"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("depth"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("depth"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(
+            server, *it, mangleNumeric("fields.fieldA.name"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(
+            server, *it, mangleNumeric("array[*].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<darbotdb::iresearch::GeoVPackAnalyzer>(
+            server, *it, "array[*].subobj.id", "my_geo");
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer, true>(
+            server, *it, mangleInvertedIndexStringIdentity("array[*].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::null_token_stream>(server, *it,
+                                            mangleNull("array[*].subobj.id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<IdentityAnalyzer, true>(
+            server, *it, mangleInvertedIndexStringIdentity("array[*].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<darbotdb::iresearch::GeoVPackAnalyzer>(
+            server, *it, "array[*].subobj.id", "my_geo");
+      },
+      [](auto& server, auto const& it) {
+        assertField<darbotdb::iresearch::GeoVPackAnalyzer>(
+            server, *it, "array[*].subobj.id", "my_geo");
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::null_token_stream>(server, *it,
+                                            mangleNull("array[*].id"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::null_token_stream>(server, *it,
+                                            mangleNull("never_present"));
+      }};
+
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+
+  size_t fieldIdx{};
+  for (auto& assertField : assertFields) {
+    SCOPED_TRACE(testing::Message("Field Idx: ") << (fieldIdx++));
+    ASSERT_TRUE(it.valid());
+    assertField(server, it);
+    ++it;
+  }
+
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest, InvertedFieldIterator_not_array_expansion) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"fields" : [{"name": "boost"},
+                      {"name": "keys[*]"}]})");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({"keys": "not_an_array", "boost": 10})");
+
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+  ASSERT_TRUE(it.valid());
+  assertField<irs::numeric_token_stream, true>(server, *it,
+                                               mangleNumeric("boost"));
+  ++it;  // "keys" is just ignored
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest, InvertedFieldIterator_array_no_expansion) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"fields" : [{"name": "boost"},
+                      {"name": "keys"}]})");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({"boost": 10, "keys": [1,2,3]})");
+
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+  ASSERT_TRUE(it.valid());
+  assertField<irs::numeric_token_stream, true>(server, *it,
+                                               mangleNumeric("boost"));
+  ASSERT_THROW(++it, darbotdb::basics::Exception);
+}
+
+TEST_F(IResearchDocumentTest, InvertedFieldIterator_searchField) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"fields" : [{"name": "boost"},
+                      {"name": "keys", "searchField": true}]})");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({"boost": 10, "keys": [1,2,3]})");
+
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+  ASSERT_TRUE(it.valid());
+  assertField<irs::numeric_token_stream, true>(server, *it,
+                                               mangleNumeric("boost"));
+  ++it;
+  ASSERT_TRUE(it.valid());
+  assertField<irs::numeric_token_stream, true>(server, *it,
+                                               mangleNumeric("keys"));
+  ++it;
+  ASSERT_TRUE(it.valid());
+  assertField<irs::numeric_token_stream, true>(server, *it,
+                                               mangleNumeric("keys"));
+  ++it;
+  ASSERT_TRUE(it.valid());
+  assertField<irs::numeric_token_stream, true>(server, *it,
+                                               mangleNumeric("keys"));
+  ++it;
+  ASSERT_FALSE(it.valid());
+
+  auto json2 =
+      darbotdb::velocypack::Parser::fromJson(R"({"boost": 10, "keys": 123})");
+  it.reset(json2->slice(), *indexMeta._indexingContext);
+  ASSERT_TRUE(it.valid());
+  assertField<irs::numeric_token_stream, true>(server, *it,
+                                               mangleNumeric("boost"));
+  ++it;
+  ASSERT_TRUE(it.valid());
+  assertField<irs::numeric_token_stream, true>(server, *it,
+                                               mangleNumeric("keys"));
+  ++it;
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest, InvertedFieldIterator_object) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"fields" : [{"name": "boost"},
+                      {"name": "keys"}]})");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({"boost": 10, "keys": { "a":1, "b":2, "c":3}})");
+
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+  ASSERT_TRUE(it.valid());
+  assertField<irs::numeric_token_stream, true>(server, *it,
+                                               mangleNumeric("boost"));
+  ASSERT_THROW(++it, darbotdb::basics::Exception);
+}
+
+TEST_F(IResearchDocumentTest, InvertedFieldIterator_empty) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"fields" : [{"name": "boost"},
+                      {"name": "keys"}]})");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({"not_keys": { "a":1, "b":2, "c":3}, "some_boost": 10})");
+
+  std::function<AssertInvertedIndexFieldFunc> const assertFields[] = {
+      [](auto& server, auto const& it) {
+        assertField<irs::null_token_stream>(server, *it, mangleNull("boost"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::null_token_stream>(server, *it, mangleNull("keys"));
+      }};
+
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+  ASSERT_TRUE(it.valid());
+  auto& field = *it;
+  std::string name(field.name());
+  if (name.starts_with("boost")) {
+    assertFields[0](server, it);
+    ++it;
+    ASSERT_TRUE(it.valid());
+    assertFields[1](server, it);
+  } else if (name.starts_with("keys")) {
+    assertFields[1](server, it);
+    ++it;
+    ASSERT_TRUE(it.valid());
+    assertFields[0](server, it);
+  } else {
+    ASSERT_TRUE(false);
+  }
+  ++it;
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest, InvertedFieldIterator_partial_path_match) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"fields" : [{"name": "boost.foo"},
+                      {"name": "booster"}]})");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({"boost": { "fo":2, "foo":1, "b":2, "c":3}, "booster": 10})");
+
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+
+  std::function<AssertInvertedIndexFieldFunc> const assertFields[] = {
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(
+            server, *it, mangleNumeric("boost.foo"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("booster"));
+      },
+  };
+
+  size_t fieldIdx{};
+  for (auto& assertField : assertFields) {
+    SCOPED_TRACE(testing::Message("Field Idx: ") << (fieldIdx++));
+    ASSERT_TRUE(it.valid());
+    assertField(server, it);
+    ++it;
+  }
+
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest, InvertedFieldIterator_IncludeAllFields_simple) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"fields" : [{"name": "boost.foo"},
+                      {"name": "booster", "includeAllFields":true}]})");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({"boost": { "fo":2, "foo":1, "b":2, "c":3}, "booster": 10})");
+
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+
+  std::function<AssertInvertedIndexFieldFunc> const assertFields[] = {
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(
+            server, *it, mangleNumeric("boost.foo"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(server, *it,
+                                                     mangleNumeric("booster"));
+      },
+  };
+
+  size_t fieldIdx{};
+  for (auto& assertField : assertFields) {
+    SCOPED_TRACE(testing::Message("Field Idx: ") << (fieldIdx++));
+    ASSERT_TRUE(it.valid());
+    assertField(server, it);
+    ++it;
+  }
+
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest,
+       InvertedFieldIterator_includeAllFields_subobject) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"fields" : [{"name": "boost.foo"},
+                      {"name": "booster", "includeAllFields":true, "analyzer":"iresearch-document-string"}]})");
+
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({"boost": { "fo":2, "foo":1, "b":2, "c":3}, "booster": { "fo":"2", "foo":"1"}})");
+
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+
+  std::function<AssertInvertedIndexFieldFunc> const assertFields[] = {
+      [](auto& server, auto const& it) {
+        assertField<irs::numeric_token_stream, true>(
+            server, *it, mangleNumeric("boost.foo"));
+      },
+      [](auto& server, auto const& it) {
+        assertField<TypedAnalyzer, true>(
+            server, *it, mangleInvertedIndexStringIdentity("booster.fo"),
+            "iresearch-document-string");
+      },
+      [](auto& server, auto const& it) {
+        assertField<TypedAnalyzer, true>(
+            server, *it, mangleInvertedIndexStringIdentity("booster.foo"),
+            "iresearch-document-string");
+      },
+  };
+
+  size_t fieldIdx{};
+  for (auto& assertField : assertFields) {
+    SCOPED_TRACE(testing::Message("Field Idx: ") << (fieldIdx++));
+    ASSERT_TRUE(it.valid());
+    assertField(server, it);
+    ++it;
+  }
+
+  ASSERT_FALSE(it.valid());
+}
+
+TEST_F(IResearchDocumentTest, InvertedFieldIterator_choose_closer_path_match) {
+  auto const indexMetaJson = darbotdb::velocypack::Parser::fromJson(
+      R"({"includeAllFields":true, "fields" : [
+            {"name": "boost.foo.bar", "analyzer":"iresearch-document-string"}, 
+            {"name": "boost.foo"}]})");
+  auto& sysDatabase = server.getFeature<darbotdb::SystemDatabaseFeature>();
+  auto sysVocbase = sysDatabase.use();
+  std::vector<std::string> EMPTY;
+  darbotdb::transaction::Methods trx(
+      darbotdb::transaction::StandaloneContext::create(
+          *sysVocbase, darbotdb::transaction::OperationOriginTestCase{}),
+      EMPTY, EMPTY, EMPTY, darbotdb::transaction::Options());
+
+  auto json = darbotdb::velocypack::Parser::fromJson(
+      R"({"boost": { "foo":{"bar":{"bas":{"a":"1"}}}}})");
+
+  darbotdb::iresearch::IResearchInvertedIndexMeta indexMeta;
+  std::string error;
+  ASSERT_TRUE(indexMeta.init(server.server(), indexMetaJson->slice(), false,
+                             error, sysVocbase.get()->name()));
+
+  InvertedIndexFieldIterator it(irs::kEmptyStringView<char>,
+                                darbotdb::IndexId(0));
+  it.reset(json->slice(), *indexMeta._indexingContext);
+
+  std::function<AssertInvertedIndexFieldFunc> const assertFields[] = {
+      [](auto& server, auto const& it) {
+        assertField<TypedAnalyzer, true>(
+            server, *it,
+            mangleInvertedIndexStringIdentity("boost.foo.bar.bas.a"),
+            "iresearch-document-string");
+      }};
+
+  size_t fieldIdx{};
+  for (auto& assertField : assertFields) {
+    SCOPED_TRACE(testing::Message("Field Idx: ") << (fieldIdx++));
+    ASSERT_TRUE(it.valid());
+    assertField(server, it);
+    ++it;
+  }
+  ASSERT_FALSE(it.valid());
+}
+
+#if USE_ENTERPRISE
+#include "tests/IResearch/IResearchDocumentTestEE.h"
+#endif

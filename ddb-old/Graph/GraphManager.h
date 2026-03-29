@@ -1,0 +1,224 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Heiko Kernbach
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <velocypack/Buffer.h>
+#include <chrono>
+#include <utility>
+
+#include "Aql/Query.h"
+#include "Aql/VariableGenerator.h"
+#include "Basics/ResultT.h"
+#include "Cluster/ClusterInfo.h"
+#include "Graph/Graph.h"
+#include "Transaction/Methods.h"
+#include "Transaction/StandaloneContext.h"
+#include "Utils/OperationResult.h"
+
+namespace arangodb {
+
+struct CollectionCreationInfo;
+
+namespace graph {
+
+class GraphManager {
+ private:
+  TRI_vocbase_t& _vocbase;
+  transaction::OperationOrigin _operationOrigin;
+
+  std::shared_ptr<transaction::Context> ctx() const;
+
+ public:
+  explicit GraphManager(TRI_vocbase_t& vocbase,
+                        transaction::OperationOrigin operationOrigin)
+      : _vocbase(vocbase), _operationOrigin(operationOrigin) {}
+
+  Result readGraphs(velocypack::Builder& builder) const;
+
+  Result readGraphKeys(velocypack::Builder& builder) const;
+
+  Result readGraphByQuery(velocypack::Builder& builder,
+                          std::string const& queryStr) const;
+
+  ////////////////////////////////////////////////////////////////////////////////
+  /// @brief find and return a collections if available
+  ////////////////////////////////////////////////////////////////////////////////
+  static std::shared_ptr<LogicalCollection> getCollectionByName(
+      const TRI_vocbase_t& vocbase, std::string const& name);
+
+  ////////////////////////////////////////////////////////////////////////////////
+  /// @brief checks wheter a graph exists or not
+  ////////////////////////////////////////////////////////////////////////////////
+  bool graphExists(std::string const& graphName) const;
+
+  ////////////////////////////////////////////////////////////////////////////////
+  /// @brief lookup a graph by name
+  ////////////////////////////////////////////////////////////////////////////////
+  ResultT<std::unique_ptr<Graph>> lookupGraphByName(
+      std::string const& name) const;
+
+  ////////////////////////////////////////////////////////////////////////////////
+  /// @brief create a graph
+  ////////////////////////////////////////////////////////////////////////////////
+  OperationResult createGraph(VPackSlice document, bool waitForSync) const;
+
+  ////////////////////////////////////////////////////////////////////////////////
+  /// @brief find or create collections by EdgeDefinitions
+  ////////////////////////////////////////////////////////////////////////////////
+  Result findOrCreateCollectionsByEdgeDefinition(
+      Graph& graph, EdgeDefinition const& edgeDefinition, bool waitForSync);
+
+  /// @brief rename a collection used in an edge definition
+  bool renameGraphCollection(std::string const& oldName,
+                             std::string const& newName);
+
+  /// @brief check if the edge definitions conflicts with one in an existing
+  /// graph
+  Result checkForEdgeDefinitionConflicts(
+      std::map<std::string, arangodb::graph::EdgeDefinition> const&
+          edgeDefinitions,
+      std::string const& graphName) const;
+
+  /// @brief check if the edge definition conflicts with one in an existing
+  /// graph
+  Result checkForEdgeDefinitionConflicts(
+      arangodb::graph::EdgeDefinition const& edgeDefinition,
+      std::string const& graphName) const;
+
+  /// @brief Remove a graph and optional all connected collections
+  OperationResult removeGraph(Graph const& graph, bool waitForSync,
+                              bool dropCollections);
+
+  Result pushCollectionIfMayBeDropped(
+      const std::string& colName, const std::string& graphName,
+      std::unordered_set<std::string>& toBeRemoved);
+
+  bool collectionExists(std::string const& collection) const;
+
+  /**
+   * @brief Helper function to make sure all collections required
+   *        for this graph are created or exist.
+   *        Will fail if the collections cannot be created, or
+   *        if they have a non-compatible sharding in SmartGraph-case.
+   *
+   * @param graph The graph information used to make sure all collections exist
+   *
+   * @return Either OK or an error.
+   */
+  Result ensureAllCollections(Graph* graph, bool waitForSync) const;
+
+  /// @brief check if only SatelliteCollections are used
+  bool onlySatellitesUsed(Graph const* graph) const;
+
+  /**
+   * @brief Store the given graph
+   *
+   * @param graph The graph to store
+   * @param waitForSync Wait for Collection to sync
+   * @param isUpdate If it is an update on existing graph or a new one.
+   *
+   * @return The result of the insrt transaction or Error.
+   */
+  OperationResult storeGraph(Graph const& graph, bool waitForSync,
+                             bool isUpdate) const;
+
+  /**
+   * @brief Apply callback on all graphs. The callback
+   * may take over ownership of the unique_ptr otherwise
+   * it will be deleted after the callback.
+   * If the callback returns an error the iteration will
+   * stop and return this error itself.
+   *
+   * @param callback The callback to be applied on all graphs
+   *
+   * @return The first failed callback, a general loading error or
+   * TRI_ERROR_NO_ERROR.
+   */
+  Result applyOnAllGraphs(
+      std::function<Result(std::unique_ptr<Graph>)> const& callback) const;
+
+  /**
+   * @brief Find whether there is a named graph which contains any of the
+   * given edge collections.
+   *
+   * @param edgeCollectionNames The names of the edge collections to look for
+   *
+   * @return a set of fromCollections and toCollections implied by
+   * edgeCollections.
+   */
+  auto findImplicitVertexCollectionsFromEdgeCollections(
+      containers::FlatHashSet<std::string> const& edgeCollections) const
+      -> ResultT<containers::FlatHashSet<std::string>>;
+
+ private:
+  /**
+   * @brief Invalidate all query optimizer caches in the database of this
+   * GraphManager. This is necessary in the cluster when the GraphManager
+   * runs on a coordinator and all coordinators need to be informed that
+   * their query optimizer caches are now invalid, since some graph definition
+   * has been changed. This method is called in the other GraphManager
+   * methods, whenever some graph is changed on a coordinator. This is a
+   * fire-and-forget method.
+   */
+  void invalidateQueryOptimizerCaches() const;
+
+  Result ensureCollections(
+      Graph& graph,
+      std::unordered_set<std::string>& documentCollectionsToCreate,
+      std::unordered_set<std::string> const& edgeCollectionsToCreate,
+      std::unordered_set<std::shared_ptr<LogicalCollection>> const&
+          existentDocumentCollections,
+      std::unordered_set<std::shared_ptr<LogicalCollection>> const&
+          existentEdgeCollections,
+      std::unordered_set<std::string> const& satellites,
+      bool waitForSync) const;
+
+  /**
+   * @brief Create a new in memory graph object from the given input.
+   *        This graph object does not create collections and does
+   *        not check them. It cannot be used to access any kind
+   *        of data. In order to get a "usable" Graph object use
+   *        lookup by name.
+   *
+   * @param input The slice containing the graph data.
+   *
+   * @return A temporary Graph object
+   */
+  ResultT<std::unique_ptr<Graph>> buildGraphFromInput(
+      std::string const& graphName, arangodb::velocypack::Slice input) const;
+
+  Result checkCreateGraphPermissions(Graph const* graph) const;
+
+  Result checkDropGraphPermissions(
+      Graph const& graph,
+      std::unordered_set<std::string> const& followersToBeRemoved,
+      std::unordered_set<std::string> const& leadersToBeRemoved);
+
+  Result ensureVertexShardingMatches(
+      Graph const& graph, LogicalCollection& edgeColl,
+      std::unordered_set<std::string> const& satellites,
+      std::string const& vertexCollection, bool fromSide) const;
+};
+}  // namespace graph
+}  // namespace arangodb

@@ -1,0 +1,255 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Manuel Pöter
+////////////////////////////////////////////////////////////////////////////////
+
+#include "Runner.h"
+
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <numeric>
+#include <memory>
+#include <stdexcept>
+
+#include "Inspection/VPack.h"
+
+#include "Basics/overload.h"
+#include "Execution.h"
+#include "Server.h"
+#include "Workloads/EdgeCache.h"
+#include "Workloads/GetByPrimaryKey.h"
+#include "Workloads/InsertDocuments.h"
+#include "Workloads/IterateDocuments.h"
+#include "Workloads/WriteWriteConflict.h"
+#include "velocypack/Collection.h"
+#include "velocypack/Parser.h"
+
+#include "Transaction/Manager.h"
+#include "Transaction/ManagerFeature.h"
+#include "Transaction/Methods.h"
+#include "Transaction/StandaloneContext.h"
+#include "Utils/SingleCollectionTransaction.h"
+#include "VocBase/LogicalCollection.h"
+#include "VocBase/Methods/Collections.h"
+#include "VocBase/Properties/CreateCollectionBody.h"
+#include "VocBase/Properties/DatabaseConfiguration.h"
+
+namespace {
+std::size_t getFolderSize(std::string_view path) {
+  return std::accumulate(std::filesystem::recursive_directory_iterator(path),
+                         std::filesystem::recursive_directory_iterator(), 0ull,
+                         [](auto size, auto const& path) {
+                           return std::filesystem::is_directory(path)
+                                      ? size
+                                      : size + std::filesystem::file_size(path);
+                         });
+}
+}  // namespace
+
+namespace darbotdb::sepp {
+
+Runner::Runner(std::string_view executable, std::string_view reportFile,
+               velocypack::Slice config)
+    : _executable(executable), _reportFile(reportFile) {
+  velocypack::deserializeUnsafe(config, _options);
+}
+
+Runner::~Runner() = default;
+
+void Runner::run() {
+  auto report = runBenchmark();
+  printSummary(report);
+  writeReport(report);
+}
+
+auto Runner::runBenchmark() -> Report {
+  auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch());
+
+  startServer();
+  setup();
+
+  std::cout << "Running benchmark...\n";
+  auto workload = std::visit(
+      overload{
+          [](workloads::WriteWriteConflict::Options& opts)
+              -> std::shared_ptr<Workload> {
+            return std::make_shared<workloads::WriteWriteConflict>(opts);
+          },
+          [](workloads::GetByPrimaryKey::Options& opts)
+              -> std::shared_ptr<Workload> {
+            return std::make_shared<workloads::GetByPrimaryKey>(opts);
+          },
+          [](workloads::EdgeCache::Options& opts) -> std::shared_ptr<Workload> {
+            return std::make_shared<workloads::EdgeCache>(opts);
+          },
+          [](workloads::InsertDocuments::Options& opts)
+              -> std::shared_ptr<Workload> {
+            return std::make_shared<workloads::InsertDocuments>(opts);
+          },
+          [](workloads::IterateDocuments::Options& opts)
+              -> std::shared_ptr<Workload> {
+            return std::make_shared<workloads::IterateDocuments>(opts);
+          }},
+      _options.workload);
+
+  Execution exec(_options, workload);
+  exec.createThreads(*_server);
+  auto report = exec.run();
+  report.timestamp = timestamp.count();
+
+  // we need to stop the server before we calculate the size of the DB folder
+  // because otherwise RocksDB might still write/delete some files
+  _server.reset();
+
+  report.databaseSize = getFolderSize(_options.databaseDirectory);
+
+  return report;
+}
+
+void Runner::printSummary(Report const& report) {
+  std::cout << "Summary:\n"
+            << "  runtime: " << report.runtime << " ms\n"
+            << "  operations: " << report.operations() << " ops\n"
+            << "  throughput: " << report.throughput() << " ops/ms"
+            << std::endl;
+}
+
+void Runner::writeReport(Report const& report) {
+  if (_reportFile.empty()) {
+    return;
+  }
+
+  velocypack::Builder reportBuilder;
+  reportBuilder.openArray();
+
+  std::ifstream oldReportFile(_reportFile);
+  if (oldReportFile.is_open()) {
+    try {
+      std::stringstream buffer;
+      buffer << oldReportFile.rdbuf();
+
+      auto oldReport = darbotdb::velocypack::Parser::fromJson(buffer.str());
+      if (oldReport) {
+        velocypack::Collection::appendArray(reportBuilder, oldReport->slice());
+      }
+    } catch (std::exception const& e) {
+      std::cerr << "Failed to parse existing report file \"" << _reportFile
+                << "\" - " << e.what() << "\nSkipping report generation!"
+                << std::endl;
+      return;
+    }
+  }
+
+  velocypack::serialize(reportBuilder, report);
+  reportBuilder.close();
+
+  std::ofstream out(_reportFile);
+  out << reportBuilder.slice().toString();
+}
+
+void Runner::startServer() {
+  if (_options.clearDatabaseDirectory) {
+    std::filesystem::remove_all(_options.databaseDirectory);
+  }
+  _server = std::make_unique<Server>(_options.rocksdb, _options.cache,
+                                     _options.databaseDirectory);
+  _server->start(_executable.data());
+}
+
+void Runner::setup() {
+  if (!_options.setup.collections.empty()) {
+    std::cout << "Setting up collections\n";
+    for (auto& col : _options.setup.collections) {
+      auto collection = createCollection(col.name, col.type);
+      for (auto& idx : col.indexes) {
+        createIndex(*collection, idx);
+      }
+    }
+  }
+
+  if (!_options.setup.prefill.empty()) {
+    std::cout << "Running prefill...\n";
+    for (auto& opts : _options.setup.prefill) {
+      auto workload = std::make_shared<workloads::InsertDocuments>(opts.second);
+      Execution exec(_options, workload);
+      exec.createThreads(*_server);
+      std::ignore = exec.run();  // TODO - do we need the report?
+    }
+  }
+}
+
+auto Runner::createCollection(std::string const& name, std::string const& type)
+    -> std::shared_ptr<LogicalCollection> {
+  VPackBuilder b;
+  b.openObject();
+  b.add("name", VPackValue(name));
+  b.add("type",
+        VPackValue(type == "edge" ? TRI_COL_TYPE_EDGE : TRI_COL_TYPE_DOCUMENT));
+  b.close();
+
+  bool enforceReplicationFactor = true;
+  auto config = _server->vocbase()->getDatabaseConfiguration();
+  config.enforceReplicationFactor = enforceReplicationFactor;
+
+  auto planCollection =
+      CreateCollectionBody::fromCreateAPIBody(b.slice(), config);
+
+  if (planCollection.fail()) {
+    throw std::runtime_error("Failed to create collection: " +
+                             std::string(planCollection.errorMessage()));
+  }
+
+  std::vector<CreateCollectionBody> collections{
+      std::move(planCollection.get())};
+
+  auto res = methods::Collections::create(
+      *_server->vocbase(),  // collection vocbase
+      {},                   // operation options
+      collections,
+      /*waitForSyncReplication*/ true, enforceReplicationFactor,
+      /*isNewDatabase*/ false);
+
+  if (!res.ok()) {
+    throw std::runtime_error("Failed to create collection: " +
+                             std::string(res.errorMessage()));
+  }
+  TRI_ASSERT(res.get().size() == 1);
+  return res.get().at(0);
+}
+
+void Runner::createIndex(LogicalCollection& col, IndexSetup const& index) {
+  VPackBuilder builder;
+  builder.openObject();
+  builder.add("type", index.type);
+  builder.add(VPackValue("fields"));
+  builder.openArray();
+  for (auto& f : index.fields) {
+    builder.add(VPackValue(f));
+  }
+  builder.close();
+  builder.close();
+  bool created = false;
+  std::ignore = col.createIndex(builder.slice(), created);
+}
+
+}  // namespace darbotdb::sepp

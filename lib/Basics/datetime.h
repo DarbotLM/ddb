@@ -1,0 +1,65 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Manuel Baesler
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <chrono>
+#include <regex>
+#include <string>
+#include <string_view>
+
+#include <date/date.h>
+
+namespace arangodb {
+
+using tp_sys_clock_ms = std::chrono::time_point<std::chrono::system_clock,
+                                                std::chrono::milliseconds>;
+using tp_sys_clock_us = std::chrono::time_point<std::chrono::system_clock,
+                                                std::chrono::microseconds>;
+
+using d_sys_clock_ms = std::chrono::duration<std::chrono::milliseconds>;
+
+namespace basics {
+bool parseDateTime(std::string_view dateTime, tp_sys_clock_ms& date_tp);
+
+bool regexIsoDuration(std::string_view isoDuration,
+                      std::match_results<char const*>& durationParts);
+
+/// @brief formats a date(time) value according to formatString
+std::string formatDate(std::string const& formatString,
+                       tp_sys_clock_ms const& dateValue);
+
+struct ParsedDuration {
+  int years = 0;
+  int months = 0;
+  int weeks = 0;
+  int days = 0;
+  int hours = 0;
+  int minutes = 0;
+  int seconds = 0;
+  int milliseconds = 0;
+};
+
+bool parseIsoDuration(std::string_view duration, ParsedDuration& output);
+}  // namespace basics
+}  // namespace arangodb

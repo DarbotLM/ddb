@@ -1,0 +1,386 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Michael Hackstein
+////////////////////////////////////////////////////////////////////////////////
+
+#include "MockGraph.h"
+#include <Aql/QueryRegistry.h>
+#include "IResearch/RestHandlerMock.h"
+#include "InternalRestHandler/InternalRestTraverserHandler.h"
+
+#include "gtest/gtest.h"
+
+#include "Mocks/PreparedResponseConnectionPool.h"
+#include "Mocks/Servers.h"
+
+#include "Aql/QueryContext.h"
+#include "Aql/RestAqlHandler.h"
+#include "Network/NetworkFeature.h"
+#include "Transaction/Helpers.h"
+#include "Transaction/OperationOrigin.h"
+#include "Transaction/StandaloneContext.h"
+#include "Utils/SingleCollectionTransaction.h"
+#include "VocBase/vocbase.h"
+
+using namespace darbotdb;
+using namespace darbotdb::tests;
+using namespace darbotdb::tests::graph;
+using namespace darbotdb::tests::mocks;
+
+namespace {
+
+void FixCustomTypesResponse(GeneralResponse* res,
+                            aql::QueryContext const& query) {
+  auto genRes = static_cast<GeneralResponseMock*>(res);
+  auto translatedString =
+      genRes->_payload.slice().toJson(&query.vpackOptions());
+  genRes->_payload.clear();
+  VPackParser parser(genRes->_payload);
+  parser.parse(translatedString);
+}
+}  // namespace
+
+void MockGraph::EdgeDef::addToBuilder(
+    darbotdb::velocypack::Builder& builder) const {
+  std::string fromId = _from;
+  std::string toId = _to;
+  std::string keyId =
+      _from.substr(_from.find('/') + 1) + "-" + _to.substr(_to.find("/") + 1);
+
+  builder.openObject();
+  builder.add(StaticStrings::IdString, VPackValue(_eCol + "/" + keyId));
+  builder.add(StaticStrings::KeyString, VPackValue(keyId));
+  builder.add(StaticStrings::FromString, VPackValue(fromId));
+  builder.add(StaticStrings::ToString, VPackValue(toId));
+  builder.add("weight", VPackValue(_weight));
+  builder.close();
+}
+
+std::string MockGraph::EdgeDef::generateId() const {
+  std::string keyId =
+      _from.substr(_from.find('/') + 1) + "-" + _to.substr(_to.find("/") + 1);
+  return _eCol + "/" + keyId;
+}
+
+void MockGraph::VertexDef::addToBuilder(
+    darbotdb::velocypack::Builder& builder) const {
+  builder.openObject();
+  builder.add(StaticStrings::KeyString, VPackValue(_id.substr(2)));
+  builder.add(StaticStrings::IdString, VPackValue(_id));
+  builder.close();
+}
+
+MockGraph::EdgeDef MockGraph::addEdge(size_t uniqueEdgeId, std::string from,
+                                      std::string to, double weight) {
+  EdgeDef newEdge{uniqueEdgeId, from, to, weight, _edgeCollectionName};
+  _edges.emplace_back(newEdge);
+  _vertices.emplace(std::move(from));
+  _vertices.emplace(std::move(to));
+
+  return newEdge;
+}
+
+MockGraph::EdgeDef MockGraph::addEdge(size_t from, size_t to, double weight) {
+  return addEdge(
+      _edges.size(),
+      getVertexCollectionName() + "/" + basics::StringUtils::itoa(from),
+      getVertexCollectionName() + "/" + basics::StringUtils::itoa(to), weight);
+}
+
+void MockGraph::storeVertexData(
+    TRI_vocbase_t& vocbase, std::string const& vertexShardName,
+    std::unordered_set<VertexDef, hashVertexDef> const& vertexData) const {
+  darbotdb::OperationOptions options;
+  darbotdb::SingleCollectionTransaction trx(
+      darbotdb::transaction::StandaloneContext::create(
+          vocbase, transaction::OperationOriginTestCase{}),
+      vertexShardName, darbotdb::AccessMode::Type::WRITE);
+  EXPECT_TRUE((trx.begin().ok()));
+
+  size_t added = 0;
+  velocypack::Builder b;
+  for (auto& v : vertexData) {
+    b.clear();
+    v.addToBuilder(b);
+    auto res = trx.insert(vertexShardName, b.slice(), options);
+    EXPECT_TRUE((res.ok()));
+    added++;
+  }
+
+  EXPECT_TRUE((trx.commit().ok()));
+  EXPECT_TRUE(added == vertexData.size());
+}
+
+void MockGraph::storeEdgeData(TRI_vocbase_t& vocbase,
+                              std::string const& edgeShardName,
+                              std::vector<EdgeDef> const& edgeData) const {
+  darbotdb::OperationOptions options;
+  darbotdb::SingleCollectionTransaction trx(
+      darbotdb::transaction::StandaloneContext::create(
+          vocbase, transaction::OperationOriginTestCase{}),
+      edgeShardName, darbotdb::AccessMode::Type::WRITE);
+  EXPECT_TRUE((trx.begin().ok()));
+  size_t added = 0;
+  velocypack::Builder b;
+  for (auto& edge : edgeData) {
+    b.clear();
+    edge.addToBuilder(b);
+    auto res = trx.insert(edgeShardName, b.slice(), options);
+    EXPECT_TRUE(res.ok()) << res.errorMessage() << " " << b.toJson();
+    added++;
+  }
+
+  EXPECT_TRUE((trx.commit().ok()));
+  EXPECT_TRUE(added == edgeData.size());
+}
+
+void MockGraph::storeData(TRI_vocbase_t& vocbase,
+                          std::string const& vertexCollectionName,
+                          std::string const& edgeCollectionName,
+                          std::string const& edgeCollectionSecondName,
+                          std::vector<EdgeDef> const& secondEdges) const {
+  // Insert vertices
+  storeVertexData(vocbase, vertexCollectionName, vertices());
+
+  storeEdgeData(vocbase, edgeCollectionName, edges());
+  if (!edgeCollectionSecondName.empty()) {
+    storeEdgeData(vocbase, edgeCollectionSecondName, secondEdges);
+  }
+}
+
+template<>
+void MockGraph::prepareServer(MockDBServer& server) const {
+  std::string db = "_system";
+  auto vCol = server.createCollection(db, getVertexCollectionName(),
+                                      getVertexShardNameServerPairs(),
+                                      TRI_COL_TYPE_DOCUMENT);
+  for (auto const& [shard, servName] : _vertexShards) {
+    server.createShard(db, shard, *vCol);
+  }
+  auto eCol =
+      server.createCollection(db, getEdgeCollectionName(),
+                              getEdgeShardNameServerPairs(), TRI_COL_TYPE_EDGE);
+
+  for (auto const& [shard, servName] : _edgeShards) {
+    server.createShard(db, shard, *eCol);
+  }
+
+  // NOTE: This only works on a single shard yet.
+  storeData(server.getSystemDatabase(), _vertexShards[0].first,
+            _edgeShards[0].first);
+}
+
+template<>
+void MockGraph::prepareServer(MockCoordinator& server) const {
+  std::string db = "_system";
+  std::ignore = server.createCollection(db, getVertexCollectionName(),
+                                        getVertexShardNameServerPairs(),
+                                        TRI_COL_TYPE_DOCUMENT);
+
+  std::ignore =
+      server.createCollection(db, getEdgeCollectionName(),
+                              getEdgeShardNameServerPairs(), TRI_COL_TYPE_EDGE);
+}
+
+auto MockGraph::createEngine(MockDBServer& server,
+                             darbotdb::graph::BaseOptions const& opts,
+                             aql::QueryRegistry& queryRegistry) const
+    -> uint64_t {
+  // init restaqlhandler
+  darbotdb::tests::PreparedRequestResponse prep{server.getSystemDatabase()};
+
+  // generate and add body here
+  VPackBuilder builder;
+  builder.openObject();
+  builder.add("lockInfo", VPackValue(VPackValueType::Object));
+
+  builder.add("read", VPackValue(VPackValueType::Array));
+  // append here the collection names (?) <-- TODO: Check
+  // RestAqlHandler.cpp:230 builder.add(VPackValue(_vertexCollectionName));
+  // builder.add(VPackValue(_edgeCollectionName));
+  // appending collection shard ids
+  for (auto const& vShard : _vertexShards) {
+    builder.add(VPackValue(vShard.first));
+  }
+  for (auto const& eShard : _edgeShards) {
+    builder.add(VPackValue(eShard.first));
+  }
+  builder.close();  // array READ
+  builder.close();  // object lockInfo
+
+  builder.add("options", VPackValue(VPackValueType::Object));
+  builder.add("ttl", VPackValue(120));
+  builder.close();  // object options
+
+  builder.add("snippets", VPackValue(VPackValueType::Object));
+  builder.close();  // object snippets
+
+  builder.add("variables", VPackValue(VPackValueType::Array));
+  builder.close();  // object variables
+
+  builder.add("traverserEngines", VPackValue(VPackValueType::Array));
+
+  builder.openObject();  // main container
+
+  builder.add(VPackValue("options"));
+
+  opts.buildEngineInfo(builder);
+
+  builder.add(VPackValue("shards"));
+  builder.openObject();
+
+  builder.add(VPackValue("vertices"));
+  builder.openObject();
+
+  for (auto const& vertexTuple : getVertexShardNameServerPairs()) {
+    builder.add(_vertexCollectionName, VPackValue(VPackValueType::Array));
+    builder.add(VPackValue(vertexTuple.first));  // shardID
+    builder.close();                             // inner array
+  }
+
+  builder.close();  // vertices
+
+  builder.add(VPackValue("edges"));
+  builder.openArray();
+  for (auto const& edgeTuple : getEdgeShardNameServerPairs()) {
+    builder.openArray();
+    builder.add(VPackValue(edgeTuple.first));  // shardID
+    builder.close();                           // inner array
+  }
+  builder.close();  // edges
+  builder.close();  // shards
+  builder.close();  // main container
+  builder.close();  // array traverserEngines
+  builder.close();  // object (outer)
+
+  prep.addBody(builder.slice());
+  prep.addSuffix("setup");
+
+  prep.setRequestType(darbotdb::rest::RequestType::POST);
+  auto fakeRequest = prep.generateRequest();
+  auto fakeResponse = std::make_unique<GeneralResponseMock>();
+  darbotdb::aql::RestAqlHandler aqlHandler{
+      server.server(), fakeRequest.release(), fakeResponse.release(),
+      &queryRegistry};
+
+  aqlHandler.executeAsync().wait();
+  auto response = aqlHandler.stealResponse();
+  auto resBody =
+      static_cast<GeneralResponseMock*>(response.get())->_payload.slice();
+  TRI_ASSERT(resBody.hasKey("result"));
+  resBody = resBody.get("result");
+  TRI_ASSERT(resBody.hasKey("traverserEngines"));
+  auto engines = resBody.get("traverserEngines");
+  TRI_ASSERT(engines.isArray());
+  TRI_ASSERT(engines.length() == 1);
+  auto eidSlice = engines.at(0);
+  TRI_ASSERT(eidSlice.isNumber());
+  return eidSlice.getNumericValue<uint64_t>();
+}
+
+template<>
+// Future: Also engineID's need to be returned here.
+std::pair<std::vector<darbotdb::tests::PreparedRequestResponse>, uint64_t>
+MockGraph::simulateApi(MockDBServer& server,
+                       std::vector<size_t> const& expectedVerticesToFetch,
+                       darbotdb::graph::BaseOptions& opts) const {
+  // NOTE: We need the server input only for template magic.
+  // Can be solved differently, but for a test i think this is sufficient.
+  std::vector<darbotdb::tests::PreparedRequestResponse> preparedResponses{};
+
+  aql::QueryRegistry queryRegistry{120};
+  uint64_t engineId = createEngine(server, opts, queryRegistry);
+
+  for (auto const& vertex : expectedVerticesToFetch) {
+    {
+      // 1.) fetch the vertex itself
+      darbotdb::tests::PreparedRequestResponse prep{server.getSystemDatabase()};
+      auto fakeResponse = std::make_unique<GeneralResponseMock>();
+
+      /*
+       *  Export to external method later (Create network request including
+       * options)
+       */
+      VPackBuilder leased;
+      leased.openObject();
+      leased.add("keys", VPackValue(VPackValueType::Array));
+      leased.add(VPackValue(vertexToId(vertex)));
+      leased.close();  // 'keys' Array
+      leased.close();  // base object
+
+      prep.setRequestType(darbotdb::rest::RequestType::PUT);
+      prep.addRestSuffix("traverser");
+      prep.addSuffix("vertex");
+      prep.addSuffix(basics::StringUtils::itoa(engineId));
+      prep.addBody(leased.slice());
+
+      auto fakeRequest = prep.generateRequest();
+      InternalRestTraverserHandler testee{
+          server.server(), fakeRequest.release(), fakeResponse.release(),
+          &queryRegistry};
+
+      testee.executeAsync().wait();
+
+      auto res = testee.stealResponse();
+      FixCustomTypesResponse(res.get(), opts.query());
+
+      prep.rememberResponse(std::move(res));
+      preparedResponses.emplace_back(std::move(prep));
+    }
+    {
+      // 2.) fetch all connected edges requests
+      darbotdb::tests::PreparedRequestResponse prep{server.getSystemDatabase()};
+      auto fakeResponse = std::make_unique<GeneralResponseMock>();
+
+      /*
+       *  Export to external method later (Create network request including
+       * options)
+       */
+      VPackBuilder leased;
+      leased.openObject();
+      leased.add("keys", VPackValue(vertexToId(vertex)));
+      leased.add("backward", VPackValue(false));
+      leased.add("depth", VPackValue(0));
+      leased.add("batchSize", 1000);
+      leased.close();  // base object
+
+      prep.setRequestType(darbotdb::rest::RequestType::PUT);
+      prep.addRestSuffix("traverser");
+      prep.addSuffix("edge");
+      prep.addSuffix(basics::StringUtils::itoa(engineId));
+      prep.addBody(leased.slice());
+
+      auto fakeRequest = prep.generateRequest();
+      InternalRestTraverserHandler testee{
+          server.server(), fakeRequest.release(), fakeResponse.release(),
+          &queryRegistry};
+
+      testee.executeAsync().wait();
+
+      auto res = testee.stealResponse();
+      FixCustomTypesResponse(res.get(), opts.query());
+      prep.rememberResponse(std::move(res));
+      preparedResponses.emplace_back(std::move(prep));
+    }
+  }
+
+  return std::make_pair(std::move(preparedResponses), engineId);
+}

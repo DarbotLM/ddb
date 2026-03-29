@@ -1,0 +1,225 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Michael Hackstein
+////////////////////////////////////////////////////////////////////////////////
+
+#include "WaitingExecutionBlockMock.h"
+
+#include "Aql/AqlCallStack.h"
+#include "Aql/AqlItemBlock.h"
+#include "Aql/ExecutionEngine.h"
+#include "Aql/ExecutionState.h"
+#include "Aql/QueryOptions.h"
+#include "Aql/SkipResult.h"
+
+#include "Logger/LogMacros.h"
+
+using namespace darbotdb;
+using namespace darbotdb::aql;
+using namespace darbotdb::tests;
+using namespace darbotdb::tests::aql;
+
+namespace {
+static auto blocksToInfos(std::deque<SharedAqlItemBlockPtr> const& blocks)
+    -> RegisterInfos {
+  auto readInput = RegIdSet{};
+  auto writeOutput = RegIdSet{};
+  RegIdSet toClear{};
+  RegIdSetStack toKeep{{}};
+  RegisterCount regs = 1;
+  for (auto const& b : blocks) {
+    if (b != nullptr) {
+      // Find the first non-nullptr block
+      regs = b->numRegisters();
+
+      break;
+    }
+  }
+  // if non found sorry blind guess the number of registers here.
+  // This can happen if you insert the data later into this Mock.
+  // If you do so this register planning is of
+  // for the rime being no test is showing this behavior.
+  // Consider adding data first if the test fails
+
+  for (RegisterId::value_t r = 0; r < regs; ++r) {
+    toKeep.back().emplace(r);
+  }
+  return {readInput, writeOutput, regs, regs, toClear, toKeep};
+}
+}  // namespace
+
+WaitingExecutionBlockMock::WaitingExecutionBlockMock(
+    ExecutionEngine* engine, ExecutionNode const* node,
+    std::deque<SharedAqlItemBlockPtr>&& data, WaitingBehaviour variant,
+    size_t subqueryDepth, WakeupCallback wakeUpCallback,
+    ExecuteCallback executeCallback)
+    : ExecutionBlock(engine, node),
+      _hasWaited(false),
+      _variant{variant},
+      _infos{::blocksToInfos(data)},
+      _blockData{*engine, node, _infos},
+      _wakeUpCallback(std::move(wakeUpCallback)),
+      _executeCallback(std::move(executeCallback)) {
+  SkipResult s;
+  for (size_t i = 0; i < subqueryDepth; ++i) {
+    s.incrementSubquery();
+  }
+  for (auto const& b : data) {
+    if (b != nullptr) {
+      TRI_ASSERT(s.nothingSkipped());
+      _blockData.addBlock(b, s);
+      if (b->hasShadowRows()) {
+        _doesContainShadowRows = true;
+      }
+    }
+  }
+
+  if (!data.empty() && data.back() == nullptr) {
+    // If the last block in _data is explicitly a nullptr
+    // we will lie on the last row
+    _shouldLieOnLastRow = true;
+  }
+}
+
+std::pair<darbotdb::aql::ExecutionState, darbotdb::Result>
+WaitingExecutionBlockMock::initializeCursor(
+    darbotdb::aql::InputAqlItemRow const& input) {
+  if (!_hasWaited) {
+    _hasWaited = true;
+    wakeupCallback();
+    return {ExecutionState::WAITING, TRI_ERROR_NO_ERROR};
+  }
+  _hasWaited = false;
+  return {ExecutionState::DONE, TRI_ERROR_NO_ERROR};
+}
+
+std::tuple<ExecutionState, SkipResult, SharedAqlItemBlockPtr>
+WaitingExecutionBlockMock::execute(AqlCallStack const& stack) {
+  _lastCall = stack.peek();
+  traceExecuteBegin(stack);
+  auto res = executeWithoutTrace(stack);
+  traceExecuteEnd(res);
+  return res;
+}
+
+std::tuple<ExecutionState, SkipResult, SharedAqlItemBlockPtr>
+WaitingExecutionBlockMock::executeWithoutTrace(AqlCallStack stack) {
+  executeCallback();
+
+  auto myCall = stack.peek();
+
+  TRI_ASSERT(
+      !(myCall.getOffset() == 0 && myCall.softLimit == AqlCall::Limit{0u}));
+  TRI_ASSERT(!(myCall.hasSoftLimit() && myCall.fullCount));
+  TRI_ASSERT(!(myCall.hasSoftLimit() && myCall.hasHardLimit()));
+  if (_variant != WaitingBehaviour::NEVER && !_hasWaited) {
+    // If we ordered waiting check on _hasWaited and wait if not
+    _hasWaited = true;
+    wakeupCallback();
+    return {ExecutionState::WAITING, SkipResult{}, nullptr};
+  }
+  if (_variant == WaitingBehaviour::ALWAYS) {
+    // If we always wait, reset.
+    _hasWaited = false;
+  }
+  if (!_blockData.hasDataFor(myCall)) {
+    return {ExecutionState::DONE, {}, nullptr};
+  }
+  SkipResult localSkipped;
+  while (true) {
+    auto [state, skipped, result] =
+        _blockData.execute(stack, ExecutionState::DONE);
+    // We loop here if we only skip
+    localSkipped.merge(skipped, false);
+    bool shouldReturn = state == ExecutionState::DONE || result != nullptr;
+
+    if (result != nullptr && !result->hasShadowRows()) {
+      // Count produced rows
+      auto& modCall = stack.modifyTopCall();
+      modCall.didProduce(result->numRows());
+    }
+
+    if (!skipped.nothingSkipped()) {
+      auto& modCall = stack.modifyTopCall();
+      modCall.didSkip(skipped.getSkipCount());
+      // Reset the internal counter.
+      // We reuse the call to upstream
+      // this inturn uses this counter to report nrRowsSkipped
+      modCall.skippedRows = 0;
+      if (!modCall.needSkipMore() && modCall.getLimit() == 0) {
+        // We do not have anything to do for this call
+        shouldReturn = true;
+      }
+    }
+    if (shouldReturn) {
+      if (!_doesContainShadowRows && state == ExecutionState::HASMORE) {
+        // FullCount phase, let us loop until we are done
+        // We do not have anything to do for this call
+        // But let us only do this on top-level queries
+
+        auto call = stack.peek();
+        if (call.hasHardLimit() && call.getLimit() == 0) {
+          // We are in fullCount/fastForward phase now.
+          while (state == ExecutionState::HASMORE) {
+            auto [nextState, nextSkipped, nextResult] =
+                _blockData.execute(stack, ExecutionState::DONE);
+            state = nextState;
+            // We are disallowed to have any result here.
+            TRI_ASSERT(nextResult == nullptr);
+            localSkipped.merge(nextSkipped, false);
+          }
+        }
+      }
+      // We want to "lie" on upstream if we have hit a softLimit exactly on the
+      // last row
+      if (state == ExecutionState::DONE && _shouldLieOnLastRow) {
+        auto const& call = stack.peek();
+        if (call.hasSoftLimit() && call.getLimit() == 0 &&
+            call.getOffset() == 0) {
+          state = ExecutionState::HASMORE;
+        }
+      }
+
+      // We have a valid result.
+      return {state, localSkipped, result};
+    }
+  }
+}
+
+void WaitingExecutionBlockMock::wakeupCallback() {
+  if (_wakeUpCallback) {
+    _wakeUpCallback();
+  }
+}
+
+void WaitingExecutionBlockMock::executeCallback() {
+  if (_executeCallback) {
+    _executeCallback();
+  }
+}
+
+auto WaitingExecutionBlockMock::remainingRows() const -> uint64_t {
+  return _blockData.remainingRows();
+}
+
+auto WaitingExecutionBlockMock::getLastCall() const -> darbotdb::aql::AqlCall {
+  return _lastCall;
+}

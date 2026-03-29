@@ -1,0 +1,530 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Dr. Frank Celler
+/// @author Achim Brandt
+/// @author Simon Grätzer
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
+#include "Basics/StringBuffer.h"
+#include "Basics/debugging.h"
+#include "Basics/error.h"
+#include "Basics/voc-errors.h"
+#include "Logger/LogMacros.h"
+#include "Logger/Logger.h"
+#include "Logger/LoggerStream.h"
+#include "Rest/CommonDefines.h"
+#include "Rest/GeneralRequest.h"
+
+namespace arangodb {
+namespace application_features {
+class CommunicationFeaturePhase;
+}
+
+namespace httpclient {
+
+class SimpleHttpResult;
+class GeneralClientConnection;
+
+struct SimpleHttpClientParams {
+  friend class SimpleHttpClient;
+
+  SimpleHttpClientParams(double requestTimeout, bool warn,
+                         bool addContentLength = true)
+      : _requestTimeout(requestTimeout),
+        _warn(warn),
+        _addContentLength(addContentLength),
+        _locationRewriter({nullptr, nullptr}) {}
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief leave connection open on destruction
+  //////////////////////////////////////////////////////////////////////////////
+
+  void keepConnectionOnDestruction(bool b) noexcept {
+    _keepConnectionOnDestruction = b;
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief enable or disable keep-alive
+  //////////////////////////////////////////////////////////////////////////////
+
+  void setKeepAlive(bool value) noexcept { _keepAlive = value; }
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief expose ArangoDB via user-agent?
+  //////////////////////////////////////////////////////////////////////////////
+
+  void setExposeArangoDB(bool value) noexcept { _exposeArangoDB = value; }
+
+  void setCompressRequestThreshold(uint64_t value) noexcept {
+    _compressRequestThreshold = value;
+  }
+
+  void setAllowCompressedResponses(bool value) noexcept {
+    _allowCompressedResponses = value;
+  }
+
+  void setMaxRetries(size_t s) noexcept { _maxRetries = s; }
+
+  size_t getMaxRetries() const noexcept { return _maxRetries; }
+
+  void setRetryWaitTime(uint64_t wt) noexcept { _retryWaitTime = wt; }
+
+  uint64_t getRetryWaitTime() const noexcept { return _retryWaitTime; }
+
+  void setRetryMessage(std::string const& m) { _retryMessage = m; }
+
+  double getRequestTimeout() const noexcept { return _requestTimeout; }
+
+  void setRequestTimeout(double value) noexcept { _requestTimeout = value; }
+
+  void setMaxPacketSize(size_t ms) noexcept { _maxPacketSize = ms; }
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief sets username and password
+  ///
+  /// @param prefix                         prefix for sending username and
+  /// password
+  /// @param username                       username
+  /// @param password                       password
+  //////////////////////////////////////////////////////////////////////////////
+
+  void setJwt(std::string const& jwt) { _jwt = jwt; }
+
+  // sets username and password
+  void setUserNamePassword(std::string_view prefix, std::string_view username,
+                           std::string_view password);
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief allows rewriting locations
+  //////////////////////////////////////////////////////////////////////////////
+
+  void setLocationRewriter(void const* data,
+                           std::string (*func)(void const*,
+                                               std::string const&)) {
+    _locationRewriter.data = data;
+    _locationRewriter.func = func;
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief set the value for max packet size
+  //////////////////////////////////////////////////////////////////////////////
+
+  static void setDefaultMaxPacketSize(size_t value) { MaxPacketSize = value; }
+
+ private:
+  double _requestTimeout;
+
+  // flag whether or not we keep the connection on destruction
+  bool _keepConnectionOnDestruction = false;
+
+  bool _warn;
+
+  bool _addContentLength = true;
+
+  bool _keepAlive = true;
+
+  bool _exposeArangoDB = true;
+
+  // if true, then the SimpleHttpClient will advertise via the HTTP header
+  // "accept-encoding: deflate" that it supports handling compressed response
+  // bodies.
+  bool _allowCompressedResponses = true;
+
+  size_t _maxRetries = 3;
+
+  uint64_t _retryWaitTime = 1 * 1000 * 1000;
+
+  std::string _retryMessage;
+
+  size_t _maxPacketSize = SimpleHttpClientParams::MaxPacketSize;
+
+  // compress request bodies if their size is >= this value. disabled by
+  // default.
+  uint64_t _compressRequestThreshold = 0;
+
+  std::string _basicAuth;
+
+  std::string _jwt;
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief struct for rewriting location URLs
+  //////////////////////////////////////////////////////////////////////////////
+
+  struct {
+    void const* data;
+    std::string (*func)(void const*, std::string const&);
+  } _locationRewriter;
+
+  // default value for max packet size
+  static size_t MaxPacketSize;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief simple http client
+////////////////////////////////////////////////////////////////////////////////
+
+class SimpleHttpClient {
+ private:
+  SimpleHttpClient(SimpleHttpClient const&) = delete;
+  SimpleHttpClient& operator=(SimpleHttpClient const&) = delete;
+
+ public:
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief state of the connection
+  //////////////////////////////////////////////////////////////////////////////
+
+  enum request_state {
+    IN_CONNECT,
+    IN_WRITE,
+    IN_READ_HEADER,
+    IN_READ_BODY,
+    IN_READ_CHUNKED_HEADER,
+    IN_READ_CHUNKED_BODY,
+    FINISHED,
+    DEAD
+  };
+
+  SimpleHttpClient(std::unique_ptr<GeneralClientConnection>&,
+                   SimpleHttpClientParams const&);
+  SimpleHttpClient(GeneralClientConnection*, SimpleHttpClientParams const&);
+  ~SimpleHttpClient();
+
+  /// @brief allow the SimpleHttpClient to reuse/recycle the result.
+  /// the SimpleHttpClient will assume ownership for it
+  void recycleResult(std::unique_ptr<SimpleHttpResult> result);
+
+  void setInterrupted(bool value);
+
+  request_state state() const { return _state; }
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief invalidates the connection used by the client
+  /// this may be called from other objects that are responsible for managing
+  /// connections. after this method has been called, the client must not be
+  /// used for any further HTTP operations, but should be destroyed instantly.
+  //////////////////////////////////////////////////////////////////////////////
+
+  void invalidateConnection() { _connection = nullptr; }
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief checks if the connection is open
+  //////////////////////////////////////////////////////////////////////////////
+
+  bool isConnected();
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief checks if the connection is open
+  //////////////////////////////////////////////////////////////////////////////
+
+  void disconnect();
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief returns a string representation of the connection endpoint
+  //////////////////////////////////////////////////////////////////////////////
+
+  std::string getEndpointSpecification() const;
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief close connection, go to state IN_CONNECT and clear the input
+  /// buffer. This is used to organize a retry of the connection.
+  //////////////////////////////////////////////////////////////////////////////
+
+  void close();
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief make an http request, creating a new HttpResult object
+  /// the caller has to delete the result object
+  /// this version does not allow specifying custom headers
+  /// if the request fails because of connection problems, the request will be
+  /// retried until it either succeeds (at least no connection problem) or there
+  /// have been _maxRetries retries
+  //////////////////////////////////////////////////////////////////////////////
+
+  SimpleHttpResult* retryRequest(
+      rest::RequestType, std::string const&, char const*, size_t,
+      std::unordered_map<std::string, std::string> const&);
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief make an http request, creating a new HttpResult object
+  /// the caller has to delete the result object
+  /// this version does not allow specifying custom headers
+  /// if the request fails because of connection problems, the request will be
+  /// retried until it either succeeds (at least no connection problem) or there
+  /// have been _maxRetries retries
+  //////////////////////////////////////////////////////////////////////////////
+
+  SimpleHttpResult* retryRequest(rest::RequestType, std::string const&,
+                                 char const*, size_t);
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief make an http request, creating a new HttpResult object
+  /// the caller has to delete the result object
+  /// this version does not allow specifying custom headers
+  //////////////////////////////////////////////////////////////////////////////
+
+  SimpleHttpResult* request(rest::RequestType, std::string const&, char const*,
+                            size_t);
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief make an http request, actual worker function
+  /// the caller has to delete the result object
+  /// this version allows specifying custom headers
+  //////////////////////////////////////////////////////////////////////////////
+
+  SimpleHttpResult* request(
+      rest::RequestType, std::string const&, char const*, size_t,
+      std::unordered_map<std::string, std::string> const&);
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief returns the current error message
+  //////////////////////////////////////////////////////////////////////////////
+
+  std::string const& getErrorMessage() const { return _errorMessage; }
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief register and dump an error message
+  //////////////////////////////////////////////////////////////////////////////
+
+  void setErrorMessage(std::string_view message, bool forceWarn = false) {
+    _errorMessage = message;
+
+    if (_params._warn || forceWarn) {
+      LOG_TOPIC("a1b4d", WARN, arangodb::Logger::HTTPCLIENT)
+          << "" << _errorMessage;
+    }
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief register an error message
+  //////////////////////////////////////////////////////////////////////////////
+
+  void setErrorMessage(std::string_view message, ErrorCode error);
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief checks whether an error message is already there
+  //////////////////////////////////////////////////////////////////////////////
+
+  bool haveErrorMessage() const { return _errorMessage.size() > 0; }
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief fetch the version from the server
+  //////////////////////////////////////////////////////////////////////////////
+
+  std::string getServerVersion(ErrorCode* errorCode = nullptr);
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief extract an error message from a response
+  //////////////////////////////////////////////////////////////////////////////
+
+  std::string getHttpErrorMessage(SimpleHttpResult const* result,
+                                  ErrorCode* errorCode = nullptr);
+
+  SimpleHttpClientParams& params() { return _params; }
+
+  /// @brief Thread-safe check abortion status
+  bool isAborted() const noexcept {
+    return _aborted.load(std::memory_order_acquire);
+  }
+
+  /// @brief Thread-safe set abortion status
+  void setAborted(bool value) noexcept;
+
+ private:
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief make a http request, creating a new HttpResult object
+  /// the caller has to delete the result object
+  /// this version allows specifying custom headers
+  //////////////////////////////////////////////////////////////////////////////
+
+  SimpleHttpResult* doRequest(
+      rest::RequestType, std::string const&, char const*, size_t,
+      std::unordered_map<std::string, std::string> const&);
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief initialize the connection
+  //////////////////////////////////////////////////////////////////////////////
+
+  void handleConnect();
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief clearReadBuffer, clears the read buffer as well as the result
+  //////////////////////////////////////////////////////////////////////////////
+
+  void clearReadBuffer();
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief rewrite a location URL
+  //////////////////////////////////////////////////////////////////////////////
+
+  std::string rewriteLocation(std::string const& location) {
+    if (_params._locationRewriter.func != nullptr) {
+      return _params._locationRewriter.func(_params._locationRewriter.data,
+                                            location);
+    }
+
+    return location;
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief set the type of the result
+  //////////////////////////////////////////////////////////////////////////////
+
+  void setResultType(bool haveSentRequest);
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief set the request
+  ///
+  /// @param method                         request method
+  /// @param location                       request uri
+  /// @param body                           request body
+  /// @param bodyLength                     size of body
+  /// @param headerFields                   list of header fields
+  //////////////////////////////////////////////////////////////////////////////
+
+  ErrorCode setRequest(
+      rest::RequestType method, std::string const& location, char const* body,
+      size_t bodyLength,
+      std::unordered_map<std::string, std::string> const& headerFields);
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief process (a part of) the http header, the data is
+  /// found in _readBuffer starting at _readBufferOffset until
+  /// _readBuffer.length().
+  //////////////////////////////////////////////////////////////////////////////
+
+  void processHeader();
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief process (a part of) the body, read the http body by content length
+  /// Note that when this is called, the content length of the body has always
+  /// been set, either by finding a value in the HTTP header or by reading
+  /// from the network until nothing more is found. The data is found in
+  /// _readBuffer starting at _readBufferOffset until _readBuffer.length().
+  //////////////////////////////////////////////////////////////////////////////
+
+  void processBody();
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief process the chunk size of the next chunk (i.e. the chunk header),
+  /// this is called when processing the body of a chunked transfer. The
+  /// data is found in _readBuffer at position _readBufferOffset until
+  /// _readBuffer.length().
+  /// Note that this method and processChunkedBody() call each other when
+  /// they complete, counting on the fact that in a single transfer the
+  /// number of chunks found is not so large to run into deep recursion
+  /// problems.
+  //////////////////////////////////////////////////////////////////////////////
+
+  void processChunkedHeader();
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief process the next chunk (i.e. the chunk body), this is called when
+  /// processing the body of a chunked transfer. The data is found in
+  /// _readBuffer at position _readBufferOffset until _readBuffer.length().
+  /// Note that this method and processChunkedHeader() call each other when
+  /// they complete, counting on the fact that in a single transfer the
+  /// number of chunks found is not so large to run into deep recursion
+  /// problems.
+  //////////////////////////////////////////////////////////////////////////////
+
+  void processChunkedBody();
+
+ private:
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief connection used (TCP or SSL connection)
+  //////////////////////////////////////////////////////////////////////////////
+
+  GeneralClientConnection* _connection;
+
+  // flag whether or not to delete the connection on destruction
+  bool _deleteConnectionOnDestruction = false;
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief connection parameters
+  //////////////////////////////////////////////////////////////////////////////
+  SimpleHttpClientParams _params;
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief write buffer
+  //////////////////////////////////////////////////////////////////////////////
+
+  arangodb::basics::StringBuffer _writeBuffer;
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief read buffer
+  //////////////////////////////////////////////////////////////////////////////
+
+  arangodb::basics::StringBuffer _readBuffer;
+
+  //////////////////////////////////////////////////////////////////////////////
+  /// @brief read buffer offset
+  ///
+  /// _state == IN_READ_BODY:
+  ///     points to the beginning of the body
+  ///
+  /// _state == IN_READ_HEADER:
+  ///     points to the beginning of the next header line
+  ///
+  /// _state == FINISHED:
+  ///     points to the beginning of the next request
+  ///
+  /// _state == IN_READ_CHUNKED_HEADER:
+  ///     points to the beginning of the next size line
+  ///
+  /// _state == IN_READ_CHUNKED_BODY:
+  ///     points to the beginning of the next body
+  //////////////////////////////////////////////////////////////////////////////
+
+  size_t _readBufferOffset;
+
+  request_state _state;
+
+  size_t _written;
+
+  std::string _errorMessage;
+
+  uint32_t _nextChunkedSize;
+
+  rest::RequestType _method;
+
+  std::unique_ptr<SimpleHttpResult> _result;
+
+  std::atomic<bool> _aborted;
+
+  std::string _hostname;
+
+  // reference to communication feature phase (populated only once for
+  // the entire lifetime of the SimpleHttpClient, as the repeated feature
+  // lookup may be expensive otherwise)
+  application_features::CommunicationFeaturePhase& _comm;
+};
+}  // namespace httpclient
+}  // namespace arangodb

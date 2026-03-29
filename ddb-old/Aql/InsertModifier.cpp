@@ -1,0 +1,56 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Markus Pfeiffer
+////////////////////////////////////////////////////////////////////////////////
+
+#include "InsertModifier.h"
+
+#include "Aql/AqlValue.h"
+#include "Aql/Collection.h"
+#include "Aql/Executor/ModificationExecutor.h"
+#include "Aql/Executor/ModificationExecutorHelpers.h"
+#include "Basics/StaticStrings.h"
+#include "Transaction/Methods.h"
+#include "VocBase/LogicalCollection.h"
+
+using namespace darbotdb;
+using namespace darbotdb::aql;
+using namespace darbotdb::aql::ModificationExecutorHelpers;
+
+ModifierOperationType InsertModifierCompletion::accumulate(
+    ModificationExecutorAccumulator& accu, InputAqlItemRow& row) {
+  RegisterId const inDocReg = _infos._input1RegisterId;
+
+  // The document to be INSERTed
+  AqlValue const& inDoc = row.getValue(inDocReg);
+
+  if (writeRequired(_infos, inDoc.slice(), StaticStrings::Empty)) {
+    accu.add(inDoc.slice());
+    return ModifierOperationType::ReturnIfAvailable;
+  } else {
+    return ModifierOperationType::CopyRow;
+  }
+}
+
+futures::Future<OperationResult> InsertModifierCompletion::transact(
+    transaction::Methods& trx, VPackSlice const& data) {
+  return trx.insertAsync(_infos._aqlCollection->name(), data, _infos._options);
+}

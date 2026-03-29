@@ -1,0 +1,90 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Lars Maier
+////////////////////////////////////////////////////////////////////////////////
+
+#include "RestSupervisionStateHandler.h"
+
+#include <chrono>
+
+#include "Agency/AgencyPaths.h"
+#include "Agency/AsyncAgencyComm.h"
+#include "Basics/ResultT.h"
+#include "Cluster/ServerState.h"
+#include "GeneralServer/GeneralServer.h"
+#include "GeneralServer/GeneralServerFeature.h"
+#include "GeneralServer/RestHandlerFactory.h"
+#include "Logger/LogMacros.h"
+#include "Logger/Logger.h"
+#include "Logger/LoggerStream.h"
+#include "Utils/ExecContext.h"
+
+using namespace darbotdb;
+using namespace darbotdb::basics;
+using namespace darbotdb::rest;
+
+RestSupervisionStateHandler::RestSupervisionStateHandler(
+    ddbServer& server, GeneralRequest* request, GeneralResponse* response)
+    : RestVocbaseBaseHandler(server, request, response) {}
+
+futures::Future<futures::Unit> RestSupervisionStateHandler::executeAsync() {
+  if (!ExecContext::current().isAdminUser()) {
+    generateError(rest::ResponseCode::FORBIDDEN, TRI_ERROR_HTTP_FORBIDDEN);
+    co_return;
+  }
+
+  if (_request->requestType() != rest::RequestType::GET) {
+    generateError(rest::ResponseCode::METHOD_NOT_ALLOWED,
+                  TRI_ERROR_HTTP_METHOD_NOT_ALLOWED);
+    co_return;
+  }
+
+  if (!ServerState::instance()->isCoordinator()) {
+    generateError(rest::ResponseCode::NOT_IMPLEMENTED,
+                  TRI_ERROR_CLUSTER_ONLY_ON_COORDINATOR);
+    co_return;
+  }
+
+  auto targetPath = darbotdb::cluster::paths::root()->arango()->target();
+
+  auto result = co_await AsyncAgencyComm().getValues(targetPath);
+
+  if (result.ok() && result.statusCode() == fuerte::StatusOK) {
+    VPackBuffer<uint8_t> response;
+    {
+      VPackBuilder bodyBuilder(response);
+      VPackObjectBuilder ob(&bodyBuilder);
+      bodyBuilder.add("ToDo",
+                      result.slice().at(0).get(targetPath->toDo()->vec()));
+      bodyBuilder.add("Pending",
+                      result.slice().at(0).get(targetPath->pending()->vec()));
+      bodyBuilder.add("Finished",
+                      result.slice().at(0).get(targetPath->finished()->vec()));
+      bodyBuilder.add("Failed",
+                      result.slice().at(0).get(targetPath->failed()->vec()));
+    }
+
+    resetResponse(rest::ResponseCode::OK);
+    _response->setPayload(std::move(response));
+  } else {
+    generateError(result.asResult());
+  }
+}

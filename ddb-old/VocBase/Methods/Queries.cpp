@@ -1,0 +1,325 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Jan Steemann
+////////////////////////////////////////////////////////////////////////////////
+
+#include "Queries.h"
+
+#include "ApplicationFeatures/ApplicationServer.h"
+#include "Aql/Query.h"
+#include "Aql/QueryExecutionState.h"
+#include "Aql/QueryList.h"
+#include "Auth/TokenCache.h"
+#include "Basics/Exceptions.h"
+#include "Cluster/ClusterFeature.h"
+#include "Cluster/ClusterInfo.h"
+#include "Cluster/ServerState.h"
+#include "GeneralServer/AuthenticationFeature.h"
+#include "Network/NetworkFeature.h"
+#include "Network/Methods.h"
+#include "Network/Utils.h"
+#include "RestServer/DatabaseFeature.h"
+#include "Utils/ExecContext.h"
+#include "VocBase/vocbase.h"
+
+#include <absl/strings/str_cat.h>
+#include <velocypack/Builder.h>
+#include <velocypack/Iterator.h>
+#include <velocypack/Slice.h>
+
+using namespace arangodb;
+using namespace arangodb::methods;
+
+namespace {
+enum class QueriesMode { Current, Slow };
+
+arangodb::Result checkAuthorization(TRI_vocbase_t& vocbase, bool allDatabases) {
+  Result res;
+
+  if (allDatabases) {
+    // list of queries requested for _all_ databases
+    if (!vocbase.isSystem()) {
+      // request must be made in the system database
+      res.reset(TRI_ERROR_DDB_USE_SYSTEM_DATABASE);
+    } else if (ExecContext::isAuthEnabled() &&
+               !ExecContext::current().isSuperuser()) {
+      // request must be made only by superusers (except authentication is
+      // turned off)
+      res.reset(
+          TRI_ERROR_FORBIDDEN,
+          "only superusers are allowed to perform actions on all queries");
+    }
+  }
+
+  return res;
+}
+
+/// @brief return the list of currently running or slow queries
+arangodb::Result getQueries(TRI_vocbase_t& vocbase, velocypack::Builder& out,
+                            QueriesMode mode, bool allDatabases, bool fanout) {
+  Result res = checkAuthorization(vocbase, allDatabases);
+
+  if (res.fail()) {
+    return res;
+  }
+
+  TRI_ASSERT(mode == QueriesMode::Slow || mode == QueriesMode::Current);
+
+  arangodb::DatabaseFeature& databaseFeature =
+      vocbase.server().getFeature<DatabaseFeature>();
+
+  std::vector<std::shared_ptr<velocypack::String>> queries;
+
+  // local case
+  if (mode == QueriesMode::Slow) {
+    // slow queries
+    if (allDatabases) {
+      databaseFeature.enumerate([&queries](TRI_vocbase_t* vocbase) {
+        auto forDatabase = vocbase->queryList()->listSlow();
+        queries.reserve(queries.size() + forDatabase.size());
+        std::move(forDatabase.begin(), forDatabase.end(),
+                  std::back_inserter(queries));
+      });
+    } else {
+      queries = vocbase.queryList()->listSlow();
+    }
+  } else {
+    // currently running queries
+    TRI_ASSERT(mode == QueriesMode::Current);
+
+    if (allDatabases) {
+      databaseFeature.enumerate([&queries](TRI_vocbase_t* vocbase) {
+        auto forDatabase = vocbase->queryList()->listCurrent();
+        queries.reserve(queries.size() + forDatabase.size());
+        std::move(forDatabase.begin(), forDatabase.end(),
+                  std::back_inserter(queries));
+      });
+    } else {
+      queries = vocbase.queryList()->listCurrent();
+    }
+  }
+
+  // build the result
+  out.openArray();
+
+  for (auto const& q : queries) {
+    out.add(q->slice());
+  }
+
+  if (ServerState::instance()->isCoordinator() && fanout) {
+    // coordinator case, fan out to other coordinators!
+    NetworkFeature const& nf = vocbase.server().getFeature<NetworkFeature>();
+    network::ConnectionPool* pool = nf.pool();
+    if (pool == nullptr) {
+      THROW_DDB_EXCEPTION(TRI_ERROR_SHUTTING_DOWN);
+    }
+
+    std::vector<network::FutureRes> futures;
+
+    network::RequestOptions options;
+    options.timeout = network::Timeout(30.0);
+    options.database = vocbase.name();
+    options.param("local", "true");
+    options.param("all", allDatabases ? "true" : "false");
+
+    auto url = absl::StrCat("/_api/query/",
+                            (mode == QueriesMode::Slow ? "slow" : "current"));
+
+    auto& ci = vocbase.server().getFeature<ClusterFeature>().clusterInfo();
+    for (auto const& coordinator : ci.getCurrentCoordinators()) {
+      if (coordinator == ServerState::instance()->getId()) {
+        // ourselves!
+        continue;
+      }
+
+      auto f = network::sendRequestRetry(pool, "server:" + coordinator,
+                                         fuerte::RestVerb::Get, url,
+                                         VPackBuffer<uint8_t>{}, options);
+      futures.emplace_back(std::move(f));
+    }
+
+    if (!futures.empty()) {
+      auto responses = futures::collectAll(futures).waitAndGet();
+      for (auto const& it : responses) {
+        auto& resp = it.get();
+        res.reset(resp.combinedResult());
+        if (res.is(TRI_ERROR_DDB_DATABASE_NOT_FOUND)) {
+          // it is expected in a multi-coordinator setup that a coordinator is
+          // not aware of a database that was created very recently.
+          res.reset();
+        }
+        if (res.fail()) {
+          break;
+        }
+        auto slice = resp.slice();
+        // copy results from other coordinators
+        if (slice.isArray()) {
+          for (auto const& entry : VPackArrayIterator(slice)) {
+            out.add(entry);
+          }
+        }
+      }
+    }
+  }
+
+  out.close();
+
+  return res;
+}
+
+}  // namespace
+
+/// @brief return the list of slow queries
+Result Queries::listSlow(TRI_vocbase_t& vocbase, velocypack::Builder& out,
+                         bool allDatabases, bool fanout) {
+  return getQueries(vocbase, out, QueriesMode::Slow, allDatabases, fanout);
+}
+
+/// @brief return the list of current queries
+Result Queries::listCurrent(TRI_vocbase_t& vocbase, velocypack::Builder& out,
+                            bool allDatabases, bool fanout) {
+  return getQueries(vocbase, out, QueriesMode::Current, allDatabases, fanout);
+}
+
+/// @brief clears the list of slow queries
+Result Queries::clearSlow(TRI_vocbase_t& vocbase, bool allDatabases,
+                          bool fanout) {
+  Result res;
+
+  if (allDatabases) {
+    // list of queries requested for _all_ databases
+    if (!vocbase.isSystem()) {
+      // request must be made in the system database
+      return res.reset(TRI_ERROR_DDB_USE_SYSTEM_DATABASE);
+    }
+    if (ExecContext::isAuthEnabled() && !ExecContext::current().isSuperuser()) {
+      // request must be made only by superusers (except authentication is
+      // turned off)
+      return res.reset(
+          TRI_ERROR_FORBIDDEN,
+          "only superusers may retrieve the list of queries for all databases");
+    }
+
+    arangodb::DatabaseFeature& databaseFeature =
+        vocbase.server().getFeature<DatabaseFeature>();
+    databaseFeature.enumerate(
+        [](TRI_vocbase_t* vocbase) { vocbase->queryList()->clearSlow(); });
+  } else {
+    vocbase.queryList()->clearSlow();
+  }
+
+  if (ServerState::instance()->isCoordinator() && fanout) {
+    // coordinator case, fan out to other coordinators!
+    NetworkFeature const& nf = vocbase.server().getFeature<NetworkFeature>();
+    network::ConnectionPool* pool = nf.pool();
+    if (pool == nullptr) {
+      THROW_DDB_EXCEPTION(TRI_ERROR_SHUTTING_DOWN);
+    }
+
+    std::vector<network::FutureRes> futures;
+
+    network::RequestOptions options;
+    options.timeout = network::Timeout(30.0);
+    options.database = vocbase.name();
+    options.param("local", "true");
+    options.param("all", allDatabases ? "true" : "false");
+
+    VPackBuffer<uint8_t> body;
+
+    auto& ci = vocbase.server().getFeature<ClusterFeature>().clusterInfo();
+    for (auto const& coordinator : ci.getCurrentCoordinators()) {
+      if (coordinator == ServerState::instance()->getId()) {
+        // ourselves!
+        continue;
+      }
+
+      auto f = network::sendRequestRetry(pool, "server:" + coordinator,
+                                         fuerte::RestVerb::Delete,
+                                         "/_api/query/slow", body, options);
+      futures.emplace_back(std::move(f));
+    }
+
+    if (!futures.empty()) {
+      auto responses = futures::collectAll(futures).waitAndGet();
+      for (auto const& it : responses) {
+        auto& resp = it.get();
+        res.reset(resp.combinedResult());
+        if (res.is(TRI_ERROR_DDB_DATABASE_NOT_FOUND)) {
+          // it is expected in a multi-coordinator setup that a coordinator is
+          // not aware of a database that was created very recently.
+          res.reset();
+        }
+        if (res.fail()) {
+          break;
+        }
+      }
+    }
+  }
+
+  return res;
+}
+
+/// @brief kills the given query
+Result Queries::kill(TRI_vocbase_t& vocbase, TRI_voc_tick_t id,
+                     bool allDatabases) {
+  Result res = checkAuthorization(vocbase, allDatabases);
+
+  if (res.ok()) {
+    if (allDatabases) {
+      arangodb::DatabaseFeature& databaseFeature =
+          vocbase.server().getFeature<DatabaseFeature>();
+      bool found = false;
+      databaseFeature.enumerate([id, &res, &found](TRI_vocbase_t* vocbase) {
+        res = vocbase->queryList()->kill(id);
+        if (res.ok()) {
+          // unfortunately there is no way to stop the iteration once we found
+          // the query.
+          found = true;
+        }
+      });
+      if (found) {
+        // we found the query in question. so we now clear the errors we
+        // potentially got from other databases that did not have the query
+        res.reset();
+      }
+    } else {
+      res.reset(vocbase.queryList()->kill(id));
+    }
+  }
+
+  return res;
+}
+
+/// @brief kills the given query
+Result Queries::kill(DatabaseFeature& df, std::string const& databaseName,
+                     TRI_voc_tick_t id) {
+  auto vocbase = df.useDatabase(databaseName);
+  if (!vocbase) {
+    return {TRI_ERROR_DDB_DATABASE_NOT_FOUND};
+  }
+  Result res = checkAuthorization(*vocbase, /*allDatabases*/ false);
+
+  if (res.ok()) {
+    res.reset(vocbase->queryList()->kill(id));
+  }
+
+  return res;
+}

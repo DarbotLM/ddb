@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DDB 3DKG Viewer</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+    .layout { display: grid; grid-template-columns: 1fr 320px; min-height: 100vh; }
+    .scene { position: relative; padding: 16px; overflow: auto; background: radial-gradient(circle at top, #1e293b 0%, #020617 70%); }
+    .panel { border-left: 1px solid #334155; padding: 16px; background: #111827; }
+    .controls { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    input, button, select { padding: 8px 10px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; }
+    button { cursor: pointer; background: #2563eb; border-color: #2563eb; }
+    .scene-canvas { position: relative; min-height: 780px; perspective: 1200px; transform-style: preserve-3d; }
+    .node { position: absolute; min-width: 120px; padding: 10px 12px; border-radius: 12px; transform-style: preserve-3d; cursor: pointer; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.4); }
+    .node.cards { background: rgba(34, 197, 94, 0.16); border: 1px solid rgba(74, 222, 128, 0.5); }
+    .node.entities { background: rgba(59, 130, 246, 0.16); border: 1px solid rgba(96, 165, 250, 0.5); }
+    .node.zones { background: rgba(249, 115, 22, 0.16); border: 1px solid rgba(251, 146, 60, 0.5); }
+    .node.events { background: rgba(168, 85, 247, 0.16); border: 1px solid rgba(192, 132, 252, 0.5); }
+    .node.patterns { background: rgba(236, 72, 153, 0.16); border: 1px solid rgba(244, 114, 182, 0.5); }
+    .node-label { font-weight: 700; font-size: 13px; }
+    .node-kind { margin-top: 4px; font-size: 11px; opacity: 0.8; text-transform: uppercase; }
+    .edge-list { margin-top: 16px; font-size: 12px; color: #cbd5e1; }
+    .inspector { background: #1f2937; border: 1px solid #374151; border-radius: 12px; padding: 12px; min-height: 180px; }
+    .meta { font-size: 12px; color: #94a3b8; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div class="scene">
+      <div class="controls">
+        <input id="manifest-id" type="text" placeholder="Manifest ID" />
+        <input id="db-id" type="text" placeholder="Micro DB ID (optional)" />
+        <button id="load-btn">Load Scene</button>
+      </div>
+      <div id="scene-canvas" class="scene-canvas"></div>
+      <div id="edges" class="edge-list"></div>
+    </div>
+    <div class="panel">
+      <h2>3DKG Inspector</h2>
+      <div id="inspector" class="inspector">Select a node to inspect its 3DKG metadata.</div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { App } from "@modelcontextprotocol/ext-apps";
+    const app = new App({ name: "DDB 3DKG Viewer", version: "0.1.0" });
+    app.connect();
+
+    const manifestIdInput = document.getElementById("manifest-id");
+    const dbIdInput = document.getElementById("db-id");
+    const loadBtn = document.getElementById("load-btn");
+    const sceneCanvas = document.getElementById("scene-canvas");
+    const edgesDiv = document.getElementById("edges");
+    const inspector = document.getElementById("inspector");
+
+    function layerClass(node) {
+      return (node.layer || "entities").replace(/[^a-z0-9_-]/gi, "-");
+    }
+
+    function renderInspector(node) {
+      inspector.innerHTML = `
+        <div><strong>${node.label}</strong></div>
+        <div class="meta">${node.entity_kind} / ${node.entity_id}</div>
+        <pre class="meta">${JSON.stringify(node.metadata || {}, null, 2)}</pre>
+      `;
+    }
+
+    function renderScene(data) {
+      const nodes = data.nodes || [];
+      const edges = data.edges || [];
+      sceneCanvas.innerHTML = "";
+      edgesDiv.innerHTML = edges.map(edge => `<div>${edge.source} --${edge.relation}--> ${edge.target}</div>`).join("");
+      for (const node of nodes) {
+        const el = document.createElement("div");
+        el.className = `node ${layerClass(node)}`;
+        const spatial = node.spatial || {};
+        const x = (spatial.x || 0) + 420;
+        const y = (spatial.y || 0) * -1 + 280;
+        const z = spatial.z || 0;
+        el.style.left = `${x}px`;
+        el.style.top = `${y}px`;
+        el.style.transform = `translateZ(${z}px)`;
+        el.innerHTML = `<div class="node-label">${node.label}</div><div class="node-kind">${node.entity_kind}</div>`;
+        el.addEventListener("click", () => renderInspector(node));
+        sceneCanvas.appendChild(el);
+      }
+    }
+
+    async function loadScene() {
+      const manifestId = manifestIdInput.value.trim();
+      if (!manifestId) return;
+      const args = { manifest_id: manifestId };
+      if (dbIdInput.value.trim()) args.db_id = dbIdInput.value.trim();
+      const result = await app.callServerTool({ name: "ddb-3dkg-render", arguments: args });
+      const text = result.content?.find(c => c.type === "text")?.text;
+      if (text) renderScene(JSON.parse(text));
+    }
+
+    loadBtn.addEventListener("click", loadScene);
+    app.ontoolresult = (result) => {
+      const text = result.content?.find(c => c.type === "text")?.text;
+      if (text) {
+        try { renderScene(JSON.parse(text)); } catch {}
+      }
+    };
+  </script>
+</body>
+</html>

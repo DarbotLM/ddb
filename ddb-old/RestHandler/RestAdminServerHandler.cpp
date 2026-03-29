@@ -1,0 +1,410 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Andreas Streichardt
+////////////////////////////////////////////////////////////////////////////////
+
+#include "RestAdminServerHandler.h"
+
+#include "Actions/RestActionHandler.h"
+#include "ApplicationFeatures/ApplicationServer.h"
+#include "Auth/Handler.h"
+#include "Auth/UserManager.h"
+#include "Basics/StaticStrings.h"
+#include "Cluster/ClusterFeature.h"
+#include "GeneralServer/AuthenticationFeature.h"
+#include "GeneralServer/GeneralServerFeature.h"
+#include "GeneralServer/SslServerFeature.h"
+#include "Inspection/VPack.h"
+#include "Logger/LogMacros.h"
+#include "Replication/ReplicationFeature.h"
+#include "RestServer/ApiRecordingFeature.h"
+#include "Scheduler/Scheduler.h"
+#include "Scheduler/SchedulerFeature.h"
+#include "Utils/ExecContext.h"
+#include "StorageEngine/EngineSelectorFeature.h"
+#include "StorageEngine/StorageEngine.h"
+#include "VocBase/VocbaseInfo.h"
+
+using namespace arangodb;
+using namespace arangodb::basics;
+using namespace arangodb::rest;
+
+RestAdminServerHandler::RestAdminServerHandler(ArangodServer& server,
+                                               GeneralRequest* request,
+                                               GeneralResponse* response)
+    : RestBaseHandler(server, request, response) {}
+
+RestStatus RestAdminServerHandler::execute() {
+  std::vector<std::string> const& suffixes = _request->suffixes();
+  if (suffixes.size() == 1 && suffixes[0] == "mode") {
+    handleMode();
+  } else if (suffixes.size() == 1 && suffixes[0] == "id") {
+    handleId();
+  } else if (suffixes.size() == 1 && suffixes[0] == "role") {
+    handleRole();
+  } else if (suffixes.size() == 1 && suffixes[0] == "availability") {
+    handleAvailability();
+  } else if (suffixes.size() == 1 && suffixes[0] == "databaseDefaults") {
+    handleDatabaseDefaults();
+  } else if (suffixes.size() == 1 && suffixes[0] == "tls") {
+    handleTLS();
+  } else if (suffixes.size() == 1 && suffixes[0] == "jwt") {
+    handleJWTSecretsReload();
+  } else if (suffixes.size() == 1 && suffixes[0] == "encryption") {
+    handleEncryptionKeyRotation();
+  } else if (suffixes.size() == 1 && suffixes[0] == "api-calls") {
+    handleApiCalls();
+  } else if (suffixes.size() == 1 && suffixes[0] == "aql-queries") {
+    handleAqlRecordedQueries();
+  } else {
+    generateError(rest::ResponseCode::NOT_FOUND, TRI_ERROR_HTTP_NOT_FOUND);
+  }
+  return RestStatus::DONE;
+}
+
+void RestAdminServerHandler::writeModeResult(bool readOnly) {
+  VPackBuilder builder;
+  {
+    VPackObjectBuilder b(&builder);
+    builder.add("mode", VPackValue(readOnly ? "readonly" : "default"));
+  }
+  generateOk(rest::ResponseCode::OK, builder);
+}
+
+void RestAdminServerHandler::handleId() {
+  if (_request->requestType() != rest::RequestType::GET) {
+    generateError(rest::ResponseCode::METHOD_NOT_ALLOWED,
+                  TRI_ERROR_HTTP_METHOD_NOT_ALLOWED);
+    return;
+  }
+
+  auto instance = ServerState::instance();
+  if (!instance->isRunningInCluster()) {
+    // old behavior...klingt komisch, is aber so
+    generateError(rest::ResponseCode::SERVER_ERROR,
+                  TRI_ERROR_HTTP_SERVER_ERROR);
+    return;
+  }
+
+  VPackBuilder builder;
+  {
+    VPackObjectBuilder b(&builder);
+    builder.add("id", VPackValue(instance->getId()));
+  }
+  generateOk(rest::ResponseCode::OK, builder);
+}
+
+void RestAdminServerHandler::handleRole() {
+  if (_request->requestType() != rest::RequestType::GET) {
+    generateError(rest::ResponseCode::METHOD_NOT_ALLOWED,
+                  TRI_ERROR_HTTP_METHOD_NOT_ALLOWED);
+    return;
+  }
+  auto state = ServerState::instance();
+  VPackBuilder builder;
+  {
+    VPackObjectBuilder b(&builder);
+    builder.add("role", VPackValue(state->roleToString(state->getRole())));
+    builder.add("mode", VPackValue("default"));
+  }
+  generateOk(rest::ResponseCode::OK, builder);
+}
+
+/// @brief simple availability check
+/// this handler does not require authentication
+/// it will return HTTP 200 in case the server is up and usable,
+/// and not in read-only mode .
+/// will return HTTP 503 in case the server is starting, stopping,
+/// or set to read-only.
+void RestAdminServerHandler::handleAvailability() {
+  if (_request->requestType() != rest::RequestType::GET) {
+    generateError(rest::ResponseCode::METHOD_NOT_ALLOWED,
+                  TRI_ERROR_HTTP_METHOD_NOT_ALLOWED);
+    return;
+  }
+
+  bool available = false;
+  switch (ServerState::mode()) {
+    case ServerState::Mode::DEFAULT: {
+      available = !server().isStopping();
+      Scheduler* scheduler = SchedulerFeature::SCHEDULER;
+      if (available && scheduler) {
+        // if the scheduler's queue is more than x% full, render
+        // the server unavailable
+        double unavailabilityFillGrade =
+            scheduler->unavailabilityQueueFillGrade();
+        if (unavailabilityFillGrade > 0.0) {
+          double fillGrade = scheduler->approximateQueueFillGrade();
+          if (fillGrade >= unavailabilityFillGrade) {
+            // oops, queue is relatively full
+            available = false;
+          }
+        }
+      }
+      if (available) {
+        // also ask storage engine for its health
+        StorageEngine& engine =
+            server().getFeature<EngineSelectorFeature>().engine();
+        available = engine.healthCheck().res.ok();
+      }
+      break;
+    }
+    case ServerState::Mode::STARTUP:
+    case ServerState::Mode::MAINTENANCE:
+    case ServerState::Mode::INVALID:
+      TRI_ASSERT(!available);
+      break;
+  }
+
+  if (!available) {
+    // this will produce an HTTP 503 result
+    generateError(rest::ResponseCode::SERVICE_UNAVAILABLE,
+                  TRI_ERROR_HTTP_SERVICE_UNAVAILABLE);
+  } else {
+    // this will produce an HTTP 200 result
+    writeModeResult(ServerState::readOnly());
+  }
+}
+
+void RestAdminServerHandler::handleMode() {
+  auto const requestType = _request->requestType();
+  if (requestType == rest::RequestType::GET) {
+    writeModeResult(ServerState::readOnly());
+  } else if (requestType == rest::RequestType::PUT) {
+    AuthenticationFeature* af = AuthenticationFeature::instance();
+    if (af->isActive() && !_request->user().empty()) {
+      auth::Level lvl;
+      if (af->userManager() != nullptr) {
+        lvl = af->userManager()->databaseAuthLevel(
+            _request->user(), StaticStrings::SystemDatabase,
+            /*configured*/ true);
+      } else {
+        lvl = auth::Level::RW;
+      }
+      if (lvl < auth::Level::RW) {
+        generateError(rest::ResponseCode::FORBIDDEN, TRI_ERROR_FORBIDDEN);
+        return;
+      }
+    }
+
+    bool parseSuccess = false;
+    VPackSlice slice = this->parseVPackBody(parseSuccess);
+    if (!parseSuccess) {
+      generateError(rest::ResponseCode::BAD, TRI_ERROR_HTTP_BAD_PARAMETER,
+                    "invalid JSON");
+      return;
+    }
+
+    if (!slice.isObject()) {
+      generateError(rest::ResponseCode::BAD, TRI_ERROR_HTTP_BAD_PARAMETER,
+                    "body must be an object");
+      return;
+    }
+
+    auto modeSlice = slice.get("mode");
+    if (!modeSlice.isString()) {
+      generateError(rest::ResponseCode::BAD, TRI_ERROR_HTTP_BAD_PARAMETER,
+                    "mode must be a string");
+      return;
+    }
+
+    Result res;
+    if (modeSlice.compareString("readonly") == 0) {
+      res = ServerState::instance()->propagateClusterReadOnly(true);
+    } else if (modeSlice.compareString("default") == 0) {
+      res = ServerState::instance()->propagateClusterReadOnly(false);
+    } else {
+      generateError(rest::ResponseCode::BAD, TRI_ERROR_HTTP_BAD_PARAMETER,
+                    "mode invalid");
+      return;
+    }
+
+    if (res.fail()) {
+      generateError(rest::ResponseCode::BAD, TRI_ERROR_HTTP_SERVER_ERROR,
+                    "couldn't set requested mode");
+      LOG_TOPIC("02050", ERR, Logger::FIXME)
+          << "Couldn't set requested mode: " << res.errorMessage();
+      return;
+    }
+    writeModeResult(ServerState::readOnly());
+
+  } else {
+    generateError(rest::ResponseCode::METHOD_NOT_ALLOWED,
+                  TRI_ERROR_HTTP_METHOD_NOT_ALLOWED);
+  }
+}
+
+void RestAdminServerHandler::handleDatabaseDefaults() {
+  auto defaults = getVocbaseOptions(server(), VPackSlice::emptyObjectSlice(),
+                                    /*strictValidation*/ false);
+  if (server().getFeature<ClusterFeature>().forceOneShard()) {
+    defaults.sharding = "single";
+  }
+  VPackBuilder builder;
+
+  builder.openObject();
+  addClusterOptions(builder, defaults);
+  builder.close();
+  generateResult(rest::ResponseCode::OK, builder.slice());
+}
+
+void RestAdminServerHandler::handleTLS() {
+  auto const requestType = _request->requestType();
+  VPackBuilder builder;
+  auto& sslServerFeature = server().getFeature<SslServerFeature>();
+  if (requestType == rest::RequestType::GET) {
+    // Put together a TLS-based cocktail:
+    sslServerFeature.dumpTLSData(builder);
+    generateOk(rest::ResponseCode::OK, builder.slice());
+  } else if (requestType == rest::RequestType::POST) {
+    // Only the superuser may reload TLS data:
+    if (ExecContext::isAuthEnabled() && !ExecContext::current().isSuperuser()) {
+      generateError(rest::ResponseCode::FORBIDDEN, TRI_ERROR_FORBIDDEN,
+                    "only superusers may reload TLS data");
+      return;
+    }
+
+    auto& gs = server().getFeature<GeneralServerFeature>();
+    Result res = gs.reloadTLS();
+    if (res.fail()) {
+      generateError(rest::ResponseCode::BAD, res.errorNumber(),
+                    res.errorMessage());
+      return;
+    }
+    sslServerFeature.dumpTLSData(builder);
+    generateOk(rest::ResponseCode::OK, builder.slice());
+  } else {
+    generateError(rest::ResponseCode::FORBIDDEN, TRI_ERROR_FORBIDDEN);
+  }
+}
+
+#ifndef USE_ENTERPRISE
+void RestAdminServerHandler::handleJWTSecretsReload() {
+  generateError(rest::ResponseCode::NOT_FOUND, TRI_ERROR_HTTP_NOT_FOUND);
+}
+
+void RestAdminServerHandler::handleEncryptionKeyRotation() {
+  generateError(rest::ResponseCode::NOT_FOUND, TRI_ERROR_HTTP_NOT_FOUND);
+}
+#endif
+
+void RestAdminServerHandler::handleApiCalls() {
+  if (_request->requestType() != rest::RequestType::GET) {
+    generateError(rest::ResponseCode::METHOD_NOT_ALLOWED,
+                  TRI_ERROR_HTTP_METHOD_NOT_ALLOWED);
+    return;
+  }
+
+  auto& apiRecordingFeature = server().getFeature<ApiRecordingFeature>();
+
+  // Check if recording API is enabled
+  if (!apiRecordingFeature.isAPIEnabled()) {
+    generateError(rest::ResponseCode::FORBIDDEN, TRI_ERROR_HTTP_FORBIDDEN,
+                  "The recording API has been disabled");
+    return;
+  }
+
+  // Check permission level
+  if (apiRecordingFeature.onlySuperUser()) {
+    if (!ExecContext::current().isSuperuser()) {
+      generateError(rest::ResponseCode::FORBIDDEN, TRI_ERROR_HTTP_FORBIDDEN,
+                    "You need super user rights for recording API operations");
+      return;
+    }
+  } else {
+    if (!ExecContext::current().isAdminUser()) {
+      generateError(rest::ResponseCode::FORBIDDEN, TRI_ERROR_HTTP_FORBIDDEN,
+                    "You need admin rights for recording API operations");
+      return;
+    }
+  }
+
+  VPackBuilder builder;
+  {
+    VPackObjectBuilder guard(&builder);
+    builder.add(VPackValue("calls"));
+    {
+      VPackArrayBuilder guard2(&builder);
+
+      // Use doForApiCallRecords to iterate through records
+      apiRecordingFeature.doForApiCallRecords(
+          [&builder](ApiCallRecord const& record) {
+            arangodb::velocypack::serialize(builder, record);
+          });
+    }
+  }
+  generateOk(rest::ResponseCode::OK, builder.slice());
+}
+
+void RestAdminServerHandler::handleAqlRecordedQueries() {
+  if (_request->requestType() != rest::RequestType::GET) {
+    generateError(rest::ResponseCode::METHOD_NOT_ALLOWED,
+                  TRI_ERROR_HTTP_METHOD_NOT_ALLOWED);
+    return;
+  }
+  if (!ServerState::instance()->isCoordinator() &&
+      !ServerState::instance()->isSingleServer()) {
+    generateError(
+        Result(TRI_ERROR_NOT_IMPLEMENTED,
+               "API only available on Coordinators and single servers"));
+    return;
+  }
+
+  auto& apiRecordingFeature = server().getFeature<ApiRecordingFeature>();
+
+  // Check if recording API is enabled
+  if (!apiRecordingFeature.isAPIEnabled()) {
+    generateError(rest::ResponseCode::FORBIDDEN, TRI_ERROR_HTTP_FORBIDDEN,
+                  "recording API is disabled");
+    return;
+  }
+
+  // Check permission level
+  if (apiRecordingFeature.onlySuperUser()) {
+    if (!ExecContext::current().isSuperuser()) {
+      generateError(rest::ResponseCode::FORBIDDEN, TRI_ERROR_HTTP_FORBIDDEN,
+                    "you need super user rights for recording API operations");
+      return;
+    }
+  } else {
+    if (!ExecContext::current().isAdminUser()) {
+      generateError(rest::ResponseCode::FORBIDDEN, TRI_ERROR_HTTP_FORBIDDEN,
+                    "you need admin rights for recording API operations");
+      return;
+    }
+  }
+
+  VPackBuilder builder;
+  {
+    VPackObjectBuilder guard(&builder);
+    builder.add(VPackValue("queries"));
+    {
+      VPackArrayBuilder guard2(&builder);
+
+      // Use doForAqlQueryRecords to iterate through records
+      apiRecordingFeature.doForAqlQueryRecords(
+          [&builder](AqlQueryRecord const& record) {
+            arangodb::velocypack::serialize(builder, record);
+          });
+    }
+  }
+  generateOk(rest::ResponseCode::OK, builder.slice());
+}

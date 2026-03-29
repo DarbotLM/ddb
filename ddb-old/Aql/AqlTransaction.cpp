@@ -1,0 +1,99 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Jan Steemann
+////////////////////////////////////////////////////////////////////////////////
+
+#include "AqlTransaction.h"
+
+#include "Aql/Collection.h"
+#include "Aql/Collections.h"
+#include "StorageEngine/TransactionState.h"
+#include "Transaction/Context.h"
+#include "Utils/CollectionNameResolver.h"
+#include "VocBase/LogicalCollection.h"
+
+#ifdef USE_ENTERPRISE
+#include "Enterprise/Transaction/IgnoreNoAccessAqlTransaction.h"
+#endif
+
+using namespace darbotdb;
+using namespace darbotdb::aql;
+
+std::unique_ptr<AqlTransaction> AqlTransaction::create(
+    std::shared_ptr<transaction::Context> transactionContext,
+    aql::Collections const& collections, transaction::Options const& options,
+    std::unordered_set<std::string> inaccessibleCollections) {
+#ifdef USE_ENTERPRISE
+  if (!inaccessibleCollections.empty()) {
+    return std::make_unique<transaction::IgnoreNoAccessAqlTransaction>(
+        std::move(transactionContext), collections, options,
+        std::move(inaccessibleCollections));
+  }
+#endif
+  return std::make_unique<AqlTransaction>(std::move(transactionContext),
+                                          collections, options);
+}
+
+AqlTransaction::AqlTransaction(
+    std::shared_ptr<transaction::Context> transactionContext,
+    transaction::Options const& options)
+    : transaction::Methods(std::move(transactionContext), options) {
+  if (options.isIntermediateCommitEnabled()) {
+    addHint(transaction::Hints::Hint::INTERMEDIATE_COMMITS);
+  }
+}
+
+/// protected so we can create different subclasses
+AqlTransaction::AqlTransaction(
+    std::shared_ptr<transaction::Context> transactionContext,
+    aql::Collections const& collections, transaction::Options const& options)
+    : transaction::Methods(std::move(transactionContext), options) {
+  TRI_ASSERT(state() != nullptr);
+  if (options.isIntermediateCommitEnabled()) {
+    addHint(transaction::Hints::Hint::INTERMEDIATE_COMMITS);
+  }
+
+  collections.visit([this](std::string const&, aql::Collection& collection) {
+    Result res = processCollection(collection);
+
+    if (res.fail()) {
+      THROW_ARANGO_EXCEPTION(res);
+    }
+
+    return true;
+  });
+}
+
+/// @brief add a collection to the transaction
+Result AqlTransaction::processCollection(aql::Collection& collection) {
+  if (collection.hasCollectionObject()) {
+    // we should get here for all existing collections/shards, but
+    // not for views.
+    auto c = collection.getCollection();
+    // note that c->name() and collection->name() may differ if the collection
+    // is accessed in a query by its id instead of its name.
+    return addCollection(c->id(), c->name(), collection.accessType());
+  }
+
+  // views
+  DataSourceId cid = resolver()->getCollectionId(collection.name());
+  return addCollection(cid, collection.name(), collection.accessType());
+}

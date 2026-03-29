@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DDB Graph Explorer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 16px; background: #fafafa; }
+    h2 { margin-bottom: 12px; }
+    .controls { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .controls input, .controls select { padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+    .controls button { padding: 6px 14px; background: #1565c0; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    .graph-container { background: white; border: 1px solid #e0e0e0; border-radius: 8px; min-height: 300px; padding: 16px; position: relative; }
+    .node { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 16px; margin: 4px; font-size: 13px; cursor: pointer; }
+    .node.agents { background: #e3f2fd; border: 1px solid #90caf9; }
+    .node.cards { background: #e8f5e9; border: 1px solid #a5d6a7; }
+    .node.patterns { background: #f3e5f5; border: 1px solid #ce93d8; }
+    .node.memory_zones { background: #fff3e0; border: 1px solid #ffcc80; }
+    .edge { font-size: 11px; color: #888; padding: 2px 8px; }
+    .depth-label { font-size: 11px; color: #aaa; font-weight: 600; margin: 8px 0 4px; }
+    .empty { text-align: center; padding: 32px; color: #888; }
+    #loading { text-align: center; padding: 20px; color: #888; display: none; }
+  </style>
+</head>
+<body>
+  <h2>Graph Explorer</h2>
+  <div class="controls">
+    <input id="start-key" type="text" placeholder="Start node key" />
+    <select id="collection">
+      <option value="cards">Cards</option>
+      <option value="agents">Agents</option>
+      <option value="patterns">Patterns</option>
+    </select>
+    <input id="depth" type="number" value="3" min="1" max="10" style="width:60px" />
+    <button id="explore-btn">Explore</button>
+  </div>
+  <div id="loading">Traversing graph...</div>
+  <div id="graph" class="graph-container">
+    <div class="empty">Enter a node key and click Explore to traverse the knowledge graph</div>
+  </div>
+
+  <script type="module">
+    import { App } from "@modelcontextprotocol/ext-apps";
+
+    const app = new App({ name: "DDB Graph Explorer", version: "0.1.0" });
+    app.connect();
+
+    const startKey = document.getElementById("start-key");
+    const collection = document.getElementById("collection");
+    const depth = document.getElementById("depth");
+    const exploreBtn = document.getElementById("explore-btn");
+    const graphDiv = document.getElementById("graph");
+    const loadingDiv = document.getElementById("loading");
+
+    function renderGraph(data) {
+      const results = data.results || [];
+      if (!results.length) {
+        graphDiv.innerHTML = '<div class="empty">No nodes found from this starting point</div>';
+        return;
+      }
+
+      const byDepth = {};
+      for (const r of results) {
+        const d = r.depth ?? 0;
+        if (!byDepth[d]) byDepth[d] = [];
+        byDepth[d].push(r);
+      }
+
+      let html = "";
+      for (const [d, nodes] of Object.entries(byDepth).sort((a, b) => a[0] - b[0])) {
+        html += `<div class="depth-label">Depth ${d}</div>`;
+        for (const n of nodes) {
+          const card = n.card || n;
+          const col = card._id?.split("/")[0] || collection.value;
+          const key = card._key || card.name || card._id || "?";
+          const label = card.title || card.name || key;
+          html += `<span class="node ${col}" data-key="${key}" title="${card._id || ''}">${label}</span>`;
+        }
+      }
+      graphDiv.innerHTML = html;
+
+      graphDiv.querySelectorAll(".node").forEach(node => {
+        node.addEventListener("click", () => {
+          startKey.value = node.dataset.key;
+          doExplore();
+        });
+      });
+    }
+
+    async function doExplore() {
+      const key = startKey.value.trim();
+      if (!key) return;
+      loadingDiv.style.display = "block";
+      graphDiv.innerHTML = "";
+      const result = await app.callServerTool({
+        name: "ddb-graph-explore",
+        arguments: {
+          start_key: key,
+          collection: collection.value,
+          depth: parseInt(depth.value) || 3,
+        },
+      });
+      loadingDiv.style.display = "none";
+      const text = result.content?.find(c => c.type === "text")?.text;
+      if (text) renderGraph(JSON.parse(text));
+    }
+
+    exploreBtn.addEventListener("click", doExplore);
+    startKey.addEventListener("keydown", e => { if (e.key === "Enter") doExplore(); });
+
+    app.ontoolresult = (result) => {
+      const text = result.content?.find(c => c.type === "text")?.text;
+      if (text) {
+        try { renderGraph(JSON.parse(text)); } catch {}
+      }
+    };
+  </script>
+</body>
+</html>

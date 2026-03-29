@@ -1,0 +1,257 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Dr. Frank Celler
+/// @author Achim Brandt
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <cstddef>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <velocypack/Builder.h>
+#include <velocypack/Options.h>
+#include <velocypack/Slice.h>
+
+#include "Endpoint/ConnectionInfo.h"
+#include "Endpoint/Endpoint.h"
+#include "Rest/CommonDefines.h"
+
+namespace arangodb {
+class RequestContext;
+
+using rest::ContentType;
+using rest::EncodingType;
+using rest::RequestType;
+
+class GeneralRequest {
+  GeneralRequest(GeneralRequest const&) = delete;
+  GeneralRequest& operator=(GeneralRequest const&) = delete;
+
+ public:
+  GeneralRequest(GeneralRequest&&) = default;
+
+  explicit GeneralRequest(ConnectionInfo const& connectionInfo, uint64_t mid);
+
+  virtual ~GeneralRequest() = default;
+
+  // translate an RequestType enum value into an "HTTP method string"
+  static std::string_view translateMethod(RequestType);
+
+  // translate "HTTP method string" into RequestType enum value
+  static RequestType translateMethod(std::string_view method);
+
+  size_t memoryUsage() const noexcept { return _memoryUsage; }
+  void increaseMemoryUsage(size_t value) noexcept { _memoryUsage += value; }
+
+  ConnectionInfo const& connectionInfo() const { return _connectionInfo; }
+
+  /// Database used for this request, _system by default
+  std::string const& databaseName() const { return _databaseName; }
+  void setDatabaseName(std::string databaseName);
+
+  /// @brief User exists on this server or on external auth system
+  ///  and password was checked. Must not imply any access rights
+  ///  to any specific resource.
+  bool authenticated() const { return _authenticated; }
+  void setAuthenticated(bool a) { _authenticated = a; }
+
+  double tokenExpiry() const { return _tokenExpiry; }
+  void setTokenExpiry(double value) { _tokenExpiry = value; }
+
+  // @brief User sending this request
+  std::string const& user() const { return _user; }
+  void setUser(std::string user);
+
+  /// @brief the request context depends on the application
+  std::shared_ptr<RequestContext> requestContext() const {
+    return _requestContext;
+  }
+
+  /// @brief set request context
+  void setRequestContext(std::shared_ptr<RequestContext>);
+
+  RequestType requestType() const { return _type; }
+
+  void setRequestType(RequestType type) { _type = type; }
+
+  std::string const& fullUrl() const { return _fullUrl; }
+  void setFullUrl(std::string fullUrl);
+
+  std::string const& requestUrl() const { return _fullUrl; }
+
+  // consists of the URL without the host and without any parameters.
+  std::string const& requestPath() const { return _requestPath; }
+  void setRequestPath(std::string path);
+
+  // The request path consists of the URL without the host and without any
+  // parameters.  The request path is split into two parts: the prefix, namely
+  // the part of the request path that was match by a handler and the suffix
+  // with all the remaining arguments.
+  std::string prefix() const { return _prefix; }
+  void setPrefix(std::string prefix);
+
+  // Returns the request path suffixes in non-URL-decoded form
+  std::vector<std::string> const& suffixes() const { return _suffixes; }
+
+  void addSuffix(std::string part);
+
+#ifdef ARANGODB_USE_GOOGLE_TESTS
+  void clearSuffixes() {
+    size_t memoryUsage = 0;
+    for (auto const& it : _suffixes) {
+      memoryUsage += it.size();
+    }
+    _suffixes.clear();
+    _memoryUsage -= memoryUsage;
+  }
+#endif
+
+  // Returns the request path suffixes in URL-decoded form. Note: this will
+  // re-compute the suffix list on every call!
+  std::vector<std::string> decodedSuffixes() const;
+
+  uint64_t messageId() const { return _messageId; }
+
+  // get value from headers map. The key must be lowercase.
+  std::string const& header(std::string const& key) const;
+  std::string const& header(std::string const& key, bool& found) const;
+  std::unordered_map<std::string, std::string> const& headers() const {
+    return _headers;
+  }
+
+  void removeHeader(std::string const& key);
+  void addHeader(std::string key, std::string value);
+
+  // the value functions give access to to query string parameters
+  std::string const& value(std::string const& key) const;
+  std::string const& value(std::string const& key, bool& found) const;
+  std::unordered_map<std::string, std::string> const& values() const {
+    return _values;
+  }
+
+  // returns the query parameters as fuerte needs them (as a map)
+  std::map<std::string, std::string> parameters() const;
+
+  std::unordered_map<std::string, std::vector<std::string>> const& arrayValues()
+      const {
+    return _arrayValues;
+  }
+
+  /// @brief returns parsed value, returns valueNotFound if parameter was not
+  /// found
+  template<typename T>
+  T parsedValue(std::string const& key, T valueNotFound);
+  /// @brief returns parsed value, returns std::nullopt if parameter was not
+  /// found
+  template<typename T>
+  auto parsedValue(std::string const& key) -> std::optional<T>;
+
+  /// @brief the content length
+  virtual size_t contentLength() const noexcept = 0;
+  /// @brief unprocessed request payload
+  virtual std::string_view rawPayload() const = 0;
+  /// @brief parsed request payload
+  virtual velocypack::Slice payload(bool strictValidation = true) = 0;
+  /// @brief overwrite payload
+  virtual void setPayload(velocypack::Buffer<uint8_t> buffer);
+
+  virtual void setDefaultContentType() noexcept = 0;
+  /// @brieg should reflect the Content-Type header
+  ContentType contentType() const noexcept { return _contentType; }
+  /// @brief should generally reflect the Accept header
+  ContentType contentTypeResponse() const noexcept {
+    return _contentTypeResponse;
+  }
+
+  std::string const& contentTypeResponsePlain() const {
+    return _contentTypeResponsePlain;
+  }
+  /// @brief should generally reflect the Accept-Encoding header
+  EncodingType acceptEncoding() const { return _acceptEncoding; }
+
+  rest::AuthenticationMethod authenticationMethod() const {
+    return _authenticationMethod;
+  }
+
+  void setAuthenticationMethod(rest::AuthenticationMethod method) {
+    _authenticationMethod = method;
+  }
+
+ protected:
+  static RequestType findRequestType(char const*, size_t const);
+  void setValue(std::string key, std::string value);
+  void setArrayValue(std::string key, std::string value);
+
+  void setStringValue(std::string& target, std::string&& value);
+
+  /// @brief get VelocyPack options for validation. effectively turns off
+  /// validation if strictValidation is false. This optimization can be used for
+  /// internal requests
+  velocypack::Options const* validationOptions(bool strictValidation);
+
+  ConnectionInfo _connectionInfo;  /// connection info
+
+  /// request payload buffer, exact access semantics are defined in subclass
+  velocypack::Buffer<uint8_t> _payload;
+
+  std::string _databaseName;
+  std::string _user;
+
+  std::string _fullUrl;
+  std::string _requestPath;
+  std::string _prefix;  // part of path matched by rest route
+  std::string _contentTypeResponsePlain;
+  std::vector<std::string> _suffixes;  // path suffixes
+
+  std::unordered_map<std::string, std::string> _headers;
+  std::unordered_map<std::string, std::string> _values;
+  std::unordered_map<std::string, std::vector<std::string>> _arrayValues;
+
+  /// @brief if payload was not VPack this will store parsed result
+  std::shared_ptr<velocypack::Builder> _vpackBuilder;
+
+  uint64_t const _messageId;
+
+  // request context (might contain vocbase)
+  std::shared_ptr<RequestContext> _requestContext;
+
+  double _tokenExpiry;
+
+  size_t _memoryUsage;
+
+  rest::AuthenticationMethod _authenticationMethod;
+
+  // information about the payload
+  RequestType _type;         // GET, POST, ..
+  ContentType _contentType;  // UNSET, VPACK, JSON
+  ContentType _contentTypeResponse;
+  EncodingType _acceptEncoding;
+  bool _authenticated;
+};
+}  // namespace arangodb

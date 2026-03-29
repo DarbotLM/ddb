@@ -1,0 +1,257 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Tobias Gödderz & Heiko Kernbach
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <velocypack/Buffer.h>
+#include <chrono>
+#include <utility>
+
+#include "Aql/Query.h"
+#include "Aql/VariableGenerator.h"
+#include "Auth/Common.h"
+#include "Basics/ReadWriteLock.h"
+#include "Cluster/ClusterInfo.h"
+#include "Basics/ResultT.h"
+#include "Graph/Graph.h"
+#include "Transaction/StandaloneContext.h"
+#include "Utils/OperationResult.h"
+
+namespace arangodb {
+
+namespace transaction {
+class Methods;
+}
+class RevisionId;
+namespace graph {
+// TODO rename to GraphMethods
+
+enum class VertexValidationOrigin { DEFAULT, FROM_ATTRIBUTE, TO_ATTRIBUTE };
+
+class GraphOperations {
+ private:
+  Graph& _graph;
+  TRI_vocbase_t& _vocbase;
+  transaction::OperationOrigin _operationOrigin;
+  std::shared_ptr<transaction::Context> _ctx;
+
+  Graph const& graph() const { return _graph; };
+  std::shared_ptr<transaction::Context> ctx();
+
+ public:
+  GraphOperations() = delete;
+  GraphOperations(Graph& graph_, TRI_vocbase_t& vocbase,
+                  transaction::OperationOrigin operationOrigin,
+                  std::shared_ptr<transaction::Context> const& ctx = nullptr)
+      : _graph(graph_),
+        _vocbase(vocbase),
+        _operationOrigin(operationOrigin),
+        _ctx(ctx) {}
+
+  // TODO I added the complex result type for the get* methods to exactly
+  // reproduce (in the RestGraphHandler) the behavior of the similar methods
+  // in the RestDocumentHandler. A simpler type, e.g.
+  // ResultT<OperationResult>, would be preferable.
+
+  /// @brief Get a single vertex document from collection, optionally check
+  /// rev The return value is as follows: If trx.begin fails, the outer
+  /// ResultT will contain this error Result. Otherwise, the results of both
+  /// (trx.document(), trx.finish()) are returned as a pair. This is because
+  /// in case of a precondition error during trx.document(), the
+  /// OperationResult may still be needed.
+  futures::Future<OperationResult> getVertex(std::string const& collectionName,
+                                             std::string const& key,
+                                             std::optional<RevisionId> rev);
+
+  /// @brief Get a single edge document from definitionName.
+  /// Similar to getVertex().
+  futures::Future<OperationResult> getEdge(std::string const& definitionName,
+                                           std::string const& key,
+                                           std::optional<RevisionId> rev);
+
+  /// @brief Remove a single edge document from definitionName.
+  futures::Future<OperationResult> removeEdge(std::string const& definitionName,
+                                              std::string const& key,
+                                              std::optional<RevisionId> rev,
+                                              bool waitForSync, bool returnOld);
+
+  /// @brief Remove a vertex and all incident edges in the graph
+  futures::Future<OperationResult> removeVertex(
+      std::string const& collectionName, std::string const& key,
+      std::optional<RevisionId> rev, bool waitForSync, bool returnOld);
+
+  /// @brief Remove an edge or vertex and all incident edges in the graph
+  futures::Future<OperationResult> removeEdgeOrVertex(
+      std::string const& collectionName, std::string const& key,
+      std::optional<RevisionId> rev, bool waitForSync, bool returnOld);
+
+  futures::Future<OperationResult> updateEdge(std::string const& definitionName,
+                                              std::string const& key,
+                                              VPackSlice document,
+                                              std::optional<RevisionId> rev,
+                                              bool waitForSync, bool returnOld,
+                                              bool returnNew, bool keepNull);
+
+  futures::Future<OperationResult> replaceEdge(
+      std::string const& definitionName, std::string const& key,
+      VPackSlice document, std::optional<RevisionId> rev, bool waitForSync,
+      bool returnOld, bool returnNew, bool keepNull);
+
+  futures::Future<OperationResult> createEdge(std::string const& definitionName,
+                                              VPackSlice document,
+                                              bool waitForSync, bool returnNew);
+
+  // @brief This function is a helper function which is setting up a
+  // transaction and calls validateEdgeVertices and validateEdgeContent
+  // methods.
+  futures::Future<
+      std::pair<OperationResult, std::unique_ptr<transaction::Methods>>>
+  validateEdge(std::string const& definitionName, const VPackSlice& document,
+               bool waitForSync, bool isUpdate);
+
+  // @brief This function is checking whether the given _from and _to vertex
+  // documents are available or not
+  OperationResult validateEdgeVertices(std::string const& fromCollectionName,
+                                       std::string const& fromCollectionKey,
+                                       std::string const& toCollectionName,
+                                       std::string const& toCollectionKey,
+                                       transaction::Methods& trx);
+
+  // @brief This function is checking whether the given document defines _from
+  // and _to attributes or not and checks if they are correct or invalid if
+  // they are available.
+  std::pair<OperationResult, bool> validateEdgeContent(
+      const VPackSlice& document, std::string& fromCollectionName,
+      std::string& fromCollectionKey, std::string& toCollectionName,
+      std::string& toCollectionKey, bool isUpdate);
+
+  futures::Future<OperationResult> updateVertex(
+      std::string const& collectionName, std::string const& key,
+      VPackSlice document, std::optional<RevisionId> rev, bool waitForSync,
+      bool returnOld, bool returnNew, bool keepNull);
+
+  futures::Future<OperationResult> replaceVertex(
+      std::string const& collectionName, std::string const& key,
+      VPackSlice document, std::optional<RevisionId> rev, bool waitForSync,
+      bool returnOld, bool returnNew, bool keepNull);
+
+  futures::Future<OperationResult> createVertex(
+      std::string const& collectionName, VPackSlice document, bool waitForSync,
+      bool returnNew);
+
+  ////////////////////////////////////////////////////////////////////////////////
+  /// @brief add an orphan to collection to an existing graph
+  ////////////////////////////////////////////////////////////////////////////////
+  futures::Future<OperationResult> addOrphanCollection(VPackSlice document,
+                                                       bool waitForSync,
+                                                       bool createCollection);
+
+  ////////////////////////////////////////////////////////////////////////////////
+  /// @brief remove an orphan collection from an existing graph
+  ////////////////////////////////////////////////////////////////////////////////
+  futures::Future<OperationResult> eraseOrphanCollection(
+      bool waitForSync, std::string const& collectionName, bool dropCollection);
+
+  ////////////////////////////////////////////////////////////////////////////////
+  /// @brief create a new edge definition in an existing graph
+  ////////////////////////////////////////////////////////////////////////////////
+  futures::Future<OperationResult> addEdgeDefinition(VPackSlice edgeDefinition,
+                                                     VPackSlice options,
+                                                     bool waitForSync);
+
+  ////////////////////////////////////////////////////////////////////////////////
+  /// @brief remove an edge definition from an existing graph
+  ////////////////////////////////////////////////////////////////////////////////
+  futures::Future<OperationResult> eraseEdgeDefinition(
+      bool waitForSync, std::string const& edgeDefinitionName,
+      bool dropCollection);
+
+  ////////////////////////////////////////////////////////////////////////////////
+  /// @brief create edge definition in an existing graph
+  ////////////////////////////////////////////////////////////////////////////////
+  futures::Future<OperationResult> editEdgeDefinition(
+      VPackSlice edgeDefinitionSlice, VPackSlice options, bool waitForSync,
+      std::string const& edgeDefinitionName);
+
+  ////////////////////////////////////////////////////////////////////////////////
+  /// @brief change the edge definition for a specified graph
+  /// if the graph doesn't already contain a definition for the same edge
+  /// collection, this does nothing and returns success.
+  ////////////////////////////////////////////////////////////////////////////////
+  futures::Future<OperationResult> changeEdgeDefinitionForGraph(
+      Graph& graph, EdgeDefinition const& edgeDefinition, bool waitForSync,
+      transaction::Methods& trx);
+
+  void checkForUsedEdgeCollections(
+      const Graph& graph, std::string const& collectionName,
+      std::unordered_set<std::string>& possibleEdgeCollections);
+
+ private:
+  using VPackBufferPtr = std::shared_ptr<velocypack::Buffer<uint8_t>>;
+
+  futures::Future<OperationResult> getDocument(
+      std::string const& collectionName, std::string const& key,
+      std::optional<RevisionId> rev);
+
+  /// @brief creates a vpack { _key: key } or { _key: key, _rev: rev }
+  /// (depending on whether rev is set)
+  VPackBufferPtr _getSearchSlice(std::string const& key,
+                                 std::optional<RevisionId>& rev) const;
+
+  futures::Future<OperationResult> modifyDocument(
+      std::string const& collectionName, std::string const& key,
+      VPackSlice document, bool isPatch, std::optional<RevisionId> rev,
+      bool waitForSync, bool returnOld, bool returnNew, bool keepNull,
+      transaction::Methods& trx);
+
+  futures::Future<OperationResult> createDocument(
+      transaction::Methods* trx, std::string const& collectionName,
+      VPackSlice document, bool waitForSync, bool returnNew);
+
+  Result checkEdgeCollectionAvailability(std::string const& edgeCollectionName);
+
+  /// @brief Validates the given vertex collection name and checks if it is
+  /// available or not. The enum VertexValidationOrigin is used to
+  /// differentiate between the origin of the vertex collection name.
+  /// If it set to either FROM_ATTRIBUTE or TO_ATTRIBUTE, the vertex collection
+  /// name is coming from an edge.
+  Result checkVertexCollectionAvailability(
+      std::string const& vertexCollectionName,
+      VertexValidationOrigin origin = VertexValidationOrigin::DEFAULT);
+
+  bool hasROPermissionsFor(std::string const& collection) const;
+  bool hasRWPermissionsFor(std::string const& collection) const;
+  bool hasPermissionsFor(std::string const& collection,
+                         auth::Level level) const;
+
+  Result checkEdgeDefinitionPermissions(
+      EdgeDefinition const& edgeDefinition) const;
+
+  bool collectionExists(std::string const& collection) const;
+
+#ifdef USE_ENTERPRISE
+  bool isUsedAsInitialCollection(std::string const& collectionName);
+#endif
+};
+}  // namespace graph
+}  // namespace arangodb

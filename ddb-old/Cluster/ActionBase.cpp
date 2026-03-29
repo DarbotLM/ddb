@@ -1,0 +1,255 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Kaveh Vahedipour
+/// @author Matthew Von-Maszewski
+////////////////////////////////////////////////////////////////////////////////
+
+#include "Cluster/ActionBase.h"
+
+#include "ApplicationFeatures/ApplicationServer.h"
+#include "Basics/TimeString.h"
+#include "Cluster/ClusterFeature.h"
+#include "Cluster/MaintenanceFeature.h"
+#include "Logger/LogMacros.h"
+#include "Logger/Logger.h"
+#include "Logger/LoggerStream.h"
+
+using namespace arangodb;
+using namespace arangodb::application_features;
+using namespace arangodb::maintenance;
+
+std::string const ActionBase::FAST_TRACK = "fastTrack";
+
+inline static std::chrono::system_clock::duration secs_since_epoch() {
+  return std::chrono::system_clock::now().time_since_epoch();
+}
+
+ActionBase::ActionBase(MaintenanceFeature& feature,
+                       ActionDescription const& desc)
+    : _feature(feature),
+      _description(desc),
+      _state(READY),
+      _progress(0.),
+      _priority(desc.priority()) {
+  init();
+}
+
+ActionBase::ActionBase(MaintenanceFeature& feature, ActionDescription&& desc)
+    : _feature(feature),
+      _description(std::move(desc)),
+      _state(READY),
+      _progress(0.),
+      _priority(desc.priority()) {
+  init();
+}
+
+void ActionBase::init() {
+  _hash = _description.hash();
+  _clientId = std::to_string(_hash);
+  _id = _feature.nextActionId();
+
+  // initialization of duration struct is not guaranteed in atomic form
+  _actionCreated = secs_since_epoch();
+  _actionStarted = std::chrono::system_clock::duration::zero();
+  _actionLastStat = std::chrono::system_clock::duration::zero();
+  _actionDone = std::chrono::system_clock::duration::zero();
+}
+
+ActionBase::~ActionBase() = default;
+
+void ActionBase::notify() {
+  LOG_TOPIC("df020", DEBUG, Logger::MAINTENANCE)
+      << "Job " << _description << " notifing maintenance";
+  auto& server = _feature.server();
+  if (server.hasFeature<ClusterFeature>()) {
+    server.getFeature<ClusterFeature>().notify();
+  }
+}
+
+bool ActionBase::matches(std::unordered_set<std::string> const& labels) const {
+  for (auto const& label : labels) {
+    if (_labels.find(label) == _labels.end()) {
+      LOG_TOPIC("e29f1", TRACE, Logger::MAINTENANCE)
+          << "Must not run in worker with " << label << ": " << *this;
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ActionBase::fastTrack() const noexcept {
+  return _labels.contains(FAST_TRACK);
+}
+
+/// @brief execution finished successfully or failed ... and race timer expired
+bool ActionBase::done() const {
+  return (COMPLETE == _state || FAILED == _state) &&
+         _actionDone.load() +
+                 std::chrono::seconds(_feature.getSecondsActionsBlock()) <=
+             secs_since_epoch();
+
+}  // ActionBase::done
+
+ActionDescription const& ActionBase::describe() const { return _description; }
+
+MaintenanceFeature& ActionBase::feature() const { return _feature; }
+
+VPackSlice const ActionBase::properties() const {
+  TRI_ASSERT(_description.properties() != nullptr);
+  return _description.properties()->slice();
+}
+
+void ActionBase::startStats() {
+  _actionStarted = secs_since_epoch();
+
+}  // ActionBase::startStats
+
+/// @brief show progress on Action, and when that progress occurred
+void ActionBase::incStats() {
+  _progress.fetch_add(1.);
+  _actionLastStat = secs_since_epoch();
+}  // ActionBase::incStats
+
+void ActionBase::endStats() {
+  _actionDone = secs_since_epoch();
+
+}  // ActionBase::endStats
+
+ShardDefinition::ShardDefinition(std::string const& database,
+                                 std::string const& shard)
+    : _database(database), _shard(shard) {
+  TRI_ASSERT(!database.empty());
+  TRI_ASSERT(!shard.empty());
+}
+
+Result arangodb::actionError(ErrorCode errorCode,
+                             std::string const& errorMessage) {
+  LOG_TOPIC("c889d", ERR, Logger::MAINTENANCE) << errorMessage;
+  return Result(errorCode, errorMessage);
+}
+
+Result arangodb::actionWarn(ErrorCode errorCode,
+                            std::string const& errorMessage) {
+  LOG_TOPIC("abe54", WARN, Logger::MAINTENANCE) << errorMessage;
+  return Result(errorCode, errorMessage);
+}
+
+void ActionBase::toVelocyPack(VPackBuilder& builder) const {
+  VPackObjectBuilder ob(&builder);
+
+  builder.add("id", VPackValue(_id));
+  builder.add("state", VPackValue(_state));
+  builder.add("progress", VPackValue(_progress));
+
+  builder.add(
+      "created",
+      VPackValue(timepointToString(
+          std::chrono::duration_cast<std::chrono::system_clock::duration>(
+              _actionCreated.load()))));
+  builder.add(
+      "started",
+      VPackValue(timepointToString(
+          std::chrono::duration_cast<std::chrono::system_clock::duration>(
+              _actionStarted.load()))));
+  builder.add(
+      "lastStat",
+      VPackValue(timepointToString(
+          std::chrono::duration_cast<std::chrono::system_clock::duration>(
+              _actionLastStat.load()))));
+  builder.add(
+      "done",
+      VPackValue(timepointToString(
+          std::chrono::duration_cast<std::chrono::system_clock::duration>(
+              _actionDone.load()))));
+  {
+    std::lock_guard<std::mutex> lock(resLock);
+    builder.add("result", VPackValue(_result.errorNumber()));
+  }
+  builder.add(VPackValue("description"));
+  {
+    VPackObjectBuilder desc(&builder);
+    _description.toVelocyPack(builder);
+  }
+
+}  // MaintanceAction::toVelocityPack
+
+VPackBuilder ActionBase::toVelocyPack() const {
+  VPackBuilder builder;
+  toVelocyPack(builder);
+  return builder;
+}
+
+ActionState ActionBase::getState() const { return _state; }
+
+void ActionBase::setState(ActionState state) {
+  // We want to make sure that we get another maintenance run
+  // when we shift from any state to complete or failed
+  if ((COMPLETE == state || FAILED == state) && _state != state &&
+      _description.has(DATABASE)) {
+    _feature.addDirty(_description.get(DATABASE));
+    TRI_ASSERT(!_description.get(DATABASE).empty());
+  }
+  _state = state;
+}
+
+Result ActionBase::result() const {
+  Result result;
+  {
+    const std::lock_guard<std::mutex> lock(resLock);
+    result.reset(_result);
+  }
+  return result;
+}
+
+void ActionBase::result(Result const& result) {
+  const std::lock_guard<std::mutex> lock(resLock);
+  _result.reset(result);
+}
+
+void ActionBase::result(ErrorCode errorNumber, std::string const& errorString) {
+  const std::lock_guard<std::mutex> lock(resLock);
+  _result.reset(errorNumber, errorString);
+}
+
+arangodb::Result ActionBase::setProgress(double d) {
+  _progress.store(d, std::memory_order_relaxed);
+  return {};
+}
+
+/**
+ * progress() operation is an expected future feature.  Not supported in the
+ *  original ActionBase derivatives
+ */
+arangodb::Result ActionBase::progress(double& progress) {
+  progress = _progress.load();
+  return {};
+}
+
+auto ActionBase::get(std::string const& key) const -> std::string const& {
+  return _description.get(key);
+}
+
+namespace std {
+ostream& operator<<(ostream& out, arangodb::maintenance::ActionBase const& d) {
+  out << d.toVelocyPack().toJson();
+  return out;
+}
+}  // namespace std

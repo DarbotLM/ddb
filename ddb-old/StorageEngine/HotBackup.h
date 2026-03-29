@@ -1,0 +1,84 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Kaveh Vahedipour
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include "Basics/Result.h"
+#include "Rest/CommonDefines.h"
+#include "RestServer/arangod.h"
+
+#include <velocypack/Builder.h>
+#include <velocypack/Slice.h>
+
+namespace arangodb {
+namespace application_features {
+class ApplicationServer;
+}
+class ClusterFeature;
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief HotBackup engine selector operations
+////////////////////////////////////////////////////////////////////////////////
+
+enum BACKUP_ENGINE { ROCKSDB, CLUSTER };
+
+class HotBackup {
+ public:
+  explicit HotBackup(ArangodServer& server);
+  virtual ~HotBackup() = default;
+
+  /**
+   * @brief execute storage engine's command with payload and report back
+   * @param  command  backup command [create, delete, list, upload, download]
+   * @param  payload  JSON payload
+   * @param  report   operation's report
+   * @return
+   */
+  arangodb::Result execute(std::string const& command, VPackSlice const payload,
+                           VPackBuilder& report);
+
+ private:
+  /**
+   * @brief select engine and lock transactions
+   * @param  body  rest handling body
+   */
+  arangodb::Result executeDBServer(std::string const& command,
+                                   VPackSlice const payload,
+                                   VPackBuilder& report);
+
+  /**
+   * @brief select engine and create backup
+   * @param  payload  rest handling payload
+   */
+  arangodb::Result executeCoordinator(std::string const& command,
+                                      VPackSlice const payload,
+                                      VPackBuilder& report);
+
+#ifdef USE_ENTERPRISE
+  ArangodServer& _server;
+#endif
+  BACKUP_ENGINE _engine;
+
+};  // class HotBackup
+
+}  // namespace arangodb

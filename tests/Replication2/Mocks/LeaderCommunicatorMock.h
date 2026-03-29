@@ -1,0 +1,42 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Tobias Gödderz
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <gmock/gmock.h>
+
+#include "Replication2/ReplicatedLog/ILogInterfaces.h"
+
+using namespace darbotdb;
+using namespace darbotdb::replication2;
+using namespace darbotdb::replication2::replicated_log;
+
+namespace darbotdb::replication2::tests {
+
+struct LeaderCommunicatorMock : ILeaderCommunicator {
+  MOCK_METHOD(ParticipantId const&, getParticipantId, (),
+              (const, noexcept, override));
+  MOCK_METHOD(futures::Future<Result>, reportSnapshotAvailable, (MessageId mid),
+              (noexcept, override));
+};
+}  // namespace darbotdb::replication2::tests

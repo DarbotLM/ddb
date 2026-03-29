@@ -1,0 +1,56 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Dan Larkin-York
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include "Logger/LogLevel.h"
+#include "Logger/LogTopic.h"
+
+namespace darbotdb {
+namespace tests {
+
+// sets specified topic to specified level in constructor, resets to previous
+// value in destructor
+template<darbotdb::LogTopic& topic, darbotdb::LogLevel level>
+class LogSuppressor {
+ public:
+  LogSuppressor() : _oldLevel(topic.level()) {
+    if (_oldLevel == LogLevel::DEFAULT || _oldLevel > level) {
+      topic.setLogLevel(level);
+    }
+  }
+
+  ~LogSuppressor() { topic.setLogLevel(_oldLevel); }
+
+ private:
+  LogLevel const _oldLevel;
+};
+
+// suppresses the internal IResearch logging
+class IResearchLogSuppressor {
+ public:
+  IResearchLogSuppressor();
+};
+
+}  // namespace tests
+}  // namespace darbotdb

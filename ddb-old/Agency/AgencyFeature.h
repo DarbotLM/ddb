@@ -1,0 +1,78 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Kaveh Vahedipour
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include "RestServer/arangod.h"
+
+namespace arangodb {
+namespace consensus {
+class Agent;
+}
+
+class AgencyFeature : public ArangodFeature {
+ public:
+  static constexpr std::string_view name() { return "Agency"; }
+
+  explicit AgencyFeature(Server& server);
+  ~AgencyFeature();
+
+  void collectOptions(std::shared_ptr<options::ProgramOptions>) override final;
+  void validateOptions(std::shared_ptr<options::ProgramOptions>) override final;
+  void prepare() override final;
+  void start() override final;
+  void beginShutdown() override final;
+  void stop() override final;
+  void unprepare() override final;
+
+  bool activated() const noexcept { return _activated; }
+
+  consensus::Agent* agent() const;
+
+ private:
+  bool _activated;
+  uint64_t _size;              // agency size (default: 5)
+  uint64_t _poolSize;          // deprecated, do not use!
+  double _minElectionTimeout;  // min election timeout
+  double _maxElectionTimeout;  // max election timeout
+  bool _supervision;
+  bool _supervisionTouched;
+  bool _waitForSync;
+  double _supervisionFrequency;
+  uint64_t _compactionStepSize;
+  uint64_t _compactionKeepSize;
+  uint64_t _maxAppendSize;
+  double _supervisionGracePeriod;
+  double _supervisionOkThreshold;
+  double _supervisionExpiredServersGracePeriod;
+  uint64_t _supervisionDelayAddFollower;
+  uint64_t _supervisionDelayFailedFollower;
+  bool _failedLeaderAddsFollower;
+  std::string _agencyMyAddress;
+  std::vector<std::string> _agencyEndpoints;
+  std::string _recoveryId;
+
+  std::unique_ptr<consensus::Agent> _agent;
+};
+
+}  // namespace arangodb

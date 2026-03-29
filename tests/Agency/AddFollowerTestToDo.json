@@ -1,0 +1,12 @@
+R"=(
+{
+  "creator" : "supervision",
+  "type" : "addFollower",
+  "database" : "database",
+  "collection" : "collection",
+  "shard" : "s99",
+  "jobId" : "1" ,
+  "timeCreated" : "2017-01-01T00:00:00Z",
+  "notBefore" : "2017-01-01T00:00:00Z"
+}
+)="

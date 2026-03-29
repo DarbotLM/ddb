@@ -1,0 +1,900 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Andrey Abramov
+/// @author Vasiliy Nabatchikov
+////////////////////////////////////////////////////////////////////////////////
+
+#include "gtest/gtest.h"
+
+#include "Aql/QueryRegistry.h"
+#include "Basics/files.h"
+#include "common.h"
+#include "shared.hpp"
+
+#include "Auth/UserManager.h"
+#include "GeneralServer/AuthenticationFeature.h"
+#include "IResearch/IResearchAnalyzerFeature.h"
+#include "IResearch/IResearchCommon.h"
+#include "IResearch/IResearchFeature.h"
+#include "IResearch/IResearchLinkCoordinator.h"
+#include "IResearch/IResearchLinkHelper.h"
+#include "Mocks/StorageEngineMock.h"
+#include "Mocks/Servers.h"
+#include "RestServer/DatabaseFeature.h"
+#include "RestServer/ViewTypesFeature.h"
+#include "StorageEngine/EngineSelectorFeature.h"
+#include "Utils/ExecContext.h"
+#include "VocBase/LogicalCollection.h"
+#include "VocBase/Methods/Collections.h"
+#include "VocBase/Methods/Databases.h"
+#include "utils/misc.hpp"
+#include "velocypack/Parser.h"
+
+// -----------------------------------------------------------------------------
+// --SECTION--                                                 setup / tear-down
+// -----------------------------------------------------------------------------
+
+class IResearchLinkHelperTestSingle : public ::testing::Test {
+ protected:
+  darbotdb::tests::mocks::MockAqlServer server;
+
+  IResearchLinkHelperTestSingle() {
+    auto& dbFeature = server.getFeature<darbotdb::DatabaseFeature>();
+    darbotdb::OperationOptions options(darbotdb::ExecContext::current());
+    {
+      auto vocbase =
+          dbFeature.useDatabase(darbotdb::StaticStrings::SystemDatabase);
+      std::shared_ptr<darbotdb::LogicalCollection> unused;
+      darbotdb::methods::Collections::createSystem(
+          *vocbase, options, darbotdb::tests::AnalyzerCollectionName, false,
+          unused);
+    }
+    {
+      TRI_vocbase_t* vocbase;
+      dbFeature.createDatabase(
+          testDBInfo(server.server(), "testVocbaseWithAnalyzer", 1), vocbase);
+      std::shared_ptr<darbotdb::LogicalCollection> unused;
+      darbotdb::methods::Collections::createSystem(
+          *vocbase, options, darbotdb::tests::AnalyzerCollectionName, false,
+          unused);
+    }
+    {
+      TRI_vocbase_t* vocbase;
+      dbFeature.createDatabase(
+          testDBInfo(server.server(), "testVocbaseWithView", 2), vocbase);
+      std::shared_ptr<darbotdb::LogicalCollection> unused;
+      darbotdb::methods::Collections::createSystem(
+          *vocbase, options, darbotdb::tests::AnalyzerCollectionName, false,
+          unused);
+      auto collectionJson = darbotdb::velocypack::Parser::fromJson(
+          "{ \"id\":102, \"name\": \"foo\" }");
+      EXPECT_NE(nullptr, vocbase->createCollection(collectionJson->slice()));
+    }
+  }
+
+  ~IResearchLinkHelperTestSingle() = default;
+};
+
+// -----------------------------------------------------------------------------
+// --SECTION--                                                        test suite
+// -----------------------------------------------------------------------------
+
+TEST_F(IResearchLinkHelperTestSingle, test_equals) {
+  // test slice not both object
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson("123");
+    auto rhs = darbotdb::velocypack::Parser::fromJson("{}");
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), lhs->slice(), rhs->slice(),
+                              std::string_view{})));
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), rhs->slice(), lhs->slice(),
+                              std::string_view{})));
+  }
+
+  // test view id same type (validate only meta)
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": 123 }");
+    auto rhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": 123 }");
+    EXPECT_TRUE((true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                             server.server(), lhs->slice(), rhs->slice(),
+                             std::string_view{})));
+    EXPECT_TRUE((true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                             server.server(), rhs->slice(), lhs->slice(),
+                             std::string_view{})));
+  }
+
+  // test view id not same type (at least one non-string)
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": 123 }");
+    auto rhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": \"abc\" }");
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), lhs->slice(), rhs->slice(),
+                              std::string_view{})));
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), rhs->slice(), lhs->slice(),
+                              std::string_view{})));
+  }
+
+  // test view id prefix (up to /) not equal (at least one empty)
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": \"\" }");
+    auto rhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": \"abc\" }");
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), lhs->slice(), rhs->slice(),
+                              std::string_view{})));
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), rhs->slice(), lhs->slice(),
+                              std::string_view{})));
+  }
+
+  // test view id prefix (up to /) not equal (shorter does not end with '/')
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": \"a\" }");
+    auto rhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": \"abc\" }");
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), lhs->slice(), rhs->slice(),
+                              std::string_view{})));
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), rhs->slice(), lhs->slice(),
+                              std::string_view{})));
+  }
+
+  // test view id prefix (up to /) not equal (shorter ends with '/' but not a
+  // prefix of longer)
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": \"a/\" }");
+    auto rhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": \"ab/c\" }");
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), lhs->slice(), rhs->slice(),
+                              std::string_view{})));
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), rhs->slice(), lhs->slice(),
+                              std::string_view{})));
+  }
+
+  // test view id prefix (up to /) equal
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": \"a/\" }");
+    auto rhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": \"a/bc\" }");
+    EXPECT_TRUE((true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                             server.server(), lhs->slice(), rhs->slice(),
+                             std::string_view{})));
+    EXPECT_TRUE((true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                             server.server(), rhs->slice(), lhs->slice(),
+                             std::string_view{})));
+  }
+
+  // test meta init fail
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson("{ \"view\": \"a/\" }");
+    auto rhs = darbotdb::velocypack::Parser::fromJson(
+        "{ \"view\": \"a/bc\", \"includeAllFields\": 42 }");
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), lhs->slice(), rhs->slice(),
+                              std::string_view{})));
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), rhs->slice(), lhs->slice(),
+                              std::string_view{})));
+  }
+
+  // test meta not equal
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson(
+        "{ \"view\": \"a/\", \"includeAllFields\": false }");
+    auto rhs = darbotdb::velocypack::Parser::fromJson(
+        "{ \"view\": \"a/bc\", \"includeAllFields\": true }");
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), lhs->slice(), rhs->slice(),
+                              std::string_view{})));
+    EXPECT_TRUE((false == darbotdb::iresearch::IResearchLinkHelper::equal(
+                              server.server(), rhs->slice(), lhs->slice(),
+                              std::string_view{})));
+  }
+
+  // test equal
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson(
+        "{ \"view\": \"a/\", \"includeAllFields\": false }");
+    auto rhs = darbotdb::velocypack::Parser::fromJson(
+        "{ \"view\": \"a/bc\", \"includeAllFields\": false }");
+    EXPECT_TRUE((true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                             server.server(), lhs->slice(), rhs->slice(),
+                             std::string_view{})));
+    EXPECT_TRUE((true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                             server.server(), rhs->slice(), lhs->slice(),
+                             std::string_view{})));
+  }
+
+  // test analyzers with definitions
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson(
+        "{ \"view\": \"a/\", \"includeAllFields\": false, "
+        "\"analyzers\":[\"testAnalyzer\", \"mydb::testAnalyzer2\"],"
+        "  \"analyzerDefinitions\":[ "
+        "    {\"name\":\"testAnalyzer\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":2, \"max\":2, \"preserveOriginal\": false}}, "
+        "    {\"name\":\"testAnalyzer2\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":3, \"max\":3, \"preserveOriginal\": false}} "
+        "  ]}");
+    auto rhs = darbotdb::velocypack::Parser::fromJson(
+        "{ \"view\": \"a/bc\", \"includeAllFields\": false, "
+        "\"analyzers\":[\"mydb::testAnalyzer\", \"testAnalyzer2\"], "
+        "  \"analyzerDefinitions\":[ "
+        "    {\"name\":\"testAnalyzer\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":2, \"max\":2, \"preserveOriginal\": false}}, "
+        "    {\"name\":\"testAnalyzer2\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":3, \"max\":3, \"preserveOriginal\": false}} "
+        "  ]}");
+    EXPECT_TRUE(
+        (true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                     server.server(), lhs->slice(), rhs->slice(), "mydb")));
+    EXPECT_TRUE(
+        (true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                     server.server(), rhs->slice(), lhs->slice(), "mydb")));
+  }
+
+  // test analyzers with definitions different order
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson(
+        "{ \"view\": \"a/\", \"includeAllFields\": false, "
+        "\"analyzers\":[\"testAnalyzer\", \"mydb::testAnalyzer2\"],"
+        "  \"analyzerDefinitions\":[ "
+        "    {\"name\":\"testAnalyzer\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":2, \"max\":2, \"preserveOriginal\": false}}, "
+        "    {\"name\":\"testAnalyzer2\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":3, \"max\":3, \"preserveOriginal\": false}} "
+        "  ]}");
+    auto rhs = darbotdb::velocypack::Parser::fromJson(
+        "{ \"view\": \"a/bc\", \"includeAllFields\": false, "
+        "\"analyzers\":[\"testAnalyzer2\", \"testAnalyzer\"], "
+        "  \"analyzerDefinitions\":[ "
+        "    {\"name\":\"testAnalyzer\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":2, \"max\":2, \"preserveOriginal\": false}}, "
+        "    {\"name\":\"testAnalyzer2\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":3, \"max\":3, \"preserveOriginal\": false}} "
+        "  ]}");
+    EXPECT_TRUE(
+        (true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                     server.server(), lhs->slice(), rhs->slice(), "mydb")));
+    EXPECT_TRUE(
+        (true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                     server.server(), rhs->slice(), lhs->slice(), "mydb")));
+  }
+
+  // test analyzers with different names
+  {
+    auto lhs = darbotdb::velocypack::Parser::fromJson(
+        "{ \"view\": \"a/\", \"includeAllFields\": false, "
+        "\"analyzers\":[\"testAnalyzer\", \"testAnalyzer2\"],"
+        "  \"analyzerDefinitions\":[ "
+        "    {\"name\":\"testAnalyzer\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":2, \"max\":2, \"preserveOriginal\": false}}, "
+        "    {\"name\":\"testAnalyzer2\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":3, \"max\":3, \"preserveOriginal\": false}} "
+        "  ]}");
+    auto rhs = darbotdb::velocypack::Parser::fromJson(
+        "{ \"view\": \"a/bc\", \"includeAllFields\": false, "
+        "\"analyzers\":[\"testAnalyzer\", \"testAnalyzer3\"], "
+        "  \"analyzerDefinitions\":[ "
+        "    {\"name\":\"testAnalyzer\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":2, \"max\":2, \"preserveOriginal\": false}}, "
+        "    {\"name\":\"testAnalyzer3\", \"type\":\"ngram\", "
+        "\"properties\":{\"min\":3, \"max\":3, \"preserveOriginal\": false}} "
+        "  ]}");
+    EXPECT_FALSE(
+        (true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                     server.server(), lhs->slice(), rhs->slice(), "mydb")));
+    EXPECT_FALSE(
+        (true == darbotdb::iresearch::IResearchLinkHelper::equal(
+                     server.server(), rhs->slice(), lhs->slice(), "mydb")));
+  }
+}
+
+TEST_F(IResearchLinkHelperTestSingle, test_validate_cross_db_analyzer) {
+  auto& analyzers =
+      server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+  auto& dbFeature = server.getFeature<darbotdb::DatabaseFeature>();
+  {
+    darbotdb::iresearch::IResearchAnalyzerFeature::EmplaceResult emplaceResult;
+    ASSERT_TRUE(analyzers
+                    .emplace(emplaceResult,
+                             "testVocbaseWithAnalyzer::myIdentity", "identity",
+                             VPackParser::fromJson("{ }")->slice(),
+                             darbotdb::transaction::OperationOriginTestCase{})
+                    .ok());
+  }
+
+  // existing analyzer  but wrong database
+  {
+    auto vocbaseLocal = dbFeature.useDatabase("testVocbaseWithView");
+    ASSERT_NE(nullptr, vocbaseLocal);
+    auto json = VPackParser::fromJson(
+        "{ \"foo\": "
+        "         { "
+        "           \"analyzers\": [ \"testVocbaseWithAnalyzer::myIdentity\" ] "
+        "         } "
+        " }");
+    auto validateResult =
+        darbotdb::iresearch::IResearchLinkHelper::validateLinks(*vocbaseLocal,
+                                                                json->slice());
+    EXPECT_FALSE(validateResult.ok());
+    EXPECT_EQ(TRI_ERROR_BAD_PARAMETER, validateResult.errorNumber());
+  }
+}
+
+TEST_F(IResearchLinkHelperTestSingle, test_normalize) {
+  auto& analyzers =
+      server.getFeature<darbotdb::iresearch::IResearchAnalyzerFeature>();
+  TRI_vocbase_t& sysVocbase = server.getSystemDatabase();
+
+  // analyzer single-server, for creation
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        "{ \
+      \"analyzerDefinitions\": [ { \"name\": \"testAnalyzer0\", \"type\": \"identity\" } ], \
+      \"analyzers\": [\"testAnalyzer0\" ], \
+      \"storedValues\":[[], [\"\"], [\"test.t\"], [\"a.a\", \"b.b\"]] \
+    }");
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    EXPECT_TRUE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                    builder, json->slice(), true, sysVocbase,
+                    darbotdb::iresearch::LinkVersion::MIN)
+                    .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer0",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+
+    auto expected_json = darbotdb::velocypack::Parser::fromJson(
+        R"({
+        "type":"arangosearch",
+        "version":0,
+        "primarySort":[],
+        "primarySortCompression":"lz4",
+        "fields":{},
+        "includeAllFields": false,
+        "trackListPositions": false,
+        "storeValues": "none",
+        "analyzerDefinitions": [
+          { "name": "testAnalyzer0", "type": "identity", "properties":{}, "features":[]}
+        ],
+        "analyzers": ["testAnalyzer0" ],
+        "storedValues":[{"fields":["test.t"], "compression":"lz4"}, {"fields":["a.a", "b.b"], "compression":"lz4"}])"
+#ifdef USE_ENTERPRISE
+        ",\"optimizeTopK\": []"
+#endif
+        "}");
+    EXPECT_EQUAL_SLICES(expected_json->slice(), builder.slice());
+  }
+
+  // analyzer single-server, user definition
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        "{ \
+      \"analyzerDefinitions\": [ { \"name\": \"testAnalyzer0\", \"type\": \"identity\" } ], \
+      \"analyzers\": [\"testAnalyzer0\" ] \
+    }");
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    EXPECT_TRUE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                    builder, json->slice(), false, sysVocbase,
+                    darbotdb::iresearch::LinkVersion::MIN)
+                    .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer0",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+
+    auto expected_json = darbotdb::velocypack::Parser::fromJson(
+        "{ \
+      \"type\":\"arangosearch\", \
+      \"fields\":{}, \
+      \"includeAllFields\": false, \
+      \"trackListPositions\": false, \
+      \"storeValues\": \"none\", \
+      \"analyzers\": [\"testAnalyzer0\" ] \
+    }");
+    EXPECT_EQUAL_SLICES(expected_json->slice(), builder.slice());
+  }
+
+  // analyzer single-server, not for creation, missing "testAanalyzer0"
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        "{ \
+      \"analyzers\": [\"testAnalyzer0\" ] \
+    }");
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    EXPECT_FALSE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                     builder, json->slice(), false, sysVocbase,
+                     darbotdb::iresearch::LinkVersion::MIN)
+                     .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer0",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+  }
+
+  // analyzer single-server, for creation, missing "testAanalyzer0"
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        "{ \
+      \"analyzers\": [\"testAnalyzer0\" ] \
+    }");
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    EXPECT_FALSE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                     builder, json->slice(), false, sysVocbase,
+                     darbotdb::iresearch::LinkVersion::MIN)
+                     .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer0",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+  }
+
+  // analyzer single-server (inRecovery), for creation
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        "{ \
+      \"analyzerDefinitions\": [ { \"name\": \"testAnalyzer1\", \"type\": \"identity\" } ], \
+      \"analyzers\": [\"testAnalyzer1\" ], \
+      \"storedValues\":[[], [\"\"], [\"test.t\"], [\"a.a\", \"b.b\"]] \
+    }");
+    auto before = StorageEngineMock::recoveryStateResult;
+    StorageEngineMock::recoveryStateResult =
+        darbotdb::RecoveryState::IN_PROGRESS;
+    irs::Finally restore = [&before]() noexcept {
+      StorageEngineMock::recoveryStateResult = before;
+    };
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    EXPECT_TRUE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                    builder, json->slice(), true, sysVocbase,
+                    darbotdb::iresearch::LinkVersion::MIN)
+                    .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+
+    auto expected_json = darbotdb::velocypack::Parser::fromJson(
+        R"({
+      "type":"arangosearch",
+      "version":0,
+      "primarySort":[],
+      "primarySortCompression":"lz4",
+      "fields":{},
+      "includeAllFields": false,
+      "trackListPositions": false,
+      "storeValues": "none",
+      "analyzerDefinitions": [
+        { "name": "testAnalyzer1", "type": "identity", "properties":{}, "features":[] }
+      ],
+      "analyzers": ["testAnalyzer1" ],
+      "storedValues":[{"fields":["test.t"], "compression":"lz4"}, {"fields":["a.a", "b.b"], "compression":"lz4"}])"
+#ifdef USE_ENTERPRISE
+        ",\"optimizeTopK\": []"
+#endif
+        "}");
+    EXPECT_EQUAL_SLICES(expected_json->slice(), builder.slice());
+  }
+
+  // analyzer single-server (inRecovery), not for creation
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        "{ \
+      \"analyzerDefinitions\": [ { \"name\": \"testAnalyzer1\", \"type\": \"identity\" } ], \
+      \"analyzers\": [\"testAnalyzer1\" ] \
+    }");
+    auto before = StorageEngineMock::recoveryStateResult;
+    StorageEngineMock::recoveryStateResult =
+        darbotdb::RecoveryState::IN_PROGRESS;
+    irs::Finally restore = [&before]() noexcept {
+      StorageEngineMock::recoveryStateResult = before;
+    };
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    EXPECT_TRUE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                    builder, json->slice(), false, sysVocbase,
+                    darbotdb::iresearch::LinkVersion::MIN)
+                    .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+
+    auto expected_json = darbotdb::velocypack::Parser::fromJson(
+        "{ \
+      \"type\":\"arangosearch\", \
+      \"fields\":{}, \
+      \"includeAllFields\": false, \
+      \"trackListPositions\": false, \
+      \"storeValues\": \"none\", \
+      \"analyzers\": [\"testAnalyzer1\" ] \
+    }");
+    EXPECT_EQUAL_SLICES(expected_json->slice(), builder.slice());
+  }
+  // analyzer single-server (inRecovery), for creation with specified
+  // compression
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        "{ \
+      \"analyzerDefinitions\": [ { \"name\": \"testAnalyzer1\", \"type\": \"identity\" } ], \
+      \"analyzers\": [\"testAnalyzer1\" ], \
+      \"storedValues\":[[], [\"\"], {\"fields\":[\"test.t\"], \"compression\":\"lz4\",\
+      \"some_unknown\":1}, {\"fields\":[\"a.a\", \"b.b\"], \"compression\":\"none\"}] \
+    }");
+    auto before = StorageEngineMock::recoveryStateResult;
+    StorageEngineMock::recoveryStateResult =
+        darbotdb::RecoveryState::IN_PROGRESS;
+    irs::Finally restore = [&before]() noexcept {
+      StorageEngineMock::recoveryStateResult = before;
+    };
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    EXPECT_TRUE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                    builder, json->slice(), true, sysVocbase,
+                    darbotdb::iresearch::LinkVersion::MIN)
+                    .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+
+    auto expected_json =
+        darbotdb::velocypack::Parser::fromJson(R"({
+      "type":"arangosearch",
+      "version":0,
+      "primarySort":[],
+      "primarySortCompression":"lz4",
+      "fields":{},
+      "includeAllFields": false,
+      "trackListPositions": false,
+      "storeValues": "none",
+      "analyzerDefinitions": [
+        { "name": "testAnalyzer1", "type": "identity", "properties":{}, "features":[]}
+      ],
+      "analyzers": ["testAnalyzer1" ],
+      "storedValues":[{"fields":["test.t"], "compression":"lz4"}, {"fields":["a.a", "b.b"], "compression":"none"}])"
+#ifdef USE_ENTERPRISE
+                                               ",\"optimizeTopK\": []"
+#endif
+                                               "}");
+    EXPECT_EQUAL_SLICES(expected_json->slice(), builder.slice());
+  }
+  // with primary sort
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        "{ \
+      \"analyzerDefinitions\": [ { \"name\": \"testAnalyzer1\", \"type\": \"identity\" } ], \
+      \"analyzers\": [\"testAnalyzer1\" ], \
+      \"storedValues\":[[], [\"\"], {\"fields\":[\"test.t\"], \"compression\":\"lz4\",\
+      \"some_unknown\":1}, {\"fields\":[\"a.a\", \"b.b\"], \"compression\":\"none\"}] \
+    }");
+    auto before = StorageEngineMock::recoveryStateResult;
+    StorageEngineMock::recoveryStateResult =
+        darbotdb::RecoveryState::IN_PROGRESS;
+    irs::Finally restore = [&before]() noexcept {
+      StorageEngineMock::recoveryStateResult = before;
+    };
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    darbotdb::iresearch::IResearchViewSort sort;
+    sort.emplace_back(
+        {darbotdb::basics::AttributeName(std::string("abc"), false)}, false);
+    EXPECT_TRUE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                    builder, json->slice(), true, sysVocbase,
+                    darbotdb::iresearch::LinkVersion::MIN, &sort)
+                    .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+
+    auto expected_json = darbotdb::velocypack::Parser::fromJson(
+        R"({
+      "type":"arangosearch",
+      "version":0,
+      "primarySort":[{"field":"abc", "asc": false}],
+      "primarySortCompression":"lz4",
+      "fields":{},
+      "includeAllFields": false,
+      "trackListPositions": false,
+      "storeValues": "none",
+      "analyzerDefinitions": [
+        { "name": "testAnalyzer1", "type": "identity", "properties":{}, "features":[]}
+      ],
+      "analyzers": ["testAnalyzer1" ],
+      "storedValues":[{"fields":["test.t"], "compression":"lz4"}, {"fields":["a.a", "b.b"], "compression":"none"}])"
+#ifdef USE_ENTERPRISE
+        ",\"optimizeTopK\": []"
+#endif
+        "}");
+    EXPECT_EQUAL_SLICES(expected_json->slice(), builder.slice());
+  }
+  // with primary sort and custom primary compression
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        "{ \
+      \"analyzerDefinitions\": [ { \"name\": \"testAnalyzer1\", \"type\": \"identity\" } ], \
+      \"analyzers\": [\"testAnalyzer1\" ], \
+      \"storedValues\":[[], [\"\"], {\"fields\":[\"test.t\"], \"compression\":\"lz4\",\
+      \"some_unknown\":1}, {\"fields\":[\"a.a\", \"b.b\"], \"compression\":\"none\"}] \
+    }");
+    auto before = StorageEngineMock::recoveryStateResult;
+    StorageEngineMock::recoveryStateResult =
+        darbotdb::RecoveryState::IN_PROGRESS;
+    irs::Finally restore = [&before]() noexcept {
+      StorageEngineMock::recoveryStateResult = before;
+    };
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    darbotdb::iresearch::IResearchViewSort sort;
+    sort.emplace_back(
+        {darbotdb::basics::AttributeName(std::string("abc"), false)}, true);
+    auto compression = irs::type<irs::compression::none>::id();
+    EXPECT_TRUE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                    builder, json->slice(), true, sysVocbase,
+                    darbotdb::iresearch::LinkVersion::MIN, &sort, &compression)
+                    .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+
+    auto expected_json = darbotdb::velocypack::Parser::fromJson(
+        R"({
+      "type":"arangosearch",
+      "version":0,
+      "primarySort":[{"field":"abc", "asc": true}],
+      "primarySortCompression":"none",
+      "fields":{},
+      "includeAllFields": false,
+      "trackListPositions": false,
+      "storeValues": "none",
+      "analyzerDefinitions": [
+        { "name": "testAnalyzer1", "type": "identity", "properties":{}, "features":[]}
+      ],
+      "analyzers": ["testAnalyzer1" ],
+      "storedValues":[{"fields":["test.t"], "compression":"lz4"}, {"fields":["a.a", "b.b"], "compression":"none"}])"
+#ifdef USE_ENTERPRISE
+        ",\"optimizeTopK\": []"
+#endif
+        "}");
+    EXPECT_EQUAL_SLICES(expected_json->slice(), builder.slice());
+  }
+
+  // with primary sort and custom primary compression, version
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        R"({
+      "analyzerDefinitions": [ { "name": "testAnalyzer1", "type": "identity" } ],
+      "version": 1,
+      "analyzers": ["testAnalyzer1" ],
+      "storedValues":[[], [""], {"fields":["test.t"], "compression":"lz4",
+      "some_unknown":1}, {"fields":["a.a", "b.b"], "compression":"none"}]
+    })");
+    auto before = StorageEngineMock::recoveryStateResult;
+    StorageEngineMock::recoveryStateResult =
+        darbotdb::RecoveryState::IN_PROGRESS;
+    irs::Finally restore = [&before]() noexcept {
+      StorageEngineMock::recoveryStateResult = before;
+    };
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    darbotdb::iresearch::IResearchViewSort sort;
+    sort.emplace_back(
+        {darbotdb::basics::AttributeName(std::string("abc"), false)}, true);
+    auto compression = irs::type<irs::compression::none>::id();
+    EXPECT_TRUE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                    builder, json->slice(), true, sysVocbase,
+                    darbotdb::iresearch::LinkVersion::MIN, &sort, &compression)
+                    .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+
+    auto expected_json = darbotdb::velocypack::Parser::fromJson(
+        R"({
+      "type":"arangosearch",
+      "version":1,
+      "primarySort":[{"field":"abc", "asc": true}],
+      "primarySortCompression":"none",
+      "fields":{},
+      "includeAllFields": false,
+      "trackListPositions": false,
+      "storeValues": "none",
+      "analyzerDefinitions": [
+        { "name": "testAnalyzer1", "type": "identity", "properties":{}, "features":[]}
+      ],
+      "analyzers": ["testAnalyzer1" ],
+      "storedValues":[{"fields":["test.t"], "compression":"lz4"}, {"fields":["a.a", "b.b"], "compression":"none"}])"
+#ifdef USE_ENTERPRISE
+        ",\"optimizeTopK\": []"
+#endif
+        "}");
+    EXPECT_EQUAL_SLICES(expected_json->slice(), builder.slice());
+  }
+
+  // with primary sort and custom primary compression, default version
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        R"({
+      "analyzerDefinitions": [ { "name": "testAnalyzer1", "type": "identity" } ],
+      "analyzers": ["testAnalyzer1" ],
+      "storedValues":[[], [""], {"fields":["test.t"], "compression":"lz4",
+      "some_unknown":1}, {"fields":["a.a", "b.b"], "compression":"none"}]
+    })");
+    auto before = StorageEngineMock::recoveryStateResult;
+    StorageEngineMock::recoveryStateResult =
+        darbotdb::RecoveryState::IN_PROGRESS;
+    irs::Finally restore = [&before]() noexcept {
+      StorageEngineMock::recoveryStateResult = before;
+    };
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    darbotdb::iresearch::IResearchViewSort sort;
+    sort.emplace_back(
+        {darbotdb::basics::AttributeName(std::string("abc"), false)}, true);
+    auto compression = irs::type<irs::compression::none>::id();
+    EXPECT_TRUE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                    builder, json->slice(), true, sysVocbase,
+                    darbotdb::iresearch::LinkVersion::MAX, &sort, &compression)
+                    .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+
+    auto expected_json = darbotdb::velocypack::Parser::fromJson(
+        R"({
+      "type":"arangosearch",
+      "version":1,
+      "primarySort":[{"field":"abc", "asc": true}],
+      "primarySortCompression":"none",
+      "fields":{},
+      "includeAllFields": false,
+      "trackListPositions": false,
+      "storeValues": "none",
+      "analyzerDefinitions": [
+        { "name": "testAnalyzer1", "type": "identity", "properties":{}, "features":[]}
+      ],
+      "analyzers": ["testAnalyzer1" ],
+      "storedValues":[{"fields":["test.t"], "compression":"lz4"}, {"fields":["a.a", "b.b"], "compression":"none"}])"
+#ifdef USE_ENTERPRISE
+        ",\"optimizeTopK\": []"
+#endif
+        "}");
+    EXPECT_EQUAL_SLICES(expected_json->slice(), builder.slice());
+  }
+
+  // invalid version
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(
+        R"({
+      "analyzerDefinitions": [ { "name": "testAnalyzer1", "type": "identity" } ],
+      "version": 2,
+      "analyzers": ["testAnalyzer1" ],
+      "storedValues":[[], [""], {"fields":["test.t"], "compression":"lz4",
+      "some_unknown":1}, {"fields":["a.a", "b.b"], "compression":"none"}]
+    })");
+    auto before = StorageEngineMock::recoveryStateResult;
+    StorageEngineMock::recoveryStateResult =
+        darbotdb::RecoveryState::IN_PROGRESS;
+    irs::Finally restore = [&before]() noexcept {
+      StorageEngineMock::recoveryStateResult = before;
+    };
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    darbotdb::iresearch::IResearchViewSort sort;
+    sort.emplace_back(
+        {darbotdb::basics::AttributeName(std::string("abc"), false)}, true);
+    auto compression = irs::type<irs::compression::none>::id();
+    EXPECT_FALSE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                     builder, json->slice(), true, sysVocbase,
+                     darbotdb::iresearch::LinkVersion::MIN, &sort, &compression)
+                     .ok());
+  }
+
+  // with primary sort and custom primary compression, inBackground, parallelism
+  {
+    auto json = darbotdb::velocypack::Parser::fromJson(R"(
+    {
+      "analyzerDefinitions": [ { "name": "testAnalyzer1", "type": "identity" } ],
+      "inBackground": true,
+      "parallelism": 4,
+      "analyzers": ["testAnalyzer1" ],
+      "storedValues":[[], [""], {"fields":["test.t"], "compression":"lz4",
+      "some_unknown":1}, {"fields":["a.a", "b.b"], "compression":"none"}]
+    })");
+    auto before = StorageEngineMock::recoveryStateResult;
+    StorageEngineMock::recoveryStateResult =
+        darbotdb::RecoveryState::IN_PROGRESS;
+    irs::Finally restore = [&before]() noexcept {
+      StorageEngineMock::recoveryStateResult = before;
+    };
+    darbotdb::velocypack::Builder builder;
+    builder.openObject();
+    darbotdb::iresearch::IResearchViewSort sort;
+    sort.emplace_back(
+        {darbotdb::basics::AttributeName(std::string("abc"), false)}, true);
+    auto compression = irs::type<irs::compression::none>::id();
+    EXPECT_TRUE(darbotdb::iresearch::IResearchLinkHelper::normalize(
+                    builder, json->slice(), true, sysVocbase,
+                    darbotdb::iresearch::LinkVersion::MIN, &sort, &compression)
+                    .ok());
+    builder.close();
+    EXPECT_EQ(nullptr,
+              analyzers.get(
+                  darbotdb::StaticStrings::SystemDatabase + "::testAnalyzer1",
+                  darbotdb::QueryAnalyzerRevisions::QUERY_LATEST,
+                  darbotdb::transaction::OperationOriginTestCase{}));
+
+    auto expected_json = darbotdb::velocypack::Parser::fromJson(
+        R"({
+      "type":"arangosearch",
+      "inBackground": true,
+      "parallelism": 4,
+      "version":0,
+      "primarySort":[{"field":"abc", "asc": true}],
+      "primarySortCompression":"none",
+      "fields":{},
+      "includeAllFields": false,
+      "trackListPositions": false,
+      "storeValues": "none",
+      "analyzerDefinitions": [
+        { "name": "testAnalyzer1", "type": "identity", "properties":{}, "features":[]}
+      ],
+      "analyzers": ["testAnalyzer1" ],
+      "storedValues":[{"fields":["test.t"], "compression":"lz4"}, {"fields":["a.a", "b.b"], "compression":"none"}])"
+#ifdef USE_ENTERPRISE
+        ",\"optimizeTopK\": []"
+#endif
+        "}");
+    EXPECT_EQUAL_SLICES(expected_json->slice(), builder.slice());
+  }
+}

@@ -1,0 +1,222 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Andrey Abramov
+/// @author Vasiliy Nabatchikov
+////////////////////////////////////////////////////////////////////////////////
+
+#include "gtest/gtest.h"
+
+#include "../IResearch/common.h"
+#include "Mocks/Servers.h"
+
+#include "RestServer/DatabaseFeature.h"
+#include "RestServer/QueryRegistryFeature.h"
+#include "RestServer/ViewTypesFeature.h"
+#include "Sharding/ShardingFeature.h"
+#include "StorageEngine/EngineSelectorFeature.h"
+#include "Utils/CollectionNameResolver.h"
+#include "VocBase/LogicalCollection.h"
+#include "VocBase/LogicalView.h"
+#include "velocypack/Parser.h"
+
+namespace {
+struct TestView : public darbotdb::LogicalView {
+  static constexpr auto typeInfo() noexcept {
+    return std::pair{static_cast<darbotdb::ViewType>(42),
+                     std::string_view{"testViewType"}};
+  }
+
+  TestView(TRI_vocbase_t& vocbase,
+           darbotdb::velocypack::Slice const& definition)
+      : darbotdb::LogicalView(*this, vocbase, definition, false) {}
+  darbotdb::Result appendVPackImpl(darbotdb::velocypack::Builder&,
+                                   Serialization, bool) const override {
+    return {};
+  }
+  virtual darbotdb::Result dropImpl() override {
+    return darbotdb::storage_helper::drop(*this);
+  }
+  virtual void open() override {}
+  virtual darbotdb::Result renameImpl(std::string const& oldName) override {
+    return darbotdb::storage_helper::rename(*this, oldName);
+  }
+  virtual darbotdb::Result properties(darbotdb::velocypack::Slice, bool,
+                                      bool) override {
+    return darbotdb::Result();
+  }
+  virtual bool visitCollections(CollectionVisitor const&) const override {
+    return true;
+  }
+};
+
+struct ViewFactory : public darbotdb::ViewFactory {
+  virtual darbotdb::Result create(darbotdb::LogicalView::ptr& view,
+                                  TRI_vocbase_t& vocbase,
+                                  darbotdb::velocypack::Slice definition,
+                                  bool isUserRequest) const override {
+    view = vocbase.createView(definition, isUserRequest);
+
+    return darbotdb::Result();
+  }
+
+  virtual darbotdb::Result instantiate(darbotdb::LogicalView::ptr& view,
+                                       TRI_vocbase_t& vocbase,
+                                       darbotdb::velocypack::Slice definition,
+                                       bool /*isUserRequest*/) const override {
+    view = std::make_shared<TestView>(vocbase, definition);
+
+    return darbotdb::Result();
+  }
+};
+
+}  // namespace
+
+class CollectionNameResolverTest : public ::testing::Test {
+ protected:
+  darbotdb::tests::mocks::MockAqlServer server;
+  ViewFactory viewFactory;
+
+  CollectionNameResolverTest() {
+    // register view factory
+    server.getFeature<darbotdb::ViewTypesFeature>().emplace(
+        TestView::typeInfo().second, viewFactory);
+  }
+};
+
+TEST_F(CollectionNameResolverTest, test_getDataSource) {
+  auto collectionJson = darbotdb::velocypack::Parser::fromJson(
+      "{ \"globallyUniqueId\": \"testCollectionGUID\", \"id\": 100, \"name\": "
+      "\"testCollection\" }");
+  auto viewJson = darbotdb::velocypack::Parser::fromJson(
+      "{ \"id\": 200, \"name\": \"testView\", \"type\": \"testViewType\" "
+      "}");  // any arbitrary view type
+  Vocbase vocbase(testDBInfo(server.server()));
+  darbotdb::CollectionNameResolver resolver(vocbase);
+
+  // not present collection (no datasource)
+  {
+    EXPECT_FALSE(resolver.getDataSource(darbotdb::DataSourceId{100}));
+    EXPECT_FALSE(resolver.getDataSource("100"));
+    EXPECT_FALSE(resolver.getDataSource("testCollection"));
+    EXPECT_FALSE(resolver.getDataSource("testCollectionGUID"));
+    EXPECT_FALSE(resolver.getCollection(darbotdb::DataSourceId{100}));
+    EXPECT_FALSE(resolver.getCollection("100"));
+    EXPECT_FALSE(resolver.getCollection("testCollection"));
+    EXPECT_FALSE(resolver.getCollection("testCollectionGUID"));
+  }
+
+  // not present view (no datasource)
+  {
+    EXPECT_FALSE(resolver.getDataSource(darbotdb::DataSourceId{200}));
+    EXPECT_FALSE(resolver.getDataSource("200"));
+    EXPECT_FALSE(resolver.getDataSource("testView"));
+    EXPECT_FALSE(resolver.getDataSource("testViewGUID"));
+    EXPECT_FALSE(resolver.getView(darbotdb::DataSourceId{200}));
+    EXPECT_FALSE(resolver.getView("200"));
+    EXPECT_FALSE(resolver.getView("testView"));
+    EXPECT_FALSE(resolver.getView("testViewGUID"));
+  }
+
+  auto collection = vocbase.createCollection(collectionJson->slice());
+  auto view = vocbase.createView(viewJson->slice(), false);
+
+  EXPECT_FALSE(collection->deleted());
+  EXPECT_FALSE(view->deleted());
+
+  // not present collection (is view)
+  {
+    EXPECT_FALSE(!resolver.getDataSource(darbotdb::DataSourceId{200}));
+    EXPECT_FALSE(!resolver.getDataSource("200"));
+    EXPECT_FALSE(!resolver.getDataSource("testView"));
+    EXPECT_FALSE(resolver.getDataSource("testViewGUID"));
+    EXPECT_FALSE(resolver.getCollection(darbotdb::DataSourceId{200}));
+    EXPECT_FALSE(resolver.getCollection("200"));
+    EXPECT_FALSE(resolver.getCollection("testView"));
+    EXPECT_FALSE(resolver.getCollection("testViewGUID"));
+  }
+
+  // not preset view (is collection)
+  {
+    EXPECT_FALSE(!resolver.getDataSource(darbotdb::DataSourceId{100}));
+    EXPECT_FALSE(!resolver.getDataSource("100"));
+    EXPECT_FALSE(!resolver.getDataSource("testCollection"));
+    EXPECT_FALSE(!resolver.getDataSource("testCollectionGUID"));
+    EXPECT_FALSE(resolver.getView(darbotdb::DataSourceId{100}));
+    EXPECT_FALSE(resolver.getView("100"));
+    EXPECT_FALSE(resolver.getView("testCollection"));
+    EXPECT_FALSE(resolver.getView("testCollectionGUID"));
+  }
+
+  // present collection
+  {
+    EXPECT_FALSE(!resolver.getDataSource(darbotdb::DataSourceId{100}));
+    EXPECT_FALSE(!resolver.getDataSource("100"));
+    EXPECT_FALSE(!resolver.getDataSource("testCollection"));
+    EXPECT_FALSE(!resolver.getDataSource("testCollectionGUID"));
+    EXPECT_FALSE(!resolver.getCollection(darbotdb::DataSourceId{100}));
+    EXPECT_FALSE(!resolver.getCollection("100"));
+    EXPECT_FALSE(!resolver.getCollection("testCollection"));
+    EXPECT_FALSE(!resolver.getCollection("testCollectionGUID"));
+  }
+
+  // present view
+  {
+    EXPECT_FALSE(!resolver.getDataSource(darbotdb::DataSourceId{200}));
+    EXPECT_FALSE(!resolver.getDataSource("200"));
+    EXPECT_FALSE(!resolver.getDataSource("testView"));
+    EXPECT_FALSE(resolver.getDataSource("testViewGUID"));
+    EXPECT_FALSE(!resolver.getView(darbotdb::DataSourceId{200}));
+    EXPECT_FALSE(!resolver.getView("200"));
+    EXPECT_FALSE(!resolver.getView("testView"));
+    EXPECT_FALSE(resolver.getView("testViewGUID"));
+  }
+
+  EXPECT_TRUE(vocbase.dropCollection(collection->id(), true).ok());
+  EXPECT_TRUE(view->drop().ok());
+  EXPECT_TRUE(collection->deleted());
+  EXPECT_TRUE(view->deleted());
+
+  // present collection (deleted, cached)
+  {
+    EXPECT_FALSE(!resolver.getDataSource(darbotdb::DataSourceId{100}));
+    EXPECT_FALSE(!resolver.getDataSource("100"));
+    EXPECT_FALSE(!resolver.getDataSource("testCollection"));
+    EXPECT_FALSE(!resolver.getDataSource("testCollectionGUID"));
+    EXPECT_FALSE(!resolver.getCollection(darbotdb::DataSourceId{100}));
+    EXPECT_FALSE(!resolver.getCollection("100"));
+    EXPECT_FALSE(!resolver.getCollection("testCollection"));
+    EXPECT_FALSE(!resolver.getCollection("testCollectionGUID"));
+    EXPECT_TRUE(resolver.getCollection(darbotdb::DataSourceId{100})->deleted());
+  }
+
+  // present view (deleted, cached)
+  {
+    EXPECT_FALSE(!resolver.getDataSource(darbotdb::DataSourceId{200}));
+    EXPECT_FALSE(!resolver.getDataSource("200"));
+    EXPECT_FALSE(!resolver.getDataSource("testView"));
+    EXPECT_FALSE(resolver.getDataSource("testViewGUID"));
+    EXPECT_FALSE(!resolver.getView(darbotdb::DataSourceId{200}));
+    EXPECT_FALSE(!resolver.getView("200"));
+    EXPECT_FALSE(!resolver.getView("testView"));
+    EXPECT_FALSE(resolver.getView("testViewGUID"));
+    EXPECT_TRUE(resolver.getView(darbotdb::DataSourceId{200})->deleted());
+  }
+}

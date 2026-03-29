@@ -1,0 +1,514 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Jan Steemann
+////////////////////////////////////////////////////////////////////////////////
+
+#include "RocksDBTransactionCollection.h"
+
+#include "ApplicationFeatures/ApplicationServer.h"
+#include "Basics/Exceptions.h"
+#include "Basics/system-compiler.h"
+#include "Cluster/ServerState.h"
+#include "Logger/Logger.h"
+#include "Logger/LogMacros.h"
+#include "Random/RandomGenerator.h"
+#include "Metrics/Counter.h"
+#include "RocksDBEngine/RocksDBCuckooIndexEstimator.h"
+#include "RocksDBEngine/RocksDBEngine.h"
+#include "RocksDBEngine/RocksDBIndex.h"
+#include "RocksDBEngine/RocksDBIndexCacheRefillFeature.h"
+#include "RocksDBEngine/RocksDBMetaCollection.h"
+#include "RocksDBEngine/RocksDBOptionFeature.h"
+#include "RocksDBEngine/RocksDBSettingsManager.h"
+#include "Statistics/ServerStatistics.h"
+#include "StorageEngine/EngineSelectorFeature.h"
+#include "StorageEngine/TransactionState.h"
+#include "Transaction/Hints.h"
+#include "Transaction/Methods.h"
+#include "VocBase/LogicalCollection.h"
+
+#include <absl/strings/str_cat.h>
+
+using namespace darbotdb;
+
+RocksDBTransactionCollection::RocksDBTransactionCollection(
+    TransactionState* trx, DataSourceId cid, AccessMode::Type accessType)
+    : TransactionCollection(trx, cid, accessType),
+      _initialNumberDocuments(0),
+      _revision(0),
+      _numInserts(0),
+      _numUpdates(0),
+      _numRemoves(0),
+      _usageLocked(false),
+      _exclusiveWrites(trx->vocbase()
+                           .server()
+                           .getFeature<darbotdb::RocksDBOptionFeature>()
+                           .exclusiveWrites()) {}
+
+RocksDBTransactionCollection::~RocksDBTransactionCollection() {
+  try {
+    // cppcheck-suppress virtualCallInConstructor
+    releaseUsage();
+  } catch (...) {
+  }
+}
+
+/// @brief whether or not any write operations for the collection happened
+bool RocksDBTransactionCollection::hasOperations() const {
+  return (_numInserts > 0 || _numRemoves > 0 || _numUpdates > 0);
+}
+
+bool RocksDBTransactionCollection::canAccess(
+    AccessMode::Type accessType) const {
+  if (!_collection) {
+    return false;  // not opened. probably a mistake made by the caller
+  }
+
+  // check if access type matches
+  if (AccessMode::isWriteOrExclusive(accessType) &&
+      !AccessMode::isWriteOrExclusive(_accessType)) {
+    // type doesn't match. probably also a mistake by the caller
+    return false;
+  }
+
+  return true;
+}
+
+futures::Future<Result> RocksDBTransactionCollection::lockUsage() {
+  Result res;
+
+  bool doSetup = false;
+  if (_collection == nullptr) {
+    res = ensureCollection();
+    if (res.fail()) {
+      co_return res;
+    }
+    doSetup = true;
+  }
+
+  TRI_ASSERT(_collection != nullptr);
+
+  if (/*AccessMode::isWriteOrExclusive(_accessType) &&*/ !isLocked()) {
+    // r/w lock the collection
+    res = co_await doLock(_accessType);
+
+    // TRI_ERROR_LOCKED is not an error, but it indicates that the lock
+    // operation has actually acquired the lock (and that the lock has not
+    // been held before)
+    if (res.fail() && !res.is(TRI_ERROR_LOCKED)) {
+      co_return res;
+    }
+  }
+
+  if (doSetup) {
+    RocksDBMetaCollection* rc =
+        static_cast<RocksDBMetaCollection*>(_collection->getPhysical());
+    _initialNumberDocuments = rc->meta().numberDocuments();
+    _revision = rc->meta().revisionId();
+  }
+
+  co_return {};
+}
+
+void RocksDBTransactionCollection::releaseUsage() {
+  // questionable, but seems to work
+  if (_transaction->hasHint(transaction::Hints::Hint::LOCK_NEVER)) {
+    TRI_ASSERT(!_usageLocked);
+    TRI_ASSERT(!isLocked());
+    _collection = nullptr;
+    return;
+  }
+
+  if (isLocked()) {
+    // unlock our own r/w locks
+    doUnlock(_accessType);
+    _lockType = AccessMode::Type::NONE;
+  }
+
+  // the top level transaction releases all collections
+  if (_collection != nullptr) {
+    // unuse collection, remove usage-lock
+    LOG_TRX("67a6b", TRACE, _transaction) << "unusing collection " << _cid.id();
+
+    TRI_ASSERT(_usageLocked);  // simon: TODO make _usageLocked maintainer only
+    if (_usageLocked) {
+      _transaction->vocbase().releaseCollection(_collection.get());
+      _usageLocked = false;
+    }
+    _collection = nullptr;
+  } else {
+    TRI_ASSERT(!_usageLocked);
+  }
+}
+
+/// @brief add an operation for a transaction collection
+void RocksDBTransactionCollection::addOperation(
+    TRI_voc_document_operation_e operationType, RevisionId revisionId) {
+  switch (operationType) {
+    case TRI_VOC_DOCUMENT_OPERATION_UNKNOWN:
+      break;
+    case TRI_VOC_DOCUMENT_OPERATION_INSERT:
+      ++_numInserts;
+      _revision = revisionId;
+      break;
+    case TRI_VOC_DOCUMENT_OPERATION_UPDATE:
+    case TRI_VOC_DOCUMENT_OPERATION_REPLACE:
+      ++_numUpdates;
+      _revision = revisionId;
+      break;
+    case TRI_VOC_DOCUMENT_OPERATION_REMOVE:
+      ++_numRemoves;
+      _revision = revisionId;
+      break;
+  }
+}
+
+rocksdb::SequenceNumber RocksDBTransactionCollection::prepareTransaction(
+    TransactionId trxId) {
+  TRI_ASSERT(_collection != nullptr);
+  if (hasOperations() || !_trackedOperations.empty() ||
+      !_trackedIndexOperations.empty()) {
+    TRI_IF_FAILURE("TransactionChaos::randomSleep") {
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(RandomGenerator::interval(uint32_t(5))));
+    }
+    auto* coll =
+        static_cast<RocksDBMetaCollection*>(_collection->getPhysical());
+    rocksdb::SequenceNumber seq = coll->placeRevisionTreeBlocker(trxId);
+    return seq;
+  }
+
+  return 0;
+}
+
+void RocksDBTransactionCollection::abortCommit(TransactionId trxId) {
+  TRI_ASSERT(_collection != nullptr);
+  if (hasOperations() || !_trackedOperations.empty() ||
+      !_trackedIndexOperations.empty()) {
+    auto* coll =
+        static_cast<RocksDBMetaCollection*>(_collection->getPhysical());
+    coll->meta().removeBlocker(trxId);
+  }
+}
+
+void RocksDBTransactionCollection::commitCounts(TransactionId trxId,
+                                                uint64_t commitSeq) {
+  TRI_IF_FAILURE("DisableCommitCounts") { return; }
+  TRI_ASSERT(_collection != nullptr);
+  if (_collection == nullptr) {
+    // This was observed once in production. We currently do not know how
+    // this can happen, since no code path should lead to this. We add this
+    // provision here to avoid a crash in case this happens again and we
+    // put out additional information to the log to be able to get to the
+    // bottom of this:
+    LOG_TOPIC("54241", ERR, darbotdb::Logger::ENGINES)
+        << "commitCounts: _collcetion is nullptr, trxId=" << trxId
+        << ", commitSeq=" << commitSeq << ", usageLocked=" << _usageLocked
+        << ", collection id: " << id().id();
+    THROW_DDB_EXCEPTION_MESSAGE(TRI_ERROR_INTERNAL,
+                                   "commitCounts: _collection is nullptr");
+  }
+  auto* rcoll = static_cast<RocksDBMetaCollection*>(_collection->getPhysical());
+
+  // Update the collection count
+  int64_t adj = _numInserts - _numRemoves;
+  if (hasOperations()) {
+    TRI_ASSERT(_numInserts > 0 || _numRemoves > 0 || _numUpdates > 0);
+    TRI_ASSERT(_revision.isSet() && commitSeq != 0);
+
+    TRI_IF_FAILURE("RocksDBCommitCounts") {
+      adj = 0;
+      rcoll->meta().setTainted();
+    }
+    TRI_IF_FAILURE("RocksDBCommitCountsRandom") {
+      if (RandomGenerator::interval(uint16_t(100)) >= 50) {
+        adj = 0;
+        rcoll->meta().setTainted();
+      }
+    }
+    rcoll->meta().adjustNumberDocuments(commitSeq, _revision, adj);
+  }
+
+  bool const hasTrackedOps = !_trackedOperations.empty();
+  // update the revision tree. this is only relevant if the collection uses
+  // Merkle trees.
+  if (hasTrackedOps) {
+    TRI_ASSERT(hasOperations());
+    TRI_ASSERT(hasTrackedOps);
+    rcoll->bufferUpdates(commitSeq, std::move(_trackedOperations.inserts),
+                         std::move(_trackedOperations.removals));
+  }
+
+  // Update the index estimates.
+  for (auto& pair : _trackedIndexOperations) {
+    auto idx = _collection->lookupIndex(pair.first);
+    if (ADB_UNLIKELY(idx == nullptr)) {
+      // Index reported estimates, but does not exist
+      TRI_ASSERT(_collection->deleted());
+      continue;
+    }
+    auto ridx = static_cast<RocksDBIndex*>(idx.get());
+    auto est = ridx->estimator();
+    if (ADB_LIKELY(est != nullptr)) {
+      est->bufferUpdates(commitSeq, std::move(pair.second.inserts),
+                         std::move(pair.second.removals));
+    } else {
+      TRI_ASSERT(false);
+    }
+  }
+
+  if (hasOperations() || hasTrackedOps || !_trackedIndexOperations.empty()) {
+    rcoll->removeRevisionTreeBlocker(trxId);
+  }
+
+  _initialNumberDocuments += adj;  // needed for intermediate commits
+  _numInserts = 0;
+  _numUpdates = 0;
+  _numRemoves = 0;
+  _trackedOperations.clear();
+  _trackedIndexOperations.clear();
+}
+
+void RocksDBTransactionCollection::trackInsert(RevisionId rid) {
+  if (_collection->useSyncByRevision()) {
+    if (_trackedOperations.inserts.empty() &&
+        !_transaction->hasHint(transaction::Hints::Hint::SINGLE_OPERATION)) {
+      _trackedOperations.inserts.reserve(8);
+    }
+    _trackedOperations.inserts.emplace_back(
+        static_cast<std::uint64_t>(rid.id()));
+  }
+}
+
+void RocksDBTransactionCollection::trackRemove(RevisionId rid) {
+  if (_collection->useSyncByRevision()) {
+    if (_trackedOperations.removals.empty() &&
+        !_transaction->hasHint(transaction::Hints::Hint::SINGLE_OPERATION)) {
+      _trackedOperations.removals.reserve(8);
+    }
+    _trackedOperations.removals.emplace_back(
+        static_cast<std::uint64_t>(rid.id()));
+  }
+}
+
+void RocksDBTransactionCollection::trackIndexInsert(IndexId iid,
+                                                    uint64_t hash) {
+  _trackedIndexOperations[iid].inserts.emplace_back(hash);
+}
+
+void RocksDBTransactionCollection::trackIndexRemove(IndexId iid,
+                                                    uint64_t hash) {
+  _trackedIndexOperations[iid].removals.emplace_back(hash);
+}
+
+void RocksDBTransactionCollection::trackIndexCacheRefill(IndexId iid,
+                                                         std::string_view key) {
+  _trackedCacheRefills[iid].emplace_back(key.data(), key.size());
+}
+
+void RocksDBTransactionCollection::handleIndexCacheRefills() {
+  if (_trackedCacheRefills.empty()) {
+    return;
+  }
+
+  auto& refiller = _collection->vocbase()
+                       .server()
+                       .getFeature<RocksDBIndexCacheRefillFeature>();
+
+  for (auto const& it : _trackedCacheRefills) {
+    refiller.trackRefill(_collection, it.first, std::move(it.second));
+  }
+  _trackedCacheRefills.clear();
+}
+
+/// @brief lock a collection
+/// returns TRI_ERROR_LOCKED in case the lock was successfully acquired
+/// returns TRI_ERROR_NO_ERROR in case the lock does not need to be acquired and
+/// no other error occurred returns any other error code otherwise
+futures::Future<Result> RocksDBTransactionCollection::doLock(
+    AccessMode::Type type) {
+  if (AccessMode::Type::WRITE == type && _exclusiveWrites) {
+    type = AccessMode::Type::EXCLUSIVE;
+  }
+
+  if (!AccessMode::isWriteOrExclusive(type)) {
+    // read operations do not require any locks in RocksDB
+    _lockType = type;
+    co_return {};
+  }
+
+  if (_transaction->hasHint(transaction::Hints::Hint::LOCK_NEVER)) {
+    // never lock
+    co_return {};
+  }
+
+  TRI_ASSERT(_collection != nullptr);
+  TRI_ASSERT(!isLocked());
+
+  auto* physical =
+      static_cast<RocksDBMetaCollection*>(_collection->getPhysical());
+  TRI_ASSERT(physical != nullptr);
+
+  double const timeout = _transaction->lockTimeout();
+
+  Result res;
+  LOG_TRX("f1246", TRACE, _transaction)
+      << "write-locking collection " << _cid.id();
+  if (AccessMode::isExclusive(type)) {
+    // exclusive locking means we'll be acquiring the collection's RW lock in
+    // write mode
+    res = co_await physical->lockWrite(timeout);
+  } else {
+    // write locking means we'll be acquiring the collection's RW lock in read
+    // mode
+    res = co_await physical->lockRead(timeout);
+  }
+
+  if (res.ok()) {
+    _lockType = type;
+    // not an error, but we use TRI_ERROR_LOCKED to indicate that we actually
+    // acquired the lock ourselves
+    res.reset(TRI_ERROR_LOCKED);
+  } else if (res.is(TRI_ERROR_LOCK_TIMEOUT) && timeout >= 0.1) {
+    res.reset(
+        TRI_ERROR_LOCK_TIMEOUT,
+        absl::StrCat("timed out after ", timeout, " s waiting for ",
+                     AccessMode::typeString(type), "-lock on collection ",
+                     _transaction->vocbase().name(), "/", _collection->name(),
+                     " on ", _transaction->actorName()));
+    if (timeout <= 5.0) {
+      // low timeout, does not justify a warning message
+      LOG_TOPIC("2111a", DEBUG, Logger::QUERIES) << res.errorMessage();
+    } else {
+      LOG_TOPIC("4512c", WARN, Logger::QUERIES) << res.errorMessage();
+    }
+
+    // increase counter for lock timeouts
+    auto& stats = _transaction->statistics();
+    if (AccessMode::isExclusive(type)) {
+      ++stats._exclusiveLockTimeouts;
+    } else {
+      ++stats._writeLockTimeouts;
+    }
+  }
+
+  co_return res;
+}
+
+/// @brief unlock a collection
+Result RocksDBTransactionCollection::doUnlock(AccessMode::Type type) {
+  if (AccessMode::Type::WRITE == type && _exclusiveWrites) {
+    type = AccessMode::Type::EXCLUSIVE;
+  }
+
+  if (!AccessMode::isWriteOrExclusive(type) ||
+      !AccessMode::isWriteOrExclusive(_lockType)) {
+    _lockType = AccessMode::Type::NONE;
+    return {};
+  }
+
+  if (_transaction->hasHint(transaction::Hints::Hint::LOCK_NEVER)) {
+    // never unlock
+    return {};
+  }
+
+  TRI_ASSERT(_collection != nullptr);
+  TRI_ASSERT(isLocked());
+
+  if (!AccessMode::isWriteOrExclusive(type) &&
+      AccessMode::isWriteOrExclusive(_lockType)) {
+    // do not remove a write-lock if a read-unlock was requested!
+    return {};
+  }
+  if (AccessMode::isWriteOrExclusive(type) &&
+      !AccessMode::isWriteOrExclusive(_lockType)) {
+    // we should never try to write-unlock a collection that we have only
+    // read-locked
+    LOG_TOPIC("2b651", ERR, darbotdb::Logger::ENGINES)
+        << "logic error in doUnlock";
+    TRI_ASSERT(false);
+    return {TRI_ERROR_INTERNAL, "logical error in doUnlock"};
+  }
+
+  TRI_ASSERT(_collection);
+
+  auto* physical =
+      static_cast<RocksDBMetaCollection*>(_collection->getPhysical());
+  TRI_ASSERT(physical != nullptr);
+
+  LOG_TRX("372c0", TRACE, _transaction)
+      << "write-unlocking collection " << _cid.id();
+  if (AccessMode::isExclusive(type)) {
+    // exclusive locking means we'll be releasing the collection's RW lock in
+    // write mode
+    physical->unlockWrite();
+  } else {
+    // write locking means we'll be releasing the collection's RW lock in read
+    // mode
+    physical->unlockRead();
+  }
+
+  _lockType = AccessMode::Type::NONE;
+
+  return {};
+}
+
+Result RocksDBTransactionCollection::ensureCollection() {
+  if (_collection == nullptr) {
+    // open the collection
+    if (!_transaction->hasHint(transaction::Hints::Hint::LOCK_NEVER)) {
+      // use and usage-lock
+      LOG_TRX("b72bb", TRACE, _transaction) << "using collection " << _cid.id();
+
+#ifdef USE_ENTERPRISE
+      // we don't need to check the permissions of collections that we only
+      // read from if skipInaccessible is set
+      bool checkPermissions =
+          AccessMode::isWriteOrExclusive(_accessType) ||
+          !_transaction->options().skipInaccessibleCollections;
+#else
+      bool checkPermissions = true;
+#endif
+      // will throw if collection does not exist
+      try {
+        _collection =
+            _transaction->vocbase().useCollection(_cid, checkPermissions);
+      } catch (basics::Exception const& ex) {
+        return {ex.code(), ex.what()};
+      }
+
+      TRI_ASSERT(_collection != nullptr);
+      _usageLocked = true;
+    } else {
+      // use without usage-lock (lock already set externally)
+      TRI_ASSERT(!_usageLocked);
+      _collection = _transaction->vocbase().lookupCollection(_cid);
+
+      if (_collection == nullptr) {
+        return {TRI_ERROR_DDB_DATA_SOURCE_NOT_FOUND};
+      }
+    }
+  }
+
+  TRI_ASSERT(_collection != nullptr);
+
+  return {};
+}

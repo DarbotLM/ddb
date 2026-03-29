@@ -1,0 +1,63 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Tobias Gödderz
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <exception>
+#include <vector>
+
+#include "Futures/Promise.h"
+#include "Logger/LogContext.h"
+
+namespace arangodb::futures {
+template<typename T>
+class Future;
+template<typename T>
+class Promise;
+struct Unit;
+}  // namespace arangodb::futures
+
+namespace arangodb {
+
+class LogContext;
+
+struct WaitForBag {
+  WaitForBag() = default;
+
+  auto addWaitFor() -> futures::Future<futures::Unit>;
+
+  void resolveAll();
+
+  void resolveAll(std::exception_ptr const&);
+
+  [[nodiscard]] auto empty() const noexcept -> bool;
+
+ private:
+  struct PromiseWithContext {
+    futures::Promise<futures::Unit> promise;
+    LogContext logContext;
+  };
+  std::vector<PromiseWithContext> _waitForBag;
+};
+
+}  // namespace arangodb

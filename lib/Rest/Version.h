@@ -1,0 +1,181 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Jan Steemann
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <map>
+#include <string>
+
+#include "Basics/operating-system.h"
+
+#include "Basics/build.h"
+
+#ifdef USE_ENTERPRISE
+#include "Enterprise/Basics/Version.h"
+
+#ifndef ARANGODB_ENTERPRISE_VERSION
+#error "Enterprise Edition version number is not defined"
+#endif
+
+#ifndef NDEBUG
+// no -DNEBUG... so this will be very slow
+#define ARANGODB_VERSION_FULL                                        \
+  ARANGODB_VERSION " " ARANGODB_ENTERPRISE_VERSION " [" TRI_PLATFORM \
+                   "-NO-NDEBUG]"
+
+#else
+
+#ifdef _DEBUG
+#define ARANGODB_VERSION_FULL \
+  ARANGODB_VERSION " " ARANGODB_ENTERPRISE_VERSION " [" TRI_PLATFORM "-DEBUG]"
+#else
+#define ARANGODB_VERSION_FULL \
+  ARANGODB_VERSION " " ARANGODB_ENTERPRISE_VERSION " [" TRI_PLATFORM "]"
+#endif
+
+#endif
+
+#else
+
+#ifdef ARANGODB_ENTERPRISE_VERSION
+#error "Enterprise Edition version number should not be defined"
+#endif
+
+#ifdef _DEBUG
+#define ARANGODB_VERSION_FULL ARANGODB_VERSION " [" TRI_PLATFORM "-DEBUG]"
+#else
+#define ARANGODB_VERSION_FULL ARANGODB_VERSION " [" TRI_PLATFORM "]"
+#endif
+
+#endif
+
+namespace arangodb {
+namespace velocypack {
+class Builder;
+}
+
+namespace rest {
+
+struct FullVersion {
+  int major;
+  int minor;
+  int patch;
+};
+
+class Version {
+ private:
+  // create the version information
+  Version() = delete;
+  Version(Version const&) = delete;
+  Version& operator=(Version const&) = delete;
+
+ public:
+  // parse a version string into major, minor
+  /// returns -1, -1 when the version string has an invalid format
+  static std::pair<int, int> parseVersionString(std::string const&);
+
+  // parse a full version string into major, minor, patch
+  /// returns -1, -1, -1 when the version string has an invalid format
+  /// returns major, -1, -1 when only the major version can be determined,
+  /// returns major, minor, -1 when only the major and minor version can be
+  /// determined.
+  static FullVersion parseFullVersionString(std::string const&);
+
+  // initialize
+  static void initialize();
+
+  // get numeric server version
+  static int32_t getNumericServerVersion();
+
+  // get server version
+  static std::string getServerVersion();
+
+  // get BOOST version
+  static std::string getBoostVersion();
+
+  // get boost reactor type
+  static std::string getBoostReactorType();
+
+  // get RocksDB version
+  static std::string getRocksDBVersion();
+
+  // get V8 version
+  static std::string getV8Version();
+
+  // get OpenSSL version
+  static std::string getOpenSSLVersion(bool compileTime);
+
+  // get vpack version
+  static std::string getVPackVersion();
+
+  // get zlib version
+  static std::string getZLibVersion();
+
+  // get ICU version
+  static std::string getICUVersion();
+
+  // get IResearch version
+  static std::string getIResearchVersion();
+
+  // get compiler
+  static std::string getCompiler();
+
+  // get endianness
+  static std::string getEndianness();
+
+  // get Faiss version
+  static std::string getFaissVersion();
+
+  // get OpenMP version
+  static std::string getOpenMPVersion();
+
+  // get plaform
+  static std::string getPlatform();
+
+  // get build date
+  static std::string getBuildDate();
+
+  // get build repository
+  static std::string getBuildRepository();
+  static std::string getEnterpriseBuildRepository();
+  static std::string getOskarBuildRepository();
+
+  // get build-id, if set.
+  // intentionally returned by reference, so we can avoid a
+  // copy
+  static std::string const& getBuildId();
+
+  // return a server version string
+  static std::string getVerboseVersionString();
+
+  // get detailed version information as a (multi-line) string
+  static std::string getDetailed();
+
+  // VelocyPack all data
+  static void getVPack(velocypack::Builder&);
+
+ public:
+  static std::map<std::string, std::string> Values;
+};
+}  // namespace rest
+}  // namespace arangodb

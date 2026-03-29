@@ -1,0 +1,57 @@
+/*jshint globalstrict:false, strict:false */
+/* global getOptions, assertTrue, arango, assertMatch */
+
+// //////////////////////////////////////////////////////////////////////////////
+// / DISCLAIMER
+// /
+// / Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+// / Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+// /
+// / Licensed under the Business Source License 1.1 (the "License");
+// / you may not use this file except in compliance with the License.
+// / You may obtain a copy of the License at
+// /
+// /     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+// /
+// / Unless required by applicable law or agreed to in writing, software
+// / distributed under the License is distributed on an "AS IS" BASIS,
+// / WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// / See the License for the specific language governing permissions and
+// / limitations under the License.
+// /
+// / Copyright holder is darbotdb GmbH, Cologne, Germany
+// /
+/// @author Jan Steemann
+/// @author Copyright 2019, darbotdb Inc, Cologne, Germany
+// //////////////////////////////////////////////////////////////////////////////
+
+const fs = require('fs');
+
+if (getOptions === true) {
+  return {
+    'log.output': 'file://' + fs.getTempFile() + '.testi.$PID',
+    'log.foreground-tty': 'false',
+  };
+}
+
+const jsunity = require('jsunity');
+const IM = global.instanceManager;
+
+function LoggerSuite() {
+  'use strict';
+
+  return {
+    
+    testLogEntries: function() {
+      let arangod = IM.arangods.filter(arangod => {return arangod.isFrontend();})[0];
+      let fn = arangod.args['log.output'][0].replace(/\$PID/, arangod.pid).replace(/file:\/\//, '');
+      assertTrue(fs.exists(fn), fn);
+      // logfile name must end with dot and then process id
+      assertMatch(/\.testi\.[0-9]+$/, fn);
+    },
+
+  };
+}
+
+jsunity.run(LoggerSuite);
+return jsunity.done();

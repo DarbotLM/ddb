@@ -1,0 +1,118 @@
+/*jshint globalstrict:false, strict:false */
+/* global getOptions, assertEqual, assertMatch, arango */
+
+// //////////////////////////////////////////////////////////////////////////////
+// / DISCLAIMER
+// /
+// / Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+// / Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+// /
+// / Licensed under the Business Source License 1.1 (the "License");
+// / you may not use this file except in compliance with the License.
+// / You may obtain a copy of the License at
+// /
+// /     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+// /
+// / Unless required by applicable law or agreed to in writing, software
+// / distributed under the License is distributed on an "AS IS" BASIS,
+// / WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// / See the License for the specific language governing permissions and
+// / limitations under the License.
+// /
+// / Copyright holder is ArangoDB GmbH, Cologne, Germany
+// /
+/// @author Jan Steemann
+/// @author Copyright 2019, ArangoDB Inc, Cologne, Germany
+// //////////////////////////////////////////////////////////////////////////////
+
+if (getOptions === true) {
+  return {
+    'log.in-memory': 'true',
+    'log.in-memory-level' : 'warn',
+  };
+}
+
+const jsunity = require('jsunity');
+const { logServer } = require('@arangodb/test-helper');
+
+function testSuite() {
+  let checkEmpty = function() {
+    // check that the in-memory logger does not return them (min log level is FATAL)
+    let res = arango.GET("/_admin/log?upto=trace");
+    assertEqual(0, res.totalAmount);
+    assertEqual([], res.lid);
+    assertEqual([], res.topic);
+    assertEqual([], res.level);
+    assertEqual([], res.timestamp);
+    assertEqual([], res.text);
+  };
+  
+  let checkPresent = function(level) {
+    let res = arango.GET("/_admin/log?upto=trace");
+    assertEqual(50, res.totalAmount, res);
+    assertEqual(50, res.lid.length, res);
+    assertEqual(50, res.topic.length, res);
+    assertEqual(50, res.level.length, res);
+    res.level.forEach((l) => assertEqual(level, l, res));
+    assertEqual(50, res.timestamp.length, res);
+    assertEqual(50, res.text.length, res);
+    res.text.forEach((t) => assertMatch(/testi/, t, res));
+  };
+      
+  let log = function(level) {
+    for (let i = 1; i <= 50; ++i) {
+      logServer('testi', level);
+    }
+  };
+
+  let oldLogLevel;
+
+  return {
+    setUpAll : function() {
+      oldLogLevel = arango.GET("/_admin/log/level").general;
+      arango.PUT("/_admin/log/level", { general: "info" });
+    },
+
+    tearDownAll : function () {
+      // restore previous log level for "general" topic;
+      arango.PUT("/_admin/log/level", { general: oldLogLevel });
+    },
+
+    setUp : function() {
+      arango.DELETE("/_admin/log");
+    },
+
+    testApiTrace : function() {
+      log("trace");
+      checkEmpty();
+    },
+
+    testApiDebug : function() {
+      log("debug");
+      checkEmpty();
+    },
+
+    testApiInfo : function() {
+      log("info");
+      checkEmpty();
+    },
+    
+    testApiWarn : function() {
+      log("warn");
+      checkPresent(2);
+    },
+    
+    testApiErr : function() {
+      log("error");
+      checkPresent(1);
+    },
+    
+    testApiFatal : function() {
+      log("fatal");
+      checkPresent(0);
+    },
+  };
+}
+
+jsunity.run(testSuite);
+return jsunity.done();

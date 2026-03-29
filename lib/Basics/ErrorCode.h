@@ -1,0 +1,101 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Tobias Gödderz
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <iosfwd>
+#include <string>
+
+namespace arangodb::velocypack {
+class Value;
+}
+
+// TODO We probably want to put this into a namespace, but this is easy to
+//      refactor automatically later.
+
+class ErrorCode {
+ public:
+  using ValueType = int;
+
+  ErrorCode() = delete;
+  constexpr explicit ErrorCode(ValueType value) : _value(value) {}
+  constexpr ErrorCode(ErrorCode const&) noexcept = default;
+  constexpr ErrorCode(ErrorCode&&) noexcept = default;
+  constexpr auto operator=(ErrorCode const&) noexcept -> ErrorCode& = default;
+  constexpr auto operator=(ErrorCode&&) noexcept -> ErrorCode& = default;
+
+  [[nodiscard]] constexpr explicit operator ValueType() const noexcept {
+    return _value;
+  }
+
+  /// @brief return the document id
+  [[nodiscard]] ValueType value() const noexcept;
+
+  // This could also be constexpr, but we'd have to include
+  // <velocypack/Value.h>, and I'm unsure whether that's worth it, and rather
+  // rely on IPO here.
+  [[nodiscard]] explicit operator arangodb::velocypack::Value() const noexcept;
+
+  [[nodiscard]] constexpr auto operator==(ErrorCode other) const noexcept
+      -> bool {
+    return _value == other._value;
+  }
+
+  [[nodiscard]] constexpr auto operator!=(ErrorCode other) const noexcept
+      -> bool {
+    return _value != other._value;
+  }
+
+  friend auto to_string(::ErrorCode value) -> std::string;
+
+  template<typename Inspector>
+  friend auto inspect(Inspector& f, ErrorCode& x);
+
+ private:
+  ValueType _value;
+};
+
+namespace std {
+template<>
+struct hash<ErrorCode> {
+  auto operator()(ErrorCode const& errorCode) const noexcept -> std::size_t {
+    return std::hash<int>{}(static_cast<int>(errorCode));
+  }
+};
+}  // namespace std
+
+auto operator<<(std::ostream& out, ::ErrorCode const& res) -> std::ostream&;
+
+template<typename Inspector>
+auto inspect(Inspector& f, ErrorCode& x) {
+  if constexpr (Inspector::isLoading) {
+    auto v = 0;
+    auto res = f.apply(v);
+    if (res.ok()) {
+      x = ErrorCode{v};
+    }
+    return res;
+  } else {
+    return f.apply(x._value);
+  }
+}

@@ -1,0 +1,1155 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Dr. Frank Celler
+/// @author Achim Brandt
+/// @author Simon Grätzer
+////////////////////////////////////////////////////////////////////////////////
+
+#include "SimpleHttpClient.h"
+
+#include "ApplicationFeatures/ApplicationServer.h"
+#include "ApplicationFeatures/CommunicationFeaturePhase.h"
+#include "Basics/EncodingUtils.h"
+#include "Basics/ScopeGuard.h"
+#include "Basics/StaticStrings.h"
+#include "Basics/StringUtils.h"
+#include "Basics/system-compiler.h"
+#include "Basics/system-functions.h"
+#include "Containers/SmallVector.h"
+#include "Endpoint/Endpoint.h"
+#include "Logger/LogMacros.h"
+#include "Logger/Logger.h"
+#include "Logger/LoggerStream.h"
+#include "Rest/GeneralResponse.h"
+#include "SimpleHttpClient/GeneralClientConnection.h"
+#include "SimpleHttpClient/SimpleHttpResult.h"
+
+#include <absl/strings/str_cat.h>
+#include <absl/strings/escaping.h>
+
+#include <velocypack/Builder.h>
+#include <velocypack/Parser.h>
+#include <velocypack/Slice.h>
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+
+using namespace arangodb;
+using namespace arangodb::basics;
+
+namespace arangodb::httpclient {
+
+void SimpleHttpClientParams::setUserNamePassword(std::string_view prefix,
+                                                 std::string_view username,
+                                                 std::string_view password) {
+  TRI_ASSERT(prefix == "/");
+  _basicAuth = absl::Base64Escape(absl::StrCat(username, ":", password));
+}
+
+/// @brief default value for max packet size
+size_t SimpleHttpClientParams::MaxPacketSize = 512 * 1024 * 1024;
+
+SimpleHttpClient::SimpleHttpClient(GeneralClientConnection* connection,
+                                   SimpleHttpClientParams const& params)
+    : _connection(connection),
+      _deleteConnectionOnDestruction(false),
+      _params(params),
+      _writeBuffer(false),
+      _readBuffer(false),
+      _readBufferOffset(0),
+      _state(IN_CONNECT),
+      _written(0),
+      _errorMessage(""),
+      _nextChunkedSize(0),
+      _method(rest::RequestType::GET),
+      _aborted(false),
+      _comm(_connection->comm()) {
+  TRI_ASSERT(connection != nullptr);
+
+  if (_connection->isConnected()) {
+    _state = FINISHED;
+  }
+  // calculate hostname only once. it will remain
+  // the same for the entire lifetime of the SimpleHttpClient
+  // object.
+  _hostname = _connection->getEndpoint()->host();
+}
+
+SimpleHttpClient::SimpleHttpClient(
+    std::unique_ptr<GeneralClientConnection>& connection,
+    SimpleHttpClientParams const& params)
+    : SimpleHttpClient(connection.get(), params) {
+  _deleteConnectionOnDestruction = true;
+  connection.release();
+}
+
+SimpleHttpClient::~SimpleHttpClient() {
+  // connection may have been invalidated by other objects
+  if (_connection != nullptr) {
+    if (!_params._keepConnectionOnDestruction || !_connection->isConnected()) {
+      _connection->disconnect();
+    }
+
+    if (_deleteConnectionOnDestruction) {
+      delete _connection;
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
+// public methods
+// -----------------------------------------------------------------------------
+
+void SimpleHttpClient::recycleResult(std::unique_ptr<SimpleHttpResult> result) {
+  _result = std::move(result);
+}
+
+void SimpleHttpClient::setAborted(bool value) noexcept {
+  _aborted.store(value, std::memory_order_release);
+  setInterrupted(value);
+}
+
+void SimpleHttpClient::setInterrupted(bool value) {
+  if (_connection != nullptr) {
+    _connection->setInterrupted(value);
+  }
+}
+
+bool SimpleHttpClient::isConnected() { return _connection->isConnected(); }
+
+void SimpleHttpClient::disconnect() { _connection->disconnect(); }
+
+std::string SimpleHttpClient::getEndpointSpecification() const {
+  return _connection == nullptr ? "unknown"
+                                : _connection->getEndpointSpecification();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief close connection
+////////////////////////////////////////////////////////////////////////////////
+
+void SimpleHttpClient::close() {
+  // ensure connection has not yet been invalidated
+  TRI_ASSERT(_connection != nullptr);
+
+  _connection->disconnect();
+  _state = IN_CONNECT;
+
+  clearReadBuffer();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief send out a request, creating a new HttpResult object
+/// this version does not allow specifying custom headers
+/// if the request fails because of connection problems, the request will be
+/// retried until it either succeeds (at least no connection problem) or there
+/// have been _maxRetries retries
+////////////////////////////////////////////////////////////////////////////////
+
+SimpleHttpResult* SimpleHttpClient::retryRequest(rest::RequestType method,
+                                                 std::string const& location,
+                                                 char const* body,
+                                                 size_t bodyLength) {
+  return retryRequest(method, location, body, bodyLength, {});
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief send out a request, creating a new HttpResult object
+/// this version does not allow specifying custom headers
+/// if the request fails because of connection problems, the request will be
+/// retried until it either succeeds (at least no connection problem) or there
+/// have been _maxRetries retries
+////////////////////////////////////////////////////////////////////////////////
+
+SimpleHttpResult* SimpleHttpClient::retryRequest(
+    rest::RequestType method, std::string const& location, char const* body,
+    size_t bodyLength,
+    std::unordered_map<std::string, std::string> const& headers) {
+  std::unique_ptr<SimpleHttpResult> result;
+  size_t tries = 0;
+
+  while (true) {
+    TRI_ASSERT(result == nullptr);
+
+    result.reset(doRequest(method, location, body, bodyLength, headers));
+
+    if (result != nullptr && result->isComplete()) {
+      break;
+    }
+
+    result.reset();
+
+    if (tries++ >= _params._maxRetries) {
+      LOG_TOPIC("de0be", WARN, arangodb::Logger::HTTPCLIENT)
+          << "" << _params._retryMessage << " - no retries left"
+          << (_errorMessage.empty() ? std::string("")
+                                    : std::string(" - ") + _errorMessage);
+      break;
+    }
+
+    auto& server = _connection->server();
+    if (server.isStopping()) {
+      // abort this client, will also lead to exiting this loop next
+      setAborted(true);
+    }
+
+    if (isAborted()) {
+      break;
+    }
+
+    if (!_params._retryMessage.empty()) {
+      LOG_TOPIC("2b48f", WARN, arangodb::Logger::HTTPCLIENT)
+          << "" << _params._retryMessage
+          << " - retries left: " << (_params._maxRetries - tries)
+          << (_errorMessage.empty() ? std::string("")
+                                    : std::string(" - ") + _errorMessage);
+    }
+
+    // 1 microsecond == 10^-6 seconds
+    std::this_thread::sleep_for(
+        std::chrono::microseconds(_params._retryWaitTime));
+  }
+
+  return result.release();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief send out a request, creating a new HttpResult object
+/// this version does not allow specifying custom headers
+////////////////////////////////////////////////////////////////////////////////
+
+SimpleHttpResult* SimpleHttpClient::request(rest::RequestType method,
+                                            std::string const& location,
+                                            char const* body,
+                                            size_t bodyLength) {
+  return doRequest(method, location, body, bodyLength, {});
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief send out a request, creating a new HttpResult object
+/// this version allows specifying custom headers
+////////////////////////////////////////////////////////////////////////////////
+
+SimpleHttpResult* SimpleHttpClient::request(
+    rest::RequestType method, std::string const& location, char const* body,
+    size_t bodyLength,
+    std::unordered_map<std::string, std::string> const& headers) {
+  return doRequest(method, location, body, bodyLength, headers);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief send out a request, worker function
+////////////////////////////////////////////////////////////////////////////////
+
+SimpleHttpResult* SimpleHttpClient::doRequest(
+    rest::RequestType method, std::string const& location, char const* body,
+    size_t bodyLength,
+    std::unordered_map<std::string, std::string> const& headers) {
+  // ensure connection has not yet been invalidated
+  TRI_ASSERT(_connection != nullptr);
+  if (isAborted()) {
+    return nullptr;
+  }
+
+  // ensure that result is empty
+  if (_result == nullptr) {
+    // create a new result
+    _result = std::make_unique<SimpleHttpResult>();
+  } else {
+    _result->clear();
+  }
+
+  TRI_ASSERT(_result != nullptr);
+
+  auto resultGuard = scopeGuard([this]() noexcept { _result.reset(); });
+
+  // reset error message
+  _errorMessage.clear();
+
+  // set body
+  auto res =
+      setRequest(method, rewriteLocation(location), body, bodyLength, headers);
+  if (res != TRI_ERROR_NO_ERROR) {
+    this->close();
+    _state = DEAD;
+    setErrorMessage("Got unexpected error while setting up request");
+    return nullptr;
+  }
+
+  // ensure state
+  TRI_ASSERT(_state == IN_CONNECT || _state == IN_WRITE);
+
+  // respect timeout
+  double endTime = TRI_microtime() + _params._requestTimeout;
+  double remainingTime = _params._requestTimeout;
+
+  bool haveSentRequest = false;
+
+  while (_state < FINISHED && remainingTime > 0.0) {
+    // Note that this loop can either be left by timeout or because
+    // a connect did not work (which sets the _state to DEAD). In all
+    // other error conditions we call close() which resets the state
+    // to IN_CONNECT and tries a reconnect. This is important because
+    // it is always possible that we are called with a connection that
+    // has already been closed by the other side. This leads to the
+    // strange effect that the write (if it is small enough) proceeds
+    // but the following read runs into an error. In that case we try
+    // to reconnect one and then give up if this does not work.
+    switch (_state) {
+      case (IN_CONNECT): {
+        handleConnect();
+        // If this goes wrong, _state is set to DEAD
+        break;
+      }
+
+      case (IN_WRITE): {
+        size_t bytesWritten = 0;
+
+        TRI_ASSERT(_writeBuffer.length() >= _written);
+        TRI_set_errno(TRI_ERROR_NO_ERROR);
+
+        bool res = _connection->handleWrite(
+            remainingTime,
+            static_cast<void const*>(_writeBuffer.c_str() + _written),
+            _writeBuffer.length() - _written, &bytesWritten);
+
+        if (!res) {
+          setErrorMessage("Error writing to '" +
+                          _connection->getEndpoint()->specification() + "' '" +
+                          _connection->getErrorDetails() + "'");
+          this->close();  // this sets _state to IN_CONNECT for a retry
+        } else {
+          _written += bytesWritten;
+
+          if (_written == _writeBuffer.length()) {
+            _state = IN_READ_HEADER;
+            haveSentRequest = true;
+          }
+        }
+
+        break;
+      }
+
+      case (IN_READ_HEADER):
+      case (IN_READ_BODY):
+      case (IN_READ_CHUNKED_HEADER):
+      case (IN_READ_CHUNKED_BODY): {
+        TRI_set_errno(TRI_ERROR_NO_ERROR);
+
+        // we need to notice if the other side has closed the connection:
+        bool connectionClosed;
+
+        bool res = _connection->handleRead(remainingTime, _readBuffer,
+                                           connectionClosed);
+
+        // If there was an error, then we are doomed:
+        if (!res) {
+          setErrorMessage("Error reading from: '" +
+                          _connection->getEndpoint()->specification() + "' '" +
+                          _connection->getErrorDetails() + "'");
+
+          if (_connection->isInterrupted()) {
+            this->close();
+            setErrorMessage("Command locally aborted");
+            return nullptr;
+          }
+          this->close();  // this sets the state to IN_CONNECT for a retry
+          LOG_TOPIC("e5154", DEBUG, arangodb::Logger::HTTPCLIENT)
+              << _errorMessage;
+
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+          break;
+        }
+
+        // no error
+
+        if (connectionClosed) {
+          // write might have succeeded even if the server has closed
+          // the connection, this will then show up here with us being
+          // in state IN_READ_HEADER but nothing read.
+          if (_state == IN_READ_HEADER && 0 == _readBuffer.length()) {
+            this->close();
+            _state = DEAD;
+            setErrorMessage("Connection closed by remote");
+            break;
+          }
+
+          if (_state == IN_READ_HEADER) {
+            processHeader();
+          }
+
+          if (_state == IN_READ_BODY) {
+            if (!_result->hasContentLength()) {
+              // If we are reading the body and no content length was
+              // found in the header, then we must read until no more
+              // progress is made (but without an error), this then means
+              // that the server has closed the connection and we must
+              // process the body one more time:
+              _result->setContentLength(_readBuffer.length() -
+                                        _readBufferOffset);
+            }
+            processBody();
+          }
+
+          if (_state != FINISHED) {
+            // If the body was not fully found we give up:
+            this->close();
+            _state = DEAD;
+            setErrorMessage("Got unexpected response from remote");
+          }
+
+          break;
+        }
+
+        // the connection is still alive:
+        switch (_state) {
+          case (IN_READ_HEADER):
+            processHeader();
+            break;
+
+          case (IN_READ_BODY):
+            processBody();
+            break;
+
+          case (IN_READ_CHUNKED_HEADER):
+            processChunkedHeader();
+            break;
+
+          case (IN_READ_CHUNKED_BODY):
+            processChunkedBody();
+            break;
+
+          default:
+            break;
+        }
+
+        break;
+      }
+
+      default:
+        break;
+    }
+
+    if (!_comm.getCommAllowed()) {
+      setErrorMessage("Command locally aborted");
+      return nullptr;
+    }
+
+    remainingTime = endTime - TRI_microtime();
+    if (isAborted()) {
+      setErrorMessage("Client request aborted");
+      break;
+    }
+  }
+
+  if (_state < FINISHED && _errorMessage.empty()) {
+    setErrorMessage("Request timeout reached");
+    _result->setHttpReturnCode(static_cast<int>(ResponseCode::GATEWAY_TIMEOUT));
+  }
+
+  // set result type in getResult()
+  setResultType(haveSentRequest);
+
+  // this method always returns a raw pointer to the result.
+  // the caller must take ownership.
+  return _result.release();
+}
+
+// -----------------------------------------------------------------------------
+// private methods
+// -----------------------------------------------------------------------------
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief initialize the connection
+////////////////////////////////////////////////////////////////////////////////
+
+void SimpleHttpClient::handleConnect() {
+  // ensure connection has not yet been invalidated
+  TRI_ASSERT(_connection != nullptr);
+
+  if (!_connection->connect()) {
+    setErrorMessage("Could not connect to '" +
+                    _connection->getEndpoint()->specification() + "' '" +
+                    _connection->getErrorDetails() + "'");
+    _state = DEAD;
+  } else {
+    // can write now
+    _state = IN_WRITE;
+    _written = 0;
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief clearReadBuffer, clears the read buffer as well as the result
+////////////////////////////////////////////////////////////////////////////////
+
+void SimpleHttpClient::clearReadBuffer() {
+  _readBuffer.clear();
+  _readBufferOffset = 0;
+
+  if (_result) {
+    _result->clear();
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief set the type of the result
+////////////////////////////////////////////////////////////////////////////////
+
+void SimpleHttpClient::setResultType(bool haveSentRequest) {
+  switch (_state) {
+    case IN_WRITE:
+      _result->setResultType(SimpleHttpResult::ResultType::WRITE_ERROR);
+      break;
+
+    case IN_READ_HEADER:
+    case IN_READ_BODY:
+    case IN_READ_CHUNKED_HEADER:
+    case IN_READ_CHUNKED_BODY:
+      _result->setResultType(SimpleHttpResult::ResultType::READ_ERROR);
+      break;
+
+    case FINISHED:
+      _result->setResultType(SimpleHttpResult::ResultType::COMPLETE);
+      break;
+
+    case IN_CONNECT:
+    default: {
+      _result->setResultType(SimpleHttpResult::ResultType::COULD_NOT_CONNECT);
+      if (!haveErrorMessage()) {
+        setErrorMessage("Could not connect");
+      }
+      break;
+    }
+  }
+
+  if (haveErrorMessage() && _result->getHttpReturnMessage().empty()) {
+    _result->setHttpReturnMessage(_errorMessage);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief prepare a request
+////////////////////////////////////////////////////////////////////////////////
+
+ErrorCode SimpleHttpClient::setRequest(
+    rest::RequestType method, std::string const& location, char const* body,
+    size_t bodyLength,
+    std::unordered_map<std::string, std::string> const& headers) {
+  // clear read-buffer (no pipelining!)
+  _readBufferOffset = 0;
+  _readBuffer.reset();
+
+  // set HTTP method
+  _method = method;
+
+  // now fill the write buffer
+  _writeBuffer.clear();
+
+  // append method
+  std::string_view mth = GeneralRequest::translateMethod(method);
+  _writeBuffer.appendText(mth.data(), mth.size());
+  _writeBuffer.appendChar(' ');
+
+  // append location
+  std::string const* l = &location;
+
+  std::string appended;
+  if (!location.starts_with('/')) {
+    appended.reserve(1 + location.size());
+    appended = '/' + location;
+    l = &appended;
+  }
+
+  _writeBuffer.appendText(*l);
+
+  // append protocol
+  _writeBuffer.appendText(std::string_view(" HTTP/1.1\r\n"));
+
+  // append hostname
+  LOG_TOPIC("908b8", DEBUG, Logger::HTTPCLIENT)
+      << "request to " << _hostname << ": "
+      << GeneralRequest::translateMethod(method) << ' ' << *l;
+
+  _writeBuffer.appendText(std::string_view("Host: "));
+  _writeBuffer.appendText(_hostname);
+  _writeBuffer.appendText(std::string_view("\r\n"));
+
+  if (_params._keepAlive) {
+    _writeBuffer.appendText(std::string_view("Connection: Keep-Alive\r\n"));
+  } else {
+    _writeBuffer.appendText(std::string_view("Connection: Close\r\n"));
+  }
+
+  if (_params._exposeArangoDB) {
+    _writeBuffer.appendText(std::string_view("User-Agent: ArangoDB\r\n"));
+  }
+
+  // basic authorization
+  using ExclusionType = std::pair<size_t, size_t>;
+  containers::SmallVector<ExclusionType, 4> exclusions;
+  size_t pos = 0;
+  if (!_params._jwt.empty()) {
+    _writeBuffer.appendText(std::string_view("Authorization: bearer "));
+    pos = _writeBuffer.size();
+    _writeBuffer.appendText(_params._jwt);
+    exclusions.emplace_back(pos, _writeBuffer.size());
+    _writeBuffer.appendText(std::string_view("\r\n"));
+  } else if (!_params._basicAuth.empty()) {
+    _writeBuffer.appendText(std::string_view("Authorization: Basic "));
+    pos = _writeBuffer.size();
+    _writeBuffer.appendText(_params._basicAuth);
+    exclusions.emplace_back(pos, _writeBuffer.size());
+    _writeBuffer.appendText(std::string_view("\r\n"));
+  }
+
+  bool foundAcceptEncoding = false;
+  bool foundContentEncoding = false;
+  bool foundContentLength = false;
+  for (auto const& header : headers) {
+    if (!foundContentLength &&
+        basics::StringUtils::equalStringsCaseInsensitive(
+            StaticStrings::ContentLength, header.first)) {
+      foundContentLength = true;
+      continue;  // skip content-length header
+    }
+    if (!foundContentEncoding &&
+        basics::StringUtils::equalStringsCaseInsensitive(
+            StaticStrings::ContentEncoding, header.first)) {
+      foundContentEncoding = true;
+    }
+    if (!foundAcceptEncoding && _params._allowCompressedResponses &&
+        basics::StringUtils::equalStringsCaseInsensitive(
+            StaticStrings::AcceptEncoding, header.first)) {
+      foundAcceptEncoding = true;
+    }
+    _writeBuffer.appendText(header.first);
+    _writeBuffer.appendText(std::string_view(": "));
+    if (basics::StringUtils::equalStringsCaseInsensitive(
+            StaticStrings::Authorization, header.first)) {
+      pos = _writeBuffer.size();
+      _writeBuffer.appendText(header.second);
+      exclusions.emplace_back(pos, _writeBuffer.size());
+    } else {
+      _writeBuffer.appendText(header.second);
+    }
+    _writeBuffer.appendText(std::string_view("\r\n"));
+  }
+
+  if (!foundAcceptEncoding && _params._allowCompressedResponses) {
+    _writeBuffer.appendText(std::string_view("Accept-Encoding: deflate\r\n"));
+  }
+
+  // compress request body if we are asked for it, but only if
+  // no explicit "content-encoding" header was already set
+  bool compressBody = !foundContentEncoding &&
+                      _params._compressRequestThreshold > 0 &&
+                      _params._compressRequestThreshold <= bodyLength;
+  std::string compressed;
+  if (compressBody) {
+    auto res = encoding::zlibDeflate(reinterpret_cast<uint8_t const*>(body),
+                                     bodyLength, compressed);
+    if (res != TRI_ERROR_NO_ERROR) {
+      return res;
+    }
+    if (compressed.size() >= bodyLength) {
+      // bad: compressed request body is larger than uncompressed body.
+      // in this case we give up on the compression
+      compressBody = false;
+    } else {
+      // good: compression resulted in some smaller request body
+      bodyLength = compressed.size();
+      _writeBuffer.appendText(
+          std::string_view("Content-Encoding: deflate\r\n"));
+    }
+  }
+
+  if (method != rest::RequestType::GET && _params._addContentLength) {
+    _writeBuffer.appendText(std::string_view("Content-Length: "));
+    _writeBuffer.appendInteger(static_cast<uint64_t>(bodyLength));
+    _writeBuffer.appendText(std::string_view("\r\n"));
+  }
+
+  // end of headers
+  _writeBuffer.appendText(std::string_view("\r\n"));
+
+  if (body != nullptr) {
+    if (compressBody) {
+      TRI_ASSERT(bodyLength == compressed.size());
+      _writeBuffer.appendText(compressed.data(), compressed.size());
+    } else {
+      // don't write compressed body
+      _writeBuffer.appendText(body, bodyLength);
+    }
+  }
+  _writeBuffer.ensureNullTerminated();
+
+  if (exclusions.empty()) {
+    LOG_TOPIC("12c4c", TRACE, arangodb::Logger::HTTPCLIENT)
+        << "request: " << _writeBuffer;
+  } else {
+    pos = 0;
+    for (size_t i = 0; i < exclusions.size(); ++i) {
+      LOG_TOPIC("12c4b", TRACE, arangodb::Logger::HTTPCLIENT)
+          << "request: "
+          << std::string_view(_writeBuffer.data() + pos,
+                              exclusions[i].first - pos)
+          << "SENSITIVE_DETAILS_HIDDEN";
+      pos = exclusions[i].second;
+    }
+    LOG_TOPIC("12c4e", TRACE, arangodb::Logger::HTTPCLIENT)
+        << "request: "
+        << std::string_view(_writeBuffer.data() + pos,
+                            _writeBuffer.size() - pos);
+  }
+
+  if (_state == DEAD) {
+    _connection->resetNumConnectRetries();
+  }
+
+  // close connection to reset all read and write buffers
+  if (_state != FINISHED) {
+    this->close();
+  }
+
+  // we are connected, start with writing
+  if (_connection->isConnected()) {
+    _state = IN_WRITE;
+    _written = 0;
+  } else {
+    // connect to server
+    _state = IN_CONNECT;
+  }
+
+  TRI_ASSERT(_state == IN_CONNECT || _state == IN_WRITE);
+  return TRI_ERROR_NO_ERROR;
+}
+
+// -----------------------------------------------------------------------------
+// private methods
+// -----------------------------------------------------------------------------
+
+void SimpleHttpClient::processHeader() {
+  TRI_ASSERT(_readBufferOffset <= _readBuffer.length());
+  size_t remain = _readBuffer.length() - _readBufferOffset;
+  char const* ptr = _readBuffer.c_str() + _readBufferOffset;
+  char const* pos = static_cast<char const*>(memchr(ptr, '\n', remain));
+
+  // We enforce the following invariants:
+  //   ptr = _readBuffer.c_str() + _readBufferOffset
+  //   _readBuffer.length() >= _readBufferOffset
+  //   remain = _readBuffer.length() - _readBufferOffset
+  while (pos) {
+    TRI_ASSERT(_readBufferOffset <= _readBuffer.length());
+    TRI_ASSERT(ptr == _readBuffer.c_str() + _readBufferOffset);
+    TRI_ASSERT(remain == _readBuffer.length() - _readBufferOffset);
+
+    if (pos > ptr && *(pos - 1) == '\r') {
+      // adjust eol position
+      --pos;
+    }
+
+    // end of header found
+    if (*ptr == '\r' || *ptr == '\n' || *ptr == '\0') {
+      size_t len = pos - ptr;
+      _readBufferOffset += len + 1;
+      TRI_ASSERT(_readBufferOffset <= _readBuffer.length());
+
+      ptr += len + 1;
+      remain -= len + 1;
+
+      if (*pos == '\r') {
+        // adjust offset if line ended with \r\n
+        ++_readBufferOffset;
+        TRI_ASSERT(_readBufferOffset <= _readBuffer.length());
+
+        ptr++;
+        remain--;
+      }
+
+      // handle chunks
+      if (_result->isChunked()) {
+        _state = IN_READ_CHUNKED_HEADER;
+        processChunkedHeader();
+        return;
+      }
+
+      else if (_result->getHttpReturnCode() == 204 &&
+               _result->hasContentLength() &&
+               _result->getContentLength() != 0) {
+        _result->setResultType(SimpleHttpResult::ResultType::COMPLETE);
+        _state = FINISHED;
+        // always disconnect - some servers include a response body
+        _connection->disconnect();
+        return;
+      }
+
+      // no content-length header in response
+      else if (!_result->hasContentLength()) {
+        _state = IN_READ_BODY;
+        processBody();
+        return;
+      }
+
+      // no body
+      else if (_result->hasContentLength() &&
+               _result->getContentLength() == 0) {
+        _result->setResultType(SimpleHttpResult::ResultType::COMPLETE);
+        _state = FINISHED;
+
+        if (!_params._keepAlive) {
+          _connection->disconnect();
+        }
+        return;
+      }
+
+      // found content-length header in response
+      else if (_result->hasContentLength() && _result->getContentLength() > 0) {
+        if (_result->getContentLength() > _params._maxPacketSize) {
+          std::string errorMessage(
+              "ignoring HTTP response with 'Content-Length' bigger than max "
+              "packet size (");
+          errorMessage += std::to_string(_result->getContentLength()) + " > " +
+                          std::to_string(_params._maxPacketSize) + ")";
+          setErrorMessage(errorMessage, true);
+
+          // reset connection
+          this->close();
+          _state = DEAD;
+
+          return;
+        }
+
+        _state = IN_READ_BODY;
+        processBody();
+        return;
+      } else {
+        TRI_ASSERT(false);
+      }
+
+      break;
+    }
+
+    // we have found more header fields
+    else {
+      size_t len = pos - ptr;
+      _result->addHeaderField(ptr, len);
+
+      if (*pos == '\r') {
+        // adjust length if line ended with \r\n
+        // (header was already added so no harm is done)
+        ++len;
+      }
+
+      // account for \n
+      ptr += len + 1;
+      _readBufferOffset += len + 1;
+      TRI_ASSERT(_readBufferOffset <= _readBuffer.length());
+
+      remain -= (len + 1);
+
+      TRI_ASSERT(_readBufferOffset <= _readBuffer.length());
+      TRI_ASSERT(ptr == _readBuffer.c_str() + _readBufferOffset);
+      TRI_ASSERT(remain == _readBuffer.length() - _readBufferOffset);
+      pos = static_cast<char const*>(memchr(ptr, '\n', remain));
+    }
+  }
+}
+
+void SimpleHttpClient::processBody() {
+  // HEAD requests may be responded to without a body...
+  if (_method == rest::RequestType::HEAD) {
+    _result->setResultType(SimpleHttpResult::ResultType::COMPLETE);
+    _state = FINISHED;
+
+    if (!_params._keepAlive) {
+      _connection->disconnect();
+    }
+
+    return;
+  }
+
+  // we need to wait for a close, if content length is unknown
+  if (!_result->hasContentLength()) {
+    return;
+  }
+
+  // we need to wait for more data
+  if (_readBuffer.length() - _readBufferOffset < _result->getContentLength()) {
+    return;
+  }
+
+  // body is compressed using deflate. inflate it
+  if (_result->getEncodingType() == rest::EncodingType::DEFLATE) {
+    _readBuffer.zlibInflate(_result->getBody(), _readBufferOffset);
+  } else if (_result->getEncodingType() == rest::EncodingType::GZIP) {
+    _readBuffer.gzipUncompress(_result->getBody(), _readBufferOffset);
+  } else if (_result->getEncodingType() == rest::EncodingType::LZ4) {
+    _readBuffer.lz4Uncompress(_result->getBody(), _readBufferOffset);
+  } else {
+    // body is not compressed
+    // Note that if we are here, then
+    // _result->getContentLength() <= _readBuffer.length()-_readBufferOffset
+    _result->getBody().appendText(_readBuffer.c_str() + _readBufferOffset,
+                                  _result->getContentLength());
+  }
+  _result->getBody().ensureNullTerminated();
+
+  _readBufferOffset += _result->getContentLength();
+  TRI_ASSERT(_readBufferOffset <= _readBuffer.length());
+
+  _result->setResultType(SimpleHttpResult::ResultType::COMPLETE);
+  _state = FINISHED;
+
+  if (!_params._keepAlive) {
+    _connection->disconnect();
+  }
+}
+
+void SimpleHttpClient::processChunkedHeader() {
+  size_t remain = _readBuffer.length() - _readBufferOffset;
+  char const* ptr = _readBuffer.c_str() + _readBufferOffset;
+  char const* pos = static_cast<char const*>(memchr(ptr, '\n', remain));
+
+  // not yet finished, newline is missing
+  if (pos == nullptr) {
+    return;
+  }
+
+  // adjust eol position
+  if (pos > ptr && *(pos - 1) == '\r') {
+    --pos;
+  }
+
+  size_t len = pos - (_readBuffer.c_str() + _readBufferOffset);
+  std::string line(_readBuffer.c_str() + _readBufferOffset, len);
+  StringUtils::trimInPlace(line);
+
+  _readBufferOffset += (len + 1);
+
+  // adjust offset if line ended with \r\n
+  if (*pos == '\r') {
+    ++_readBufferOffset;
+    TRI_ASSERT(_readBufferOffset <= _readBuffer.length());
+  }
+
+  // empty lines are an error
+  if (line.empty() || line[0] == '\r') {
+    setErrorMessage("found invalid Content-Length", true);
+    // reset connection
+    this->close();
+    _state = DEAD;
+
+    return;
+  }
+
+  uint32_t contentLength;
+
+  try {
+    contentLength = static_cast<uint32_t>(std::stol(line, nullptr, 16));
+  } catch (...) {
+    setErrorMessage("found invalid Content-Length", true);
+    // reset connection
+    this->close();
+    _state = DEAD;
+
+    return;
+  }
+
+  // failed: too many bytes
+  if (contentLength > _params._maxPacketSize) {
+    std::string errorMessage = absl::StrCat(
+        "ignoring HTTP response with 'Content-Length' bigger than max packet "
+        "size (",
+        contentLength, " > ", _params._maxPacketSize, ")");
+    setErrorMessage(errorMessage, true);
+    // reset connection
+    this->close();
+    _state = DEAD;
+
+    return;
+  }
+
+  _state = IN_READ_CHUNKED_BODY;
+  _nextChunkedSize = contentLength;
+
+  processChunkedBody();
+}
+
+void SimpleHttpClient::processChunkedBody() {
+  // HEAD requests may be responded to without a body...
+  if (_method == rest::RequestType::HEAD) {
+    _result->setResultType(SimpleHttpResult::ResultType::COMPLETE);
+    _state = FINISHED;
+
+    if (!_params._keepAlive) {
+      _connection->disconnect();
+    }
+
+    return;
+  }
+
+  if (_readBuffer.length() - _readBufferOffset >= _nextChunkedSize + 2) {
+    // last chunk length was 0, therefore we are finished
+    if (_nextChunkedSize == 0) {
+      _result->setResultType(SimpleHttpResult::ResultType::COMPLETE);
+
+      _state = FINISHED;
+
+      if (!_params._keepAlive) {
+        _connection->disconnect();
+      }
+
+      return;
+    }
+
+    if (_result->getEncodingType() == rest::EncodingType::DEFLATE) {
+      _readBuffer.zlibInflate(_result->getBody(), _readBufferOffset);
+    } else if (_result->getEncodingType() == rest::EncodingType::GZIP) {
+      _readBuffer.gzipUncompress(_result->getBody(), _readBufferOffset);
+    } else if (_result->getEncodingType() == rest::EncodingType::LZ4) {
+      _readBuffer.lz4Uncompress(_result->getBody(), _readBufferOffset);
+    } else {
+      _result->getBody().appendText(_readBuffer.c_str() + _readBufferOffset,
+                                    static_cast<size_t>(_nextChunkedSize));
+    }
+    _result->getBody().ensureNullTerminated();
+
+    _readBufferOffset += (size_t)_nextChunkedSize + 2;
+
+    _state = IN_READ_CHUNKED_HEADER;
+    processChunkedHeader();
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief extract an error message from a response
+////////////////////////////////////////////////////////////////////////////////
+
+std::string SimpleHttpClient::getHttpErrorMessage(
+    SimpleHttpResult const* result, ErrorCode* errorCode) {
+  if (errorCode != nullptr) {
+    *errorCode = TRI_ERROR_NO_ERROR;
+  }
+
+  arangodb::basics::StringBuffer const& body = result->getBody();
+  std::string details;
+
+  try {
+    std::shared_ptr<VPackBuilder> builder =
+        VPackParser::fromJson(body.c_str(), body.length());
+
+    VPackSlice slice = builder->slice();
+    if (slice.isObject()) {
+      VPackSlice msg = slice.get(StaticStrings::ErrorMessage);
+      int errorNum = slice.get(StaticStrings::ErrorNum).getNumericValue<int>();
+
+      if (msg.isString() && msg.getStringLength() > 0 && errorNum > 0) {
+        if (errorCode != nullptr) {
+          *errorCode = ErrorCode{errorNum};
+        }
+        details =
+            absl::StrCat(": ArangoError ", errorNum, ": ", msg.stringView());
+      }
+    }
+  } catch (...) {
+    // don't rethrow here. we'll respond with an error message anyway
+  }
+
+  return absl::StrCat("got error from server: HTTP ",
+                      result->getHttpReturnCode(), " (",
+                      result->getHttpReturnMessage(), ")", details);
+}
+
+void SimpleHttpClient::setErrorMessage(std::string_view message,
+                                       ErrorCode error) {
+  if (error != TRI_ERROR_NO_ERROR) {
+    _errorMessage = absl::StrCat(message, ": ", TRI_errno_string(error));
+  } else {
+    setErrorMessage(message);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief fetch the version from the server
+////////////////////////////////////////////////////////////////////////////////
+
+std::string SimpleHttpClient::getServerVersion(ErrorCode* errorCode) {
+  if (errorCode != nullptr) {
+    *errorCode = TRI_ERROR_INTERNAL;
+  }
+
+  std::unique_ptr<SimpleHttpResult> response(
+      request(rest::RequestType::GET, "/_api/version", nullptr, 0));
+
+  if (response == nullptr || !response->isComplete()) {
+    return "";
+  }
+
+  if (response->getHttpReturnCode() ==
+      static_cast<int>(rest::ResponseCode::OK)) {
+    // default value
+    std::string version = "arango";
+
+    try {
+      std::shared_ptr<VPackBuilder> builder = response->getBodyVelocyPack();
+
+      VPackSlice slice = builder->slice();
+      if (slice.isObject()) {
+        if (auto server = slice.get("server");
+            server.isString() && server.stringView() == "arango") {
+          // "server" value is a string and its content is "arango"
+          VPackSlice v = slice.get("version");
+          if (v.isString()) {
+            version = v.copyString();
+          }
+        }
+      }
+
+      if (errorCode != nullptr) {
+        *errorCode = TRI_ERROR_NO_ERROR;
+      }
+      return version;
+    } catch (std::exception const& ex) {
+      setErrorMessage(ex.what(), false);
+      return "";
+    } catch (...) {
+      setErrorMessage("Unable to parse server response", false);
+      return "";
+    }
+  }
+
+  if (response->wasHttpError()) {
+    std::string msg = getHttpErrorMessage(response.get(), errorCode);
+    setErrorMessage(msg, false);
+  }
+  _connection->disconnect();
+
+  return "";
+}
+}  // namespace arangodb::httpclient

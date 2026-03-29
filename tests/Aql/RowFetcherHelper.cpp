@@ -1,0 +1,114 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Tobias Goedderz
+/// @author Michael Hackstein
+/// @author Heiko Kernbach
+/// @author Jan Christoph Uhde
+////////////////////////////////////////////////////////////////////////////////
+
+#include "RowFetcherHelper.h"
+
+#include "Aql/AqlItemBlock.h"
+#include "Aql/Executor/FilterExecutor.h"
+#include "Aql/Executor/SortExecutor.h"
+#include "Aql/InputAqlItemRow.h"
+#include "Aql/SingleRowFetcher.h"
+#include "Basics/VelocyPackHelper.h"
+
+#include <velocypack/Buffer.h>
+#include <velocypack/Iterator.h>
+#include <velocypack/Slice.h>
+
+using namespace darbotdb;
+using namespace darbotdb::tests;
+using namespace darbotdb::tests::aql;
+using namespace darbotdb::aql;
+
+namespace {}  // namespace
+
+// -----------------------------------------
+// - SECTION SINGLEROWFETCHER              -
+// -----------------------------------------
+
+template<::darbotdb::aql::BlockPassthrough passBlocksThrough>
+SingleRowFetcherHelper<passBlocksThrough>::SingleRowFetcherHelper(
+    AqlItemBlockManager& manager,
+    std::shared_ptr<VPackBuffer<uint8_t>> const& vPackBuffer,
+    bool returnsWaiting)
+    : SingleRowFetcherHelper(manager, 1, returnsWaiting,
+                             vPackBufferToAqlItemBlock(manager, vPackBuffer)) {}
+
+template<::darbotdb::aql::BlockPassthrough passBlocksThrough>
+SingleRowFetcherHelper<passBlocksThrough>::SingleRowFetcherHelper(
+    ::darbotdb::aql::AqlItemBlockManager& manager, size_t const blockSize,
+    bool const returnsWaiting, ::darbotdb::aql::SharedAqlItemBlockPtr input)
+    : SingleRowFetcher<passBlocksThrough>(),
+      _returnsWaiting(returnsWaiting),
+      _nrItems(input == nullptr ? 0 : input->numRows()),
+      _blockSize(blockSize),
+      _itemBlockManager(manager),
+      _itemBlock(std::move(input)),
+      _lastReturnedRow{CreateInvalidInputRowHint{}} {
+  TRI_ASSERT(_blockSize > 0);
+}
+
+template<::darbotdb::aql::BlockPassthrough passBlocksThrough>
+SingleRowFetcherHelper<passBlocksThrough>::~SingleRowFetcherHelper() = default;
+
+// -----------------------------------------
+// - SECTION CONSTFETCHER              -
+// -----------------------------------------
+
+ConstFetcherHelper::ConstFetcherHelper(
+    AqlItemBlockManager& itemBlockManager,
+    std::shared_ptr<VPackBuffer<uint8_t>> vPackBuffer)
+    : ConstFetcher(), _vPackBuffer(std::move(vPackBuffer)) {
+  if (_vPackBuffer != nullptr) {
+    _data = VPackSlice(_vPackBuffer->data());
+  } else {
+    _data = VPackSlice::nullSlice();
+  }
+  if (_data.isArray()) {
+    auto nrItems = _data.length();
+    if (nrItems > 0) {
+      VPackSlice oneRow = _data.at(0);
+      TRI_ASSERT(oneRow.isArray());
+      darbotdb::aql::RegisterCount nrRegs =
+          static_cast<darbotdb::aql::RegisterCount>(oneRow.length());
+      auto inputRegisters = std::make_shared<std::unordered_set<RegisterId>>();
+      for (RegisterId::value_t i = 0; i < nrRegs; i++) {
+        inputRegisters->emplace(i);
+      }
+      SharedAqlItemBlockPtr block{
+          itemBlockManager.requestBlock(nrItems, nrRegs)};
+      VPackToAqlItemBlock(_data, nrRegs, *block);
+      SkipResult skipRes{};
+      this->injectBlock(block, skipRes);
+    }
+  }
+};
+
+ConstFetcherHelper::~ConstFetcherHelper() = default;
+
+template class ::darbotdb::tests::aql::SingleRowFetcherHelper<
+    ::darbotdb::aql::BlockPassthrough::Disable>;
+template class ::darbotdb::tests::aql::SingleRowFetcherHelper<
+    ::darbotdb::aql::BlockPassthrough::Enable>;

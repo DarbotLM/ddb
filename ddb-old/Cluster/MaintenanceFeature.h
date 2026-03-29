@@ -1,0 +1,632 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Kaveh Vahedipour
+/// @author Matthew Von-Maszewski
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include "Basics/ConditionVariable.h"
+#include "Basics/Result.h"
+#include "Cluster/Action.h"
+#include "Cluster/MaintenanceWorker.h"
+#include "Cluster/Utils/ShardID.h"
+#include "ProgramOptions/ProgramOptions.h"
+#include "RestServer/arangod.h"
+
+#include "Metrics/Fwd.h"
+
+#include <map>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <shared_mutex>
+
+namespace arangodb {
+class LogicalCollection;
+namespace maintenance {
+enum ActionState;
+
+// The following is used in multiple Maintenance actions and therefore
+// made available here.
+arangodb::Result collectionCount(arangodb::LogicalCollection const& collection,
+                                 uint64_t& c);
+
+}  // namespace maintenance
+
+template<typename T>
+struct SharedPtrComparer {
+  bool operator()(std::shared_ptr<T> const& a, std::shared_ptr<T> const& b) {
+    if (a == nullptr || b == nullptr) {
+      return false;
+    }
+    return *a < *b;
+  }
+};
+
+class MaintenanceFeature : public ArangodFeature {
+ public:
+  static constexpr std::string_view name() noexcept { return "Maintenance"; }
+
+  explicit MaintenanceFeature(Server& server);
+
+  virtual ~MaintenanceFeature();
+
+  struct errors_t {
+    std::map<std::string,
+             std::map<std::string, std::shared_ptr<VPackBuffer<uint8_t>>>>
+        indexes;
+
+    // dbname/collection/shardid -> error
+    std::unordered_map<std::string, std::shared_ptr<VPackBuffer<uint8_t>>>
+        shards;
+
+    // dbname -> error
+    std::unordered_map<std::string, std::shared_ptr<VPackBuffer<uint8_t>>>
+        databases;
+  };
+
+  typedef std::map<ShardID, std::shared_ptr<maintenance::ActionDescription>>
+      ShardActionMap;
+
+  /// @brief Lowest limit for worker threads
+  static constexpr uint32_t const minThreadLimit = 3;
+
+  /// @brief Highest limit for worker threads
+  static constexpr uint32_t const maxThreadLimit = 64;
+
+  void collectOptions(std::shared_ptr<options::ProgramOptions>) override;
+  void validateOptions(std::shared_ptr<options::ProgramOptions>) override;
+  void prepare() override;
+
+  // @brief #databases last time we checked allDatabases
+  size_t lastNumberOfDatabases() const;
+
+  // Is maintenance paused?
+  bool isPaused() const;
+
+  // Pause maintenance for
+  void pause(std::chrono::seconds const& s = std::chrono::seconds(10));
+
+  // Proceed doing maintenance
+  void proceed();
+
+  // start the feature
+  virtual void start() override;
+
+  // notify the feature about a shutdown request
+  virtual void beginShutdown() override;
+
+  // stop the feature
+  void stop() final;
+
+  void initializeMetrics();
+  //
+  // api features
+  //
+
+  /// @brief This is the  API for creating an Action and executing it.
+  ///  Execution is asynchronous via thread pool. not yet:
+  ///  ActionDescription parameter will be MOVED to new object.
+  virtual Result addAction(
+      std::shared_ptr<maintenance::ActionDescription> const& description);
+
+  /// @brief This is the  API for creating an Action and executing it.
+  ///  Execution is asynchronous via thread pool. not yet:
+  ///  ActionDescription parameter will be MOVED to new object.
+  virtual Result addAction(std::shared_ptr<maintenance::Action> action);
+
+  /// returns whether or not the shard has an action of the specified type
+  /// (equivalent to NAME) that has the specified state
+  bool hasAction(maintenance::ActionState state, ShardID const& shardId,
+                 std::string const& type) const;
+
+  /// @brief Lock a shard for a certain action description. Returns `false` if
+  /// the shard is already locked and `true` otherwise. If the lock succeeds,
+  /// the action description is retained for later query.
+  bool lockShard(
+      ShardID const& shardId,
+      std::shared_ptr<maintenance::ActionDescription> const& description);
+
+  /// @brief Release shard lock. Returns `true` if the shard was locked and
+  /// `false` otherwise.
+  bool unlockShard(ShardID const& shardId) noexcept;
+
+  /// @brief Get shard locks, this copies the whole map of shard locks.
+  ShardActionMap getShardLocks() const;
+
+  /// @brief Count a SynchronizeShard actions in flight, returns `false`
+  /// if there are two many already, in which case the number is not
+  /// increased.
+  bool increaseNumberOfSyncShardActionsQueued() noexcept {
+    uint64_t n = _numberOfSyncShardActionsQueued.fetch_add(1);
+    return n <= _maximalNumberOfSyncShardActionsQueued;
+  }
+
+  void decreaseNumberOfSyncShardActionsQueued() noexcept {
+    _numberOfSyncShardActionsQueued.fetch_sub(1);
+  }
+
+  /// @brief check if a database is dirty
+  bool isDirty(std::string const& dbName) const;
+
+  /// @brief Requeue an action with a new priority. This will clone the
+  /// action to create a new action object with a different priority.
+  /// It is only allowed to requeue actions which are in states
+  /// ActionState::COMPLETE or ActionState::FAILED!
+  Result requeueAction(std::shared_ptr<maintenance::Action>& action,
+                       int newPriority);
+
+ protected:
+  std::shared_ptr<maintenance::Action> createAction(
+      std::shared_ptr<maintenance::ActionDescription> const& description);
+
+  void registerAction(std::shared_ptr<maintenance::Action> action);
+
+  std::shared_ptr<maintenance::Action> createAndRegisterAction(
+      std::shared_ptr<maintenance::ActionDescription> const& description);
+
+ public:
+  /// @brief This API will attempt to fail an existing Action that is waiting
+  ///  or executing.  Will not fail Actions that have already succeeded or
+  ///  failed.
+  Result deleteAction(uint64_t id);
+
+  /// @brief Create a VPackBuilder object with snapshot of current action
+  /// registry
+  VPackBuilder toVelocyPack() const;
+
+  /// @brief Fill the envelope with snapshot of current action registry
+  void toVelocyPack(VPackBuilder& envelope) const;
+
+  /// @brief Returns json array of all MaintenanceActions within the deque
+  Result toJson(VPackBuilder& builder);
+
+  /// @brief Return pointer to next ready action, or nullptr
+  std::shared_ptr<maintenance::Action> findReadyAction(
+      int minimalPriorityAllowed,
+      std::unordered_set<std::string> const& options =
+          std::unordered_set<std::string>());
+
+  /// @brief Process specific ID for a new action
+  /// @returns uint64_t
+  uint64_t nextActionId() { return _nextActionId++; }
+
+  bool isShuttingDown() const { return (_isShuttingDown); }
+
+  /// @brief Return number of seconds to say "not done" to block retries too
+  /// soon
+  uint32_t getSecondsActionsBlock() const { return _secondsActionsBlock; }
+
+  /**
+   * @brief Find and return first found not-done action or nullptr
+   * @param desc Description of sought action
+   */
+  std::shared_ptr<maintenance::Action> findFirstNotDoneAction(
+      std::shared_ptr<maintenance::ActionDescription> const& desc);
+
+  /**
+   * @brief add index error to bucket
+   *        Errors are added by EnsureIndex
+   *
+   * @param  database     database
+   * @param  collection   collection
+   * @param  shard        shard
+   * @param  indexId      index' id
+   *
+   * @return success
+   */
+  arangodb::Result storeIndexError(std::string const& database,
+                                   std::string const& collection,
+                                   std::string const& shard,
+                                   std::string const& indexId,
+                                   std::shared_ptr<VPackBuffer<uint8_t>> error);
+
+  /**
+   * @brief remove 1+ errors from index error bucket
+   *        Errors are removed by phaseOne, as soon as indexes no longer in plan
+   *
+   * @param  database     database
+   * @param  collection   collection
+   * @param  shard        shard
+   * @param  indexId      index' id
+   *
+   * @return success
+   */
+  arangodb::Result removeIndexErrors(
+      std::string const& database, std::string const& collection,
+      std::string const& shard,
+      std::unordered_set<std::string> const& indexIds);
+  arangodb::Result removeIndexErrors(
+      std::string const& path, std::unordered_set<std::string> const& indexIds);
+
+  /**
+   * @brief add shard error to bucket
+   *        Errors are added by CreateCollection, UpdateCollection
+   *
+   * @param  database     database
+   * @param  collection   collection
+   * @param  shard        shard
+   *
+   * @return success
+   */
+  arangodb::Result storeShardError(std::string const& database,
+                                   std::string const& collection,
+                                   std::string const& shard,
+                                   std::shared_ptr<VPackBuffer<uint8_t>> error);
+
+  arangodb::Result storeShardError(std::string const& database,
+                                   std::string const& collection,
+                                   std::string const& shard,
+                                   std::string const& serverId,
+                                   arangodb::Result const& failure);
+
+  /**
+   * @brief get all pending shard errors
+   *
+   * @param  database     database
+   * @param  collection   collection
+   * @param  shard        shard
+   *
+   * @return success
+   */
+  arangodb::Result shardError(
+      std::string const& database, std::string const& collection,
+      std::string const& shard,
+      std::shared_ptr<VPackBuffer<uint8_t>>& error) const;
+
+  /**
+   * @brief remove error from shard bucket
+   *        Errors are removed by phaseOne, as soon as indexes no longer in plan
+   *
+   * @param  database     database
+   * @param  collection   collection
+   * @param  shard        shard
+   *
+   * @return success
+   */
+  arangodb::Result removeShardError(std::string const& database,
+                                    std::string const& collection,
+                                    std::string const& shard);
+  arangodb::Result removeShardError(std::string const& key);
+
+  /**
+   * @brief add shard error to bucket
+   *        Errors are added by CreateCollection, UpdateCollection
+   *
+   * @param  database     database
+   *
+   * @return success
+   */
+  arangodb::Result storeDBError(std::string const& database,
+                                std::shared_ptr<VPackBuffer<uint8_t>> error);
+
+  arangodb::Result storeDBError(std::string const& database,
+                                Result const& failure);
+
+  /**
+   * @brief get all pending shard errors
+   *
+   * @param  database     database
+   *
+   * @return success
+   */
+  arangodb::Result dbError(std::string const& database,
+                           std::shared_ptr<VPackBuffer<uint8_t>>& error) const;
+
+  /**
+   * @brief remove an error from db error bucket
+   *        Errors are removed by phaseOne, as soon as indexes no longer in plan
+   *
+   * @param  database     database
+   *
+   * @return success
+   */
+  arangodb::Result removeDBError(std::string const& database);
+
+  /// @brief remove all replication errors for a particular database
+  void removeReplicationError(std::string const& database);
+
+  /// @brief remove all replication errors for a particular shard.
+  /// this will be called after a successful SynchronizeShard job for the shard
+  void removeReplicationError(std::string const& database,
+                              std::string const& shard);
+
+  /// @brief store a replication error for a particular shard.
+  /// this will be called after a failed SynchronizeShard job for the shard
+  void storeReplicationError(std::string const& database,
+                             std::string const& shard);
+
+  /// @brief return the number of replication errors for a particular shard.
+  /// note: we will return only those errors which happened not longer than
+  /// maxReplicationErrorsPerShardAge  ago
+  size_t replicationErrors(std::string const& database,
+                           std::string const& shard) const;
+
+  /// @brief increase the metric that counts timed-out shard synchronization
+  /// attempts
+  void countTimedOutSyncAttempt();
+
+  /**
+   * @brief copy all error maps (shards, indexes and databases) for Maintenance
+   *
+   * @param  errors  errors struct into which all maintenance feature error are
+   * copied
+   * @return         success
+   */
+  arangodb::Result copyAllErrors(errors_t& errors) const;
+
+  /**
+   * @brief get volatile shard version
+   */
+  uint64_t shardVersion(std::string const& shardId) const;
+
+  /**
+   * @brief increment volatile local shard version
+   */
+  uint64_t incShardVersion(std::string const& shardId);
+
+  /**
+   * @brief clean up after shard has been dropped locally
+   * @param  shard  Shard name
+   */
+  void delShardVersion(std::string const& shardId);
+
+  /**
+   * @brief mark and list dirty databases
+   */
+  void addDirty(std::string const& database);
+  void addDirty(containers::FlatHashSet<std::string> const& databases,
+                bool callNotify);
+  containers::FlatHashSet<std::string> dirty(
+      containers::FlatHashSet<std::string> const& = {});
+  /// @brief get n random db names
+  containers::FlatHashSet<std::string> pickRandomDirty(size_t n);
+
+  /// @brief maximum number of replication error occurrences that are kept per
+  /// shard.
+  static constexpr size_t maxReplicationErrorsPerShard = 20;
+
+  /// @brief maximum number of replication error occurrences that are tolerated
+  /// before an auto-repair is attempted
+  static constexpr size_t maxReplicationErrorsPerShardBeforeAutoRepair =
+      maxReplicationErrorsPerShard - 3;
+
+  static_assert(maxReplicationErrorsPerShard >
+                maxReplicationErrorsPerShardBeforeAutoRepair);
+
+  /// @brief maximum age of replication error occurrences that are kept per
+  /// shard. error occurrences older than this max age will be removed only
+  /// lazily and will not be considered when counting the number of errors.
+  static constexpr auto maxReplicationErrorsPerShardAge =
+      std::chrono::hours(24);
+
+ private:
+  /// @brief Search for first action matching hash and predicate
+  /// @return shared pointer to action object if exists, empty shared_ptr if not
+  std::shared_ptr<maintenance::Action> findFirstActionHash(
+      size_t hash,
+      std::function<bool(std::shared_ptr<maintenance::Action> const&)> const&
+          predicate);
+
+  /// @brief Search for first action matching hash and predicate (with lock
+  /// already held by caller)
+  /// @return shared pointer to action object if exists, empty shared_ptr if not
+  std::shared_ptr<maintenance::Action> findFirstActionHashNoLock(
+      size_t hash,
+      std::function<bool(std::shared_ptr<maintenance::Action> const&)> const&
+          predicate);
+
+  /// @brief Search for action by Id
+  /// @return shared pointer to action object if exists, nullptr if not
+  std::shared_ptr<maintenance::Action> findActionId(uint64_t id);
+
+  /// @brief Search for action by Id (but lock already held by caller)
+  /// @return shared pointer to action object if exists, nullptr if not
+  std::shared_ptr<maintenance::Action> findActionIdNoLock(uint64_t hash);
+
+  /// @brief collect all database names
+  std::unordered_set<std::string> allDatabases() const;
+
+  /// @brief refill local database list for future random checking
+  void refillToCheck();
+
+ protected:
+  ClusterFeature* _clusterFeature;
+
+  /// @brief option for forcing this feature to always be enable - used by the
+  /// catch tests
+  bool _forceActivation;
+
+  bool _resignLeadershipOnShutdown;
+
+  /// @brief detect fresh start
+  bool _firstRun;
+
+  /// @brief tunable option for thread pool size
+  uint32_t _maintenanceThreadsMax;
+
+  /// @brief tunable option for number of slow threads
+  uint32_t _maintenanceThreadsSlowMax;
+
+  /// @brief tunable option for number of seconds COMPLETE or FAILED actions
+  /// block
+  ///  duplicates from adding to _actionRegistry
+  int32_t _secondsActionsBlock;
+
+  /// @brief tunable option for number of seconds COMPLETE and FAILED actions
+  /// remain
+  ///  within _actionRegistry
+  int32_t _secondsActionsLinger;
+
+  /// @brief flag to indicate when it is time to stop thread pool
+  std::atomic<bool> _isShuttingDown;
+
+  /// @brief simple counter for creating MaintenanceAction id. Ok for it to roll
+  /// over.
+  std::atomic<uint64_t> _nextActionId;
+
+  //
+  // Lock notes:
+  //  Reading _actionRegistry requires Read or Write lock via
+  //  _actionRegistryLock Writing _actionRegistry requires BOTH:
+  //    - CONDITION_LOCKER on _actionRegistryCond
+  //    - then write lock via _actionRegistryLock
+  //
+  /// @brief all actions executing, waiting, and done
+  std::deque<std::shared_ptr<maintenance::Action>> _actionRegistry;
+
+  // The following is protected with the _actionRegistryLock exactly as
+  // the _actionRegistry. This priority queue is used to find the highest
+  // priority action that is ready. Therefore, _prioQueue contains all the
+  // actions in state READY. The sorting is done such that all fast track
+  // actions come before all non-fast track actions. Therefore, a fast track
+  // thread can just look at the top action and if this is not fast track,
+  // it does not have to pop anything. If a worker picks an action and starts
+  // work on it, the action leaves state READY and is popped from the priority
+  // queue.
+  // We also need to be able to delete actions which are READY. In that case
+  // we need to leave the action in _prioQueue (since we cannot remove anything
+  // but the top from it), and simply put it into a different state.
+  std::priority_queue<std::shared_ptr<maintenance::Action>,
+                      std::vector<std::shared_ptr<maintenance::Action>>,
+                      SharedPtrComparer<maintenance::Action>>
+      _prioQueue;
+
+  /// @brief lock to protect _actionRegistry and state changes to
+  /// MaintenanceActions within
+  mutable std::shared_mutex _actionRegistryLock;
+
+  /// @brief condition variable to motivate workers to find new action
+  arangodb::basics::ConditionVariable _actionRegistryCond;
+
+  /// @brief condition variable to indicate thread completion
+  arangodb::basics::ConditionVariable _workerCompletion;
+
+  /// @brief list of background workers
+  std::vector<std::unique_ptr<maintenance::MaintenanceWorker>> _activeWorkers;
+
+  /// Errors are managed through raiseIndexError / removeIndexError and
+  /// raiseShardError / renoveShardError. According locks must be held in said
+  /// methods.
+
+  /// @brief lock for index error bucket
+  mutable std::mutex _ieLock;
+  /// @brief pending errors raised by EnsureIndex
+  std::map<std::string,
+           std::map<std::string, std::shared_ptr<VPackBuffer<uint8_t>>>>
+      _indexErrors;
+
+  /// @brief lock for shard error bucket
+  mutable std::mutex _seLock;
+  /// @brief pending errors raised by CreateCollection/UpdateCollection
+  std::unordered_map<std::string, std::shared_ptr<VPackBuffer<uint8_t>>>
+      _shardErrors;
+
+  /// @brief lock for database error bucket
+  mutable std::mutex _dbeLock;
+  /// @brief pending errors raised by CreateDatabase
+  std::unordered_map<std::string, std::shared_ptr<VPackBuffer<uint8_t>>>
+      _dbErrors;
+
+  /// @brief lock for shard version map
+  mutable std::mutex _versionLock;
+  /// @brief shards have versions in order to be able to distinguish between
+  /// independant actions
+  std::unordered_map<std::string, size_t> _shardVersion;
+
+  /// @brief lock for replication error bucket
+  mutable std::mutex _replLock;
+  /// @brief shard replication errors { database => { shard => [ timestamps ] }
+  /// } we store up to  maxReplicationErrorsPerShard  errors per shard. all
+  /// errors for a shard will be cleared after a successful SynchronizeShard job
+  std::unordered_map<
+      std::string,
+      std::unordered_map<std::string,
+                         std::vector<std::chrono::steady_clock::time_point>>>
+      _replErrors;
+
+  std::atomic<std::chrono::steady_clock::duration> _pauseUntil;
+
+  /// @brief shard action map, this map holds information which job (can only
+  /// be one) is currently scheduled or executing for a given shard name. An
+  /// entry is added whenever an ActionDescription is created in Maintenance
+  /// and is removed, when the action for the shard is finished. The main
+  /// Maintenance loop with phaseOne and phaseTwo creates a copy of this map
+  /// before it does getLocalCollections and then avoids pondering over any
+  /// shard which has an entry in the map. In this way, shard deliberations as
+  /// well as shard actions are serialized and only one is happening at a time.
+  ShardActionMap _shardActionMap;
+
+  /// @brief mutex protecting _shardActionMap
+  mutable std::mutex _shardActionMapMutex;
+
+  std::vector<std::string> _databasesToCheck;
+  size_t _lastNumberOfDatabases;
+
+  // Here we count how many SynchronizeShard actions are either queued
+  // or currently executing. We use this number to avoid scheduling too
+  // many of them, since each one of then holds the shard lock and prevents
+  // other - potentially higher priority actions - from being scheduled.
+  // This is in particular important for TakeoverShardLeadership actions,
+  // which can become necessary when a dbserver should be come a leader but
+  // still has a SynchronizeShard action queued from its previous life as
+  // a shard follower for the shard.
+  std::atomic<uint64_t> _numberOfSyncShardActionsQueued = 0;
+  uint64_t _maximalNumberOfSyncShardActionsQueued = 32;
+
+ public:
+  metrics::Histogram<metrics::LogScale<uint64_t>>* _phase1_runtime_msec =
+      nullptr;
+  metrics::Histogram<metrics::LogScale<uint64_t>>* _phase2_runtime_msec =
+      nullptr;
+  metrics::Histogram<metrics::LogScale<uint64_t>>*
+      _agency_sync_total_runtime_msec = nullptr;
+
+  metrics::Counter* _action_duplicated_counter = nullptr;
+  metrics::Counter* _action_registered_counter = nullptr;
+  metrics::Counter* _action_done_counter = nullptr;
+
+  struct ActionMetrics {
+    metrics::Histogram<metrics::LogScale<uint64_t>>& _runtime_histogram;
+    metrics::Histogram<metrics::LogScale<uint64_t>>& _queue_time_histogram;
+    metrics::Counter& _failure_counter;
+
+    ActionMetrics(metrics::Histogram<metrics::LogScale<uint64_t>>& a,
+                  metrics::Histogram<metrics::LogScale<uint64_t>>& b,
+                  metrics::Counter& c)
+        : _runtime_histogram(a),
+          _queue_time_histogram(b),
+          _failure_counter(c) {}
+  };
+
+  std::unordered_map<std::string, ActionMetrics> _maintenance_job_metrics_map;
+  metrics::Histogram<metrics::LogScale<uint64_t>>*
+      _maintenance_action_runtime_msec = nullptr;
+
+  metrics::Gauge<uint64_t>* _shards_out_of_sync = nullptr;
+  metrics::Gauge<uint64_t>* _shards_total_count = nullptr;
+  metrics::Gauge<uint64_t>* _shards_leader_count = nullptr;
+  metrics::Gauge<uint64_t>* _shards_not_replicated_count = nullptr;
+  metrics::Counter* _sync_timeouts_total = nullptr;
+};
+
+}  // namespace arangodb

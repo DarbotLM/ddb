@@ -1,0 +1,83 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Jan Steemann
+////////////////////////////////////////////////////////////////////////////////
+
+#include "QueryExpressionContext.h"
+
+#include "Aql/AqlFunctionsInternalCache.h"
+#include "Aql/AqlValue.h"
+#include "Aql/QueryContext.h"
+#include "Transaction/Methods.h"
+
+using namespace darbotdb;
+using namespace darbotdb::aql;
+
+void QueryExpressionContext::registerWarning(ErrorCode errorCode,
+                                             std::string_view msg) {
+  _query.warnings().registerWarning(errorCode, msg);
+}
+
+void QueryExpressionContext::registerError(ErrorCode errorCode,
+                                           std::string_view msg) {
+  _query.warnings().registerError(errorCode, msg);
+}
+
+icu_64_64::RegexMatcher* QueryExpressionContext::buildRegexMatcher(
+    std::string_view expr, bool caseInsensitive) {
+  return _aqlFunctionsInternalCache.buildRegexMatcher(expr, caseInsensitive);
+}
+
+icu_64_64::RegexMatcher* QueryExpressionContext::buildLikeMatcher(
+    std::string_view expr, bool caseInsensitive) {
+  return _aqlFunctionsInternalCache.buildLikeMatcher(expr, caseInsensitive);
+}
+
+icu_64_64::RegexMatcher* QueryExpressionContext::buildSplitMatcher(
+    AqlValue splitExpression, velocypack::Options const* opts,
+    bool& isEmptyExpression) {
+  return _aqlFunctionsInternalCache.buildSplitMatcher(splitExpression, opts,
+                                                      isEmptyExpression);
+}
+
+darbotdb::ValidatorBase* QueryExpressionContext::buildValidator(
+    darbotdb::velocypack::Slice params) {
+  return _aqlFunctionsInternalCache.buildValidator(params);
+}
+
+TRI_vocbase_t& QueryExpressionContext::vocbase() const {
+  return _trx.vocbase();
+}
+
+transaction::Methods& QueryExpressionContext::trx() const { return _trx; }
+
+bool QueryExpressionContext::killed() const { return _query.killed(); }
+
+QueryContext& QueryExpressionContext::query() { return _query; }
+
+void QueryExpressionContext::setVariable(Variable const* variable,
+                                         darbotdb::velocypack::Slice value) {
+  _variables.emplace(variable, value);
+}
+
+void QueryExpressionContext::clearVariable(Variable const* variable) noexcept {
+  _variables.erase(variable);
+}

@@ -1,0 +1,84 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Simon Grätzer
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include "GeneralServer/AsioSocket.h"
+#include "GeneralServer/CommTask.h"
+
+namespace arangodb {
+class GeneralServerFeature;
+
+namespace rest {
+
+template<SocketType T>
+class GeneralCommTask : public CommTask {
+  GeneralCommTask(GeneralCommTask const&) = delete;
+  GeneralCommTask const& operator=(GeneralCommTask const&) = delete;
+
+ public:
+  GeneralCommTask(GeneralServer& server, ConnectionInfo,
+                  std::shared_ptr<AsioSocket<T>>);
+
+  virtual ~GeneralCommTask() = default;
+
+  void stop() override;
+
+  void close(asio_ns::error_code const& err = asio_ns::error_code());
+
+ protected:
+  /// read from socket
+  void asyncReadSome();
+
+  bool stopped() const { return _stopped.load(std::memory_order_acquire); }
+
+  /// called to process data in _readBuffer, return false to stop
+  virtual bool readCallback(asio_ns::error_code ec) = 0;
+
+  /// set / reset connection timeout
+  virtual void setIOTimeout() = 0;
+
+  /// default max chunksize is 30kb in arangodb (each read fits)
+  static constexpr size_t ReadBlockSize = 1024 * 32;
+  static constexpr double WriteTimeout = 300.0;
+
+  std::shared_ptr<AsioSocket<T>> _protocol;
+
+  bool _reading;
+  bool _writing;
+
+  void logRequestHeaders(
+      std::string_view protocol,
+      std::unordered_map<std::string, std::string> const& headers) const;
+  void logRequestBody(std::string_view protocol,
+                      arangodb::rest::ContentType contentType,
+                      std::string_view body, bool isResponse = false) const;
+  void logResponseHeaders(
+      std::string_view protocol,
+      std::unordered_map<std::string, std::string> const& headers) const;
+
+ private:
+  std::atomic<bool> _stopped;
+};
+}  // namespace rest
+}  // namespace arangodb

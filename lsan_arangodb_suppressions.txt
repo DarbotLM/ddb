@@ -1,0 +1,27 @@
+leak:create_conn
+leak:CRYPTO_zalloc
+# TODO(MBkkt) Should be removed when we update snowball
+leak:snowball
+
+# TODO(MBkkt) Should be fixed, but now we don't know how
+# Also it probably only last Buffer, so we don't really care
+# Direct leak of 80 byte(s) in 1 object(s) allocated from:
+#  0 in operator new(unsigned long)
+#  1 in V8Buffer::New(v8::FunctionCallbackInfo<v8::Value> const&) /work/darbotdb/lib/V8/v8-buffer.cpp:567
+#  2 in v8::internal::FunctionCallbackArguments::Call(v8::internal::CallHandlerInfo)
+# Indirect leak of 59 byte(s) in 1 object(s) allocated from:
+#  0 in operator new[](unsigned long)
+#  1 in V8Buffer::replace(v8::Isolate*, char*, unsigned long, void (*)(char*, void*), void*, bool) /work/darbotdb/lib/V8/v8-buffer.cpp:735
+#  2 in V8Buffer /work/darbotdb/lib/V8/v8-buffer.cpp:678
+#  3 in V8Buffer::New(v8::FunctionCallbackInfo<v8::Value> const&) /work/darbotdb/lib/V8/v8-buffer.cpp:567
+#  4 in v8::internal::FunctionCallbackArguments::Call(v8::internal::CallHandlerInfo) 
+# SUMMARY: AddressSanitizer: 139 byte(s) leaked in 2 allocation(s).
+leak:V8Buffer::New
+
+# This comes from LLVM implementation of OpenMP and should be safe
+# to ignore
+#Direct leak of 2539 byte(s) in 2 object(s) allocated from:
+#    #0 0x556858a6fe53 in malloc (/oskar/work/darbotdb/build/bin/arangod+0x6067e53) (BuildId: 235541cd7653419e9c549befe2ec954b061b34ce)
+#    #1 0x55686603afdb in ___kmp_allocate_align(unsigned long, unsigned long, char const*, int) /llvm-toolchain-19-19.1.7~++20250114103332+cd708029e0b2/openmp/runtime/src/kmp_alloc.cpp:1947:25
+leak:___kmp_allocate_align
+leak:__kmp_init_nesting_mode

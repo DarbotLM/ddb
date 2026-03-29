@@ -1,0 +1,58 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Kaveh Vahedipour
+/// @author Copyright 2017-2018, darbotdb GmbH, Cologne, Germany
+////////////////////////////////////////////////////////////////////////////////
+#pragma once
+
+#include "Metrics/CounterBuilder.h"
+#include "Metrics/GaugeBuilder.h"
+#include "Metrics/HistogramBuilder.h"
+#include "Metrics/LinScale.h"
+#include "Metrics/LogScale.h"
+#include "Metrics/MetricsFeature.h"
+
+struct HISTOGRAMLOGSCALE {
+  static darbotdb::metrics::LogScale<double> scale() {
+    return {10.0, 0, 1000.0, 8};
+  }
+};
+struct HISTOGRAMLINSCALE {
+  static darbotdb::metrics::LinScale<double> scale() { return {0., 1., 10}; }
+};
+struct COUNTER : darbotdb::metrics::CounterBuilder<COUNTER> {
+  COUNTER() { _name = "COUNTER", _help = "one counter"; }
+};
+struct HISTOGRAMLOG
+    : darbotdb::metrics::HistogramBuilder<HISTOGRAMLOG, HISTOGRAMLOGSCALE> {
+  HISTOGRAMLOG() {
+    _name = "HISTOGRAMLOG", _help = "one histogram with log scale";
+  }
+};
+struct HISTOGRAMLIN
+    : darbotdb::metrics::HistogramBuilder<HISTOGRAMLIN, HISTOGRAMLINSCALE> {
+  HISTOGRAMLIN() {
+    _name = "HISTOGRAMLIN", _help = "one histogram with lin scale";
+  }
+};
+struct GAUGE : darbotdb::metrics::GaugeBuilder<GAUGE, uint64_t> {
+  GAUGE() { _name = "GAUGE", _help = "one gauge"; }
+};

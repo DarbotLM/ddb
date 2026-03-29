@@ -1,0 +1,204 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Max Neunhoeffer
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include "Aql/ExecutionBlock.h"
+#include "Aql/ExecutionNode/ScatterNode.h"
+#include "Aql/ExecutionState.h"
+#include "Aql/RegisterInfos.h"
+#include "Basics/Result.h"
+
+#include <velocypack/Builder.h>
+
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace darbotdb {
+
+namespace transaction {
+class Methods;
+}
+
+namespace aql {
+class AqlItemBlock;
+struct Collection;
+class ExecutionEngine;
+class ExecutionNode;
+class SkipResult;
+
+class ClientsExecutorInfos {
+ public:
+  explicit ClientsExecutorInfos(std::vector<std::string> clientIds);
+
+  ClientsExecutorInfos(ClientsExecutorInfos&&) = default;
+  ClientsExecutorInfos(ClientsExecutorInfos const&) = delete;
+  ~ClientsExecutorInfos() = default;
+
+  auto nrClients() const noexcept -> size_t;
+  auto clientIds() const noexcept -> std::vector<std::string> const&;
+
+ private:
+  std::vector<std::string> const _clientIds;
+};
+
+class BlocksWithClients {
+ public:
+  virtual ~BlocksWithClients() = default;
+
+  /**
+   * @brief Execute for client.
+   *  Like execute, but bound to the dataset, that needs to be send to the given
+   * client ID
+   *
+   * @param stack The AqlCallStack
+   * @param clientId The requesting client Id.
+   * @return std::tuple<ExecutionState, size_t, SharedAqlItemBlockPtr>
+   */
+  virtual auto executeForClient(AqlCallStack stack, std::string const& clientId)
+      -> std::tuple<ExecutionState, SkipResult, SharedAqlItemBlockPtr> = 0;
+};
+
+/**
+ * @brief Implementation of an ExecutionBlock that has multiple clients
+ *        Data is distributed to those clients, it might be all (Scatter)
+ *        or a selected part of it (Distribute).
+ *        How data is distributed is defined by the template parameter.
+ *
+ * @tparam ClientBlockData needs to be able to hold the data to be distributed
+ *         to a single client.
+ *         It needs to implement the following methods:
+ *         canProduce(size_t limit) -> bool stating it has enough information to
+ * fill limit many rows (or more)
+ *
+ */
+
+template<class Executor>
+class BlocksWithClientsImpl : public ExecutionBlock, public BlocksWithClients {
+  using ExecutorInfos = typename Executor::Infos;
+
+ public:
+  BlocksWithClientsImpl(ExecutionEngine* engine, ExecutionNode const* ep,
+                        RegisterInfos registerInfos,
+                        typename Executor::Infos executorInfos);
+
+  ~BlocksWithClientsImpl() override = default;
+
+ public:
+  /// @brief initializeCursor
+  auto initializeCursor(InputAqlItemRow const& input)
+      -> std::pair<ExecutionState, Result> override;
+
+  /// @brief execute: shouldn't be used, use executeForClient
+  std::tuple<ExecutionState, SkipResult, SharedAqlItemBlockPtr> execute(
+      AqlCallStack const& stack) override;
+
+  /**
+   * @brief Execute for client.
+   *  Like execute, but bound to the dataset, that needs to be send to the given
+   * client ID
+   *
+   * @param stack The AqlCallStack
+   * @param clientId The requesting client Id.
+   * @return std::tuple<ExecutionState, size_t, SharedAqlItemBlockPtr>
+   */
+  auto executeForClient(AqlCallStack stack, std::string const& clientId)
+      -> std::tuple<ExecutionState, SkipResult, SharedAqlItemBlockPtr> override;
+
+#ifdef darbotdb_USE_GOOGLE_TESTS
+
+  /**
+   * @brief Get the number of rows remaining for a client
+   * TEST ONLY feature. This number should never be a concern for production
+   * code.
+   *
+   * @param clientId The client ID
+   * @return The number of rows remaining for the client
+   */
+  auto remainingRowsForClient(std::string const& clientId) const -> uint64_t;
+#endif
+
+ private:
+  /**
+   * @brief Actual implementation of Execute.
+   *
+   * @param stack The AqlCallStack
+   * @param clientId The requesting client Id.
+   * @return std::tuple<ExecutionState, size_t, SharedAqlItemBlockPtr>
+   */
+  auto executeWithoutTraceForClient(AqlCallStack stack,
+                                    std::string const& clientId)
+      -> std::tuple<ExecutionState, SkipResult, SharedAqlItemBlockPtr>;
+
+  /**
+   * @brief Send hardLimit to the dependency
+   *  This can only be called after all clients have requested a hardLimit.
+   *
+   * @param stack The AqlCallStack we need this for outside subqueries
+   * @return ExecutionState upstream state, can be WAITING or DONE
+   */
+  auto hardLimitDependency(AqlCallStack stack) -> ExecutionState;
+
+  /**
+   * @brief Load more data from upstream and distribute it into _clientBlockData
+   *
+   */
+  auto fetchMore(AqlCallStack stack) -> ExecutionState;
+
+  auto allLanesComplete() const noexcept -> bool;
+
+ protected:
+  /// @brief getClientId: get the number <clientId> (used internally)
+  /// corresponding to <shardId>
+  size_t getClientId(std::string const& shardId) const;
+
+  /// @brief _shardIdMap: map from shardIds to clientNrs
+  /// @deprecated
+  std::unordered_map<std::string, size_t> _shardIdMap;
+
+  /// @brief type of distribution that this nodes follows.
+  ScatterNode::ScatterType _type;
+
+ private:
+  RegisterInfos _registerInfos;
+
+  /**
+   * @brief This is the working party of this implementation
+   *        the template class needs to implement the logic
+   *        to produce a single row from the upstream information.
+   */
+  ExecutorInfos _executorInfos;
+
+  Executor _executor;
+
+  /// @brief A map of clientId to the data this client should receive.
+  ///        This map will be filled as the execution progresses.
+  std::unordered_map<std::string, typename Executor::ClientBlockData>
+      _clientBlockData;
+};
+
+}  // namespace aql
+}  // namespace darbotdb

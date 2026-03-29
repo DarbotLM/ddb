@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DDB Card Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 16px; background: #fafafa; color: #1a1a1a; }
+    .card { background: white; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px; max-width: 480px; }
+    .card-header { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+    .card-type { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; text-transform: uppercase; margin-bottom: 8px; }
+    .card-type.memory { background: #e8f5e9; color: #2e7d32; }
+    .card-type.task { background: #e3f2fd; color: #1565c0; }
+    .card-type.observation { background: #fff3e0; color: #e65100; }
+    .card-type.pattern { background: #f3e5f5; color: #7b1fa2; }
+    .card-type.index { background: #eceff1; color: #37474f; }
+    .facts { margin: 8px 0; }
+    .fact { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #f0f0f0; }
+    .fact-title { font-weight: 600; color: #555; }
+    .fact-value { color: #1a1a1a; }
+    .content { margin: 12px 0; line-height: 1.5; color: #333; }
+    .tags { display: flex; gap: 4px; flex-wrap: wrap; margin: 8px 0; }
+    .tag { background: #e8eaf6; color: #283593; padding: 2px 8px; border-radius: 12px; font-size: 12px; }
+    .actions { display: flex; gap: 8px; margin-top: 12px; }
+    .action-btn { padding: 6px 12px; border: 1px solid #1976d2; background: transparent; color: #1976d2; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    .action-btn:hover { background: #1976d2; color: white; }
+    .zone-badge { font-size: 12px; color: #666; margin-bottom: 8px; }
+    #loading { text-align: center; padding: 32px; color: #888; }
+  </style>
+</head>
+<body>
+  <div id="loading">Loading card data...</div>
+  <div id="card-container" style="display:none"></div>
+
+  <script type="module">
+    import { App } from "@modelcontextprotocol/ext-apps";
+
+    const app = new App({ name: "DDB Card Viewer", version: "0.1.0" });
+    app.connect();
+
+    function renderCard(data) {
+      const container = document.getElementById("card-container");
+      const loading = document.getElementById("loading");
+
+      let cardData;
+      try {
+        cardData = typeof data === "string" ? JSON.parse(data) : data;
+      } catch {
+        container.innerHTML = "<p>Error parsing card data</p>";
+        loading.style.display = "none";
+        container.style.display = "block";
+        return;
+      }
+
+      const ddb = cardData._ddb || {};
+      const body = cardData.body || [];
+      const actions = cardData.actions || [];
+
+      let html = '<div class="card">';
+
+      // Type badge
+      const cardType = ddb.card_type || "memory";
+      html += `<span class="card-type ${cardType}">${cardType}</span>`;
+
+      // Zone
+      if (ddb.zone) html += `<div class="zone-badge">Zone: ${ddb.zone}</div>`;
+
+      // Body elements
+      for (const el of body) {
+        if (el.type === "TextBlock" && el.weight === "Bolder") {
+          html += `<div class="card-header">${el.text}</div>`;
+        } else if (el.type === "TextBlock") {
+          html += `<div class="content">${el.text}</div>`;
+        } else if (el.type === "FactSet") {
+          html += '<div class="facts">';
+          for (const f of el.facts || []) {
+            html += `<div class="fact"><span class="fact-title">${f.title}</span><span class="fact-value">${f.value}</span></div>`;
+          }
+          html += '</div>';
+        }
+      }
+
+      // Tags
+      if (ddb.tags && ddb.tags.length) {
+        html += '<div class="tags">';
+        for (const t of ddb.tags) html += `<span class="tag">${t}</span>`;
+        html += '</div>';
+      }
+
+      // Actions
+      if (actions.length) {
+        html += '<div class="actions">';
+        for (const a of actions) {
+          html += `<button class="action-btn" data-verb="${a.verb || ''}" data-payload='${JSON.stringify(a.data || {})}'>${a.title}</button>`;
+        }
+        html += '</div>';
+      }
+
+      html += '</div>';
+      container.innerHTML = html;
+      loading.style.display = "none";
+      container.style.display = "block";
+
+      // Wire up action buttons
+      container.querySelectorAll(".action-btn").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const verb = btn.dataset.verb;
+          if (verb) {
+            const result = await app.callServerTool({
+              name: verb.replace("ddb.", "ddb-").replace(".", "-"),
+              arguments: JSON.parse(btn.dataset.payload || "{}"),
+            });
+            console.log("Action result:", result);
+          }
+        });
+      });
+    }
+
+    app.ontoolresult = (result) => {
+      const text = result.content?.find(c => c.type === "text")?.text;
+      if (text) renderCard(text);
+    };
+  </script>
+</body>
+</html>

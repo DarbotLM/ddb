@@ -1,0 +1,1490 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Andrey Abramov
+/// @author Vasiliy Nabatchikov
+////////////////////////////////////////////////////////////////////////////////
+
+#ifndef USE_V8
+#error this file is not supposed to be used in builds with -DUSE_V8=Off
+#endif
+
+#include "Mocks/Servers.h"  // this must be first because windows
+
+#include <v8.h>
+
+#include "gtest/gtest.h"
+
+#include "velocypack/Parser.h"
+
+#include "IResearch/common.h"
+#include "Mocks/LogLevels.h"
+
+#include "ApplicationFeatures/HttpEndpointProvider.h"
+#include "ApplicationFeatures/CommunicationFeaturePhase.h"
+#include "Aql/QueryRegistry.h"
+#include "Auth/UserManagerMock.h"
+#include "Basics/DownCast.h"
+#include "Basics/StaticStrings.h"
+#include "GeneralServer/AuthenticationFeature.h"
+#include "Logger/LogTopic.h"
+#include "Logger/Logger.h"
+#include "RestServer/DatabaseFeature.h"
+#include "RestServer/ViewTypesFeature.h"
+#include "StorageEngine/EngineSelectorFeature.h"
+#include "Utils/ExecContext.h"
+#include "V8/V8SecurityFeature.h"
+#include "V8/v8-utils.h"
+#include "V8/v8-vpack.h"
+#include "V8Server/v8-externals.h"
+#include "V8Server/v8-views.h"
+#include "VocBase/vocbase.h"
+
+#if USE_ENTERPRISE
+#include "Enterprise/Encryption/EncryptionFeature.h"
+#endif
+
+namespace {
+
+struct TestView : darbotdb::LogicalView {
+  darbotdb::Result _appendVelocyPackResult;
+  darbotdb::velocypack::Builder _properties;
+
+  static constexpr auto typeInfo() noexcept {
+    return std::pair{static_cast<darbotdb::ViewType>(42),
+                     std::string_view{"testViewType"}};
+  }
+
+  TestView(TRI_vocbase_t& vocbase,
+           darbotdb::velocypack::Slice const& definition)
+      : darbotdb::LogicalView(*this, vocbase, definition, false) {}
+  darbotdb::Result appendVPackImpl(darbotdb::velocypack::Builder& build,
+                                   Serialization, bool) const override {
+    build.add("properties", _properties.slice());
+    return _appendVelocyPackResult;
+  }
+  darbotdb::Result dropImpl() override {
+    return darbotdb::storage_helper::drop(*this);
+  }
+  void open() override {}
+  darbotdb::Result renameImpl(std::string const& oldName) override {
+    return darbotdb::storage_helper::rename(*this, oldName);
+  }
+  darbotdb::Result properties(darbotdb::velocypack::Slice properties,
+                              bool isUserRequest,
+                              bool /*partialUpdate*/) override {
+    EXPECT_TRUE(isUserRequest);
+    _properties = darbotdb::velocypack::Builder(properties);
+    return darbotdb::Result();
+  }
+  bool visitCollections(CollectionVisitor const& /*visitor*/) const override {
+    return true;
+  }
+};
+
+struct ViewFactory : darbotdb::ViewFactory {
+  darbotdb::Result create(darbotdb::LogicalView::ptr& view,
+                          TRI_vocbase_t& vocbase,
+                          darbotdb::velocypack::Slice definition,
+                          bool isUserRequest) const override {
+    EXPECT_TRUE(isUserRequest);
+    view = vocbase.createView(definition, false);
+
+    return darbotdb::Result();
+  }
+
+  darbotdb::Result instantiate(darbotdb::LogicalView::ptr& view,
+                               TRI_vocbase_t& vocbase,
+                               darbotdb::velocypack::Slice definition,
+                               bool /*isUserRequest*/) const override {
+    view = std::make_shared<TestView>(vocbase, definition);
+
+    return darbotdb::Result();
+  }
+};
+
+}  // namespace
+
+v8::Local<v8::Object> getDbInstance(TRI_v8_global_t* v8g,
+                                    v8::Isolate* isolate) {
+  auto views = v8::ObjectTemplate::New(isolate);
+  v8g->VocbaseViewTempl.Reset(isolate, views);
+  auto db = v8::ObjectTemplate::New(isolate);
+  v8g->VocbaseTempl.Reset(isolate, db);
+  TRI_InitV8Views(*v8g, isolate);
+  return v8::Local<v8::ObjectTemplate>::New(isolate, v8g->VocbaseTempl)
+      ->NewInstance(TRI_IGETC)
+      .FromMaybe(v8::Local<v8::Object>());
+}
+
+v8::Local<v8::Object> getViewInstance(TRI_v8_global_t* v8g,
+                                      v8::Isolate* isolate) {
+  auto views = v8::ObjectTemplate::New(isolate);
+  v8g->VocbaseViewTempl.Reset(isolate, views);
+  auto db = v8::ObjectTemplate::New(isolate);
+  v8g->VocbaseTempl.Reset(isolate, db);
+  TRI_InitV8Views(*v8g, isolate);
+  return v8::Local<v8::ObjectTemplate>::New(isolate, v8g->VocbaseViewTempl)
+      ->NewInstance(TRI_IGETC)
+      .FromMaybe(v8::Local<v8::Object>());
+}
+
+v8::Local<v8::Function> getViewDBMemberFunction(TRI_v8_global_t* /*v8g*/,
+                                                v8::Isolate* isolate,
+                                                v8::Local<v8::Object> db,
+                                                const char* name) {
+  auto fn = db->Get(TRI_IGETC, TRI_V8_ASCII_STRING(isolate, name))
+                .FromMaybe(v8::Local<v8::Value>());
+  EXPECT_TRUE(fn->IsFunction());
+  return v8::Local<v8::Function>::Cast(fn);
+}
+
+v8::Local<v8::Function> getViewMethodFunction(
+    TRI_v8_global_t* /*v8g*/, v8::Isolate* isolate,
+    v8::Local<v8::Object>& arangoViewObj, const char* name) {
+  auto fn = arangoViewObj->Get(TRI_IGETC, TRI_V8_ASCII_STRING(isolate, name))
+                .FromMaybe(v8::Local<v8::Value>());
+  EXPECT_TRUE(fn->IsFunction());
+  return v8::Local<v8::Function>::Cast(fn);
+}
+
+class V8ViewsTest
+    : public ::testing::Test,
+      public darbotdb::tests::LogSuppressor<darbotdb::Logger::AUTHENTICATION,
+                                            darbotdb::LogLevel::ERR> {
+ protected:
+  darbotdb::tests::mocks::MockAqlServer server;
+  ViewFactory viewFactory;
+
+  V8ViewsTest() {
+    darbotdb::tests::v8Init();  // on-time initialize V8
+    expectUserManagerCalls();
+    auto& viewTypesFeature = server.getFeature<darbotdb::ViewTypesFeature>();
+    viewTypesFeature.emplace(TestView::typeInfo().second, viewFactory);
+  }
+
+  void expectUserManagerCalls() {
+    using namespace darbotdb;
+    auto* authFeature = AuthenticationFeature::instance();
+    auto* userManager = authFeature->userManager();
+    auto* um =
+        dynamic_cast<testing::StrictMock<auth::UserManagerMock>*>(userManager);
+    EXPECT_NE(um, nullptr);
+
+    using namespace ::testing;
+    EXPECT_CALL(*um, databaseAuthLevel)
+        .Times(AtLeast(1))
+        .WillRepeatedly(WithArgs<0, 1>(
+            [this](std::string const& username, std::string const& dbname) {
+              if (_userMap.empty()) {
+                return auth::Level::NONE;
+              }
+              auto const it = _userMap.find(username);
+              EXPECT_NE(it, _userMap.end());
+              return it->second.databaseAuthLevel(dbname);
+            }));
+    EXPECT_CALL(*um, setAuthInfo)
+        .Times(AtLeast(1))
+        .WillRepeatedly(
+            [this](auth::UserMap const& userMap) { _userMap = userMap; });
+  }
+  darbotdb::auth::UserMap _userMap;
+};
+
+TEST_F(V8ViewsTest, test_auth) {
+  // test create
+  {
+    TRI_vocbase_t vocbase(testDBInfo(server.server()));
+    v8::Isolate::CreateParams isolateParams;
+    auto arrayBufferAllocator = std::unique_ptr<v8::ArrayBuffer::Allocator>(
+        v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    isolateParams.array_buffer_allocator = arrayBufferAllocator.get();
+    auto isolate = std::shared_ptr<v8::Isolate>(
+        v8::Isolate::New(isolateParams),
+        [](v8::Isolate* p) -> void { p->Dispose(); });
+    ASSERT_NE(nullptr, isolate);
+    v8::Isolate::Scope isolateScope(
+        isolate.get());  // otherwise v8::Isolate::Logger() will fail (called
+                         // from v8::Exception::Error)
+    v8::HandleScope handleScope(
+        isolate.get());  // required for v8::Context::New(...),
+                         // v8::ObjectTemplate::New(...) and
+                         // TRI_AddMethodVocbase(...)
+    auto context = v8::Context::New(isolate.get());
+    v8::Context::Scope contextScope(
+        context);  // required for TRI_AddMethodVocbase(...)
+
+    // create and set inside 'isolate' for use 'TRI_GET_GLOBALS()'
+    std::unique_ptr<V8Global<darbotdb::ArangodServer>> v8g(
+        CreateV8Globals(server.server(), isolate.get(), 0));
+
+    // otherwise v8:-utils::CreateErrorObject(...) will fail
+    v8g->ArangoErrorTempl.Reset(isolate.get(),
+                                v8::ObjectTemplate::New(isolate.get()));
+    v8g->_vocbase = &vocbase;
+    auto db = getDbInstance(v8g.get(), isolate.get());
+    auto fn_createView =
+        getViewDBMemberFunction(v8g.get(), isolate.get(), db, "_createView");
+
+    std::vector<v8::Local<v8::Value>> args = {
+        TRI_V8_ASCII_STRING(isolate.get(), "testView"),
+        TRI_V8_ASCII_STRING(isolate.get(), "testViewType"),
+        TRI_VPackToV8(isolate.get(),
+                      darbotdb::velocypack::Parser::fromJson("{}")->slice()),
+    };
+
+    EXPECT_TRUE(vocbase.views().empty());
+
+    struct ExecContext : public darbotdb::ExecContext {
+      ExecContext()
+          : darbotdb::ExecContext(darbotdb::ExecContext::ConstructorToken{},
+                                  darbotdb::ExecContext::Type::Default, "", "",
+                                  darbotdb::auth::Level::NONE,
+                                  darbotdb::auth::Level::NONE, false) {}
+    };
+    auto execContext = std::make_shared<ExecContext>();
+    darbotdb::ExecContextScope execContextScope(execContext);
+    auto* authFeature = darbotdb::AuthenticationFeature::instance();
+    auto* userManager = authFeature->userManager();
+
+    // not authorized (missing user)
+    {
+      darbotdb::auth::UserMap userMap;  // empty map, no user -> no permissions
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_createView)
+              ->CallAsFunction(context, fn_createView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      EXPECT_TRUE(vocbase.views().empty());
+    }
+
+    // not authorized (RO user)
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RO);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_createView)
+              ->CallAsFunction(context, fn_createView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      EXPECT_TRUE(vocbase.views().empty());
+    }
+
+    // authorzed (RW user)
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RW);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      auto result =
+          v8::Function::Cast(*fn_createView)
+              ->CallAsFunction(context, fn_createView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_FALSE(result.IsEmpty());
+      EXPECT_TRUE(result.ToLocalChecked()->IsObject());
+      auto* v8View = TRI_UnwrapClass<darbotdb::LogicalView>(
+          result.ToLocalChecked()->ToObject(TRI_IGETC).FromMaybe(
+              v8::Local<v8::Object>()),
+          WRP_VOCBASE_VIEW_TYPE, TRI_IGETC);
+      EXPECT_FALSE(!v8View);
+      EXPECT_EQ(std::string("testView"), v8View->name());
+      EXPECT_EQ(darbotdb::ViewType{42}, v8View->type());
+      EXPECT_EQ(std::string("testViewType"), v8View->typeName());
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+  }
+
+  // test drop (static)
+  {
+    auto createViewJson = darbotdb::velocypack::Parser::fromJson(
+        "{ \"name\": \"testView\", \"type\": \"testViewType\" }");
+    TRI_vocbase_t vocbase(testDBInfo(server.server()));
+    auto logicalView = vocbase.createView(createViewJson->slice(), false);
+    ASSERT_FALSE(!logicalView);
+
+    v8::Isolate::CreateParams isolateParams;
+    auto arrayBufferAllocator = std::unique_ptr<v8::ArrayBuffer::Allocator>(
+        v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    isolateParams.array_buffer_allocator = arrayBufferAllocator.get();
+    auto isolate = std::shared_ptr<v8::Isolate>(
+        v8::Isolate::New(isolateParams),
+        [](v8::Isolate* p) -> void { p->Dispose(); });
+    ASSERT_NE(nullptr, isolate);
+    // otherwise v8::Isolate::Logger() will fail (called
+    // from v8::Exception::Error)
+    v8::Isolate::Scope isolateScope(isolate.get());
+    // otherwise v8::Isolate::Logger() will fail (called from
+    // v8::Exception::Error)
+    // required for v8::Context::New(...), v8::ObjectTemplate::New(...) and
+    // TRI_AddMethodVocbase(...)
+    v8::HandleScope handleScope(isolate.get());
+    auto context = v8::Context::New(isolate.get());
+    // required for TRI_AddMethodVocbase(...)
+    v8::Context::Scope contextScope(context);
+    // create and set inside 'isolate' for use with 'TRI_GET_GLOBALS()'
+    std::unique_ptr<V8Global<darbotdb::ArangodServer>> v8g(
+        CreateV8Globals(server.server(), isolate.get(), 0));
+    // otherwise v8:-utils::CreateErrorObject(...) will fail
+    v8g->ArangoErrorTempl.Reset(isolate.get(),
+                                v8::ObjectTemplate::New(isolate.get()));
+    v8g->_vocbase = &vocbase;
+    auto db = getDbInstance(v8g.get(), isolate.get());
+    auto fn_dropView =
+        getViewDBMemberFunction(v8g.get(), isolate.get(), db, "_dropView");
+
+    std::vector<v8::Local<v8::Value>> args = {
+        TRI_V8_ASCII_STRING(isolate.get(), "testView"),
+    };
+
+    struct ExecContext : public darbotdb::ExecContext {
+      ExecContext()
+          : darbotdb::ExecContext(darbotdb::ExecContext::ConstructorToken{},
+                                  darbotdb::ExecContext::Type::Default, "", "",
+                                  darbotdb::auth::Level::NONE,
+                                  darbotdb::auth::Level::NONE, false) {}
+    };
+    auto execContext = std::make_shared<ExecContext>();
+    darbotdb::ExecContextScope execContextScope(execContext);
+    auto* authFeature = darbotdb::AuthenticationFeature::instance();
+    auto* userManager = authFeature->userManager();
+
+    // not authorized (missing user)
+    {
+      darbotdb::auth::UserMap userMap;  // empty map, no user -> no permissions
+      // set user map to avoid loading configuration from system database
+      userManager->setAuthInfo(userMap);
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_dropView)
+              ->CallAsFunction(context, fn_dropView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+
+    // not authorized (RO user database)
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RO);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_dropView)
+              ->CallAsFunction(context, fn_dropView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+
+    // authorized (NONE user view) as per
+    // https://github.com/darbotdb/backlog/issues/459
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RW);
+      user.grantCollection(vocbase.name(), "testView",
+                           darbotdb::auth::Level::NONE);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      auto result =
+          v8::Function::Cast(*fn_dropView)
+              ->CallAsFunction(context, fn_dropView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_FALSE(result.IsEmpty());
+      EXPECT_TRUE(result.ToLocalChecked()->IsUndefined());
+      EXPECT_TRUE(vocbase.views().empty());
+    }
+  }
+
+  // test drop (instance)
+  {
+    auto createViewJson = darbotdb::velocypack::Parser::fromJson(
+        "{ \"name\": \"testView\", \"type\": \"testViewType\" }");
+    TRI_vocbase_t vocbase(testDBInfo(server.server()));
+    auto logicalView = vocbase.createView(createViewJson->slice(), false);
+    ASSERT_FALSE(!logicalView);
+
+    v8::Isolate::CreateParams isolateParams;
+    auto arrayBufferAllocator = std::unique_ptr<v8::ArrayBuffer::Allocator>(
+        v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    isolateParams.array_buffer_allocator = arrayBufferAllocator.get();
+    auto isolate = std::shared_ptr<v8::Isolate>(
+        v8::Isolate::New(isolateParams),
+        [](v8::Isolate* p) -> void { p->Dispose(); });
+    ASSERT_NE(nullptr, isolate);
+    // otherwise v8::Isolate::Logger() will fail (called
+    // from v8::Exception::Error)
+    v8::Isolate::Scope isolateScope(isolate.get());
+    // otherwise v8::Isolate::Logger() will fail (called from
+    // v8::Exception::Error)
+    // required for v8::Context::New(...), v8::ObjectTemplate::New(...) and
+    // TRI_AddMethodVocbase(...)
+    v8::HandleScope handleScope(isolate.get());
+    auto context = v8::Context::New(isolate.get());
+    // required for TRI_AddMethodVocbase(...)
+    v8::Context::Scope contextScope(context);
+    // create and set inside 'isolate' for use with 'TRI_GET_GLOBALS()'
+    std::unique_ptr<V8Global<darbotdb::ArangodServer>> v8g(
+        CreateV8Globals(server.server(), isolate.get(), 0));
+    // otherwise v8:-utils::CreateErrorObject(...) will fail
+    v8g->ArangoErrorTempl.Reset(isolate.get(),
+                                v8::ObjectTemplate::New(isolate.get()));
+    v8g->_vocbase = &vocbase;
+
+    auto arangoView = getViewInstance(v8g.get(), isolate.get());
+    auto fn_drop =
+        getViewMethodFunction(v8g.get(), isolate.get(), arangoView, "drop");
+
+    arangoView->SetInternalField(
+        SLOT_CLASS_TYPE,
+        v8::Integer::New(isolate.get(), WRP_VOCBASE_VIEW_TYPE));
+    arangoView->SetInternalField(
+        SLOT_CLASS, v8::External::New(isolate.get(), logicalView.get()));
+    std::vector<v8::Local<v8::Value>> args = {};
+
+    struct ExecContext : public darbotdb::ExecContext {
+      ExecContext()
+          : darbotdb::ExecContext(darbotdb::ExecContext::ConstructorToken{},
+                                  darbotdb::ExecContext::Type::Default, "", "",
+                                  darbotdb::auth::Level::NONE,
+                                  darbotdb::auth::Level::NONE, false) {}
+    };
+    auto execContext = std::make_shared<ExecContext>();
+    darbotdb::ExecContextScope execContextScope(execContext);
+    auto* authFeature = darbotdb::AuthenticationFeature::instance();
+    auto* userManager = authFeature->userManager();
+
+    // not authorized (missing user)
+    {
+      darbotdb::auth::UserMap userMap;  // empty map, no user -> no permissions
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result = v8::Function::Cast(*fn_drop)->CallAsFunction(
+          context, arangoView, static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+
+    // not authorized (RO user database)
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RO);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result = v8::Function::Cast(*fn_drop)->CallAsFunction(
+          context, arangoView, static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+
+    // authorized (NONE user view) as per
+    // https://github.com/darbotdb/backlog/issues/459
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RW);
+      user.grantCollection(vocbase.name(), "testView",
+                           darbotdb::auth::Level::NONE);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      auto result = v8::Function::Cast(*fn_drop)->CallAsFunction(
+          context, arangoView, static_cast<int>(args.size()), args.data());
+      EXPECT_FALSE(result.IsEmpty());
+      EXPECT_TRUE(result.ToLocalChecked()->IsUndefined());
+      EXPECT_TRUE(vocbase.views().empty());
+    }
+  }
+
+  // test rename
+  {
+    auto createViewJson = darbotdb::velocypack::Parser::fromJson(
+        "{ \"name\": \"testView\", \"type\": \"testViewType\" }");
+    TRI_vocbase_t vocbase(testDBInfo(server.server()));
+    auto logicalView = vocbase.createView(createViewJson->slice(), false);
+    ASSERT_FALSE(!logicalView);
+
+    v8::Isolate::CreateParams isolateParams;
+    auto arrayBufferAllocator = std::unique_ptr<v8::ArrayBuffer::Allocator>(
+        v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    isolateParams.array_buffer_allocator = arrayBufferAllocator.get();
+    auto isolate = std::shared_ptr<v8::Isolate>(
+        v8::Isolate::New(isolateParams),
+        [](v8::Isolate* p) -> void { p->Dispose(); });
+    ASSERT_NE(nullptr, isolate);
+    // otherwise v8::Isolate::Logger() will fail (called from
+    // v8::Exception::Error)
+    v8::Isolate::Scope isolateScope(isolate.get());
+
+    // otherwise v8::Isolate::Logger() will fail (called from
+    // v8::Exception::Error)
+    // required for v8::Context::New(...), v8::ObjectTemplate::New(...) and
+    // TRI_AddMethodVocbase(...)
+    v8::HandleScope handleScope(isolate.get());
+    auto context = v8::Context::New(isolate.get());
+    // required for TRI_AddMethodVocbase(...)
+    v8::Context::Scope contextScope(context);
+    // create and set inside 'isolate' for use with 'TRI_GET_GLOBALS()'
+    std::unique_ptr<V8Global<darbotdb::ArangodServer>> v8g(
+        CreateV8Globals(server.server(), isolate.get(), 0));
+    // otherwise v8:-utils::CreateErrorObject(...) will fail
+    v8g->ArangoErrorTempl.Reset(isolate.get(),
+                                v8::ObjectTemplate::New(isolate.get()));
+    v8g->_vocbase = &vocbase;
+    auto arangoView = getViewInstance(v8g.get(), isolate.get());
+    auto fn_rename =
+        getViewMethodFunction(v8g.get(), isolate.get(), arangoView, "rename");
+
+    arangoView->SetInternalField(
+        SLOT_CLASS_TYPE,
+        v8::Integer::New(isolate.get(), WRP_VOCBASE_VIEW_TYPE));
+    arangoView->SetInternalField(
+        SLOT_CLASS, v8::External::New(isolate.get(), logicalView.get()));
+    std::vector<v8::Local<v8::Value>> args = {
+        TRI_V8_ASCII_STRING(isolate.get(), "testView1"),
+    };
+
+    struct ExecContext : public darbotdb::ExecContext {
+      ExecContext()
+          : darbotdb::ExecContext(darbotdb::ExecContext::ConstructorToken{},
+                                  darbotdb::ExecContext::Type::Default, "", "",
+                                  darbotdb::auth::Level::NONE,
+                                  darbotdb::auth::Level::NONE, false) {}
+    };
+    auto execContext = std::make_shared<ExecContext>();
+    darbotdb::ExecContextScope execContextScope(execContext);
+    auto* authFeature = darbotdb::AuthenticationFeature::instance();
+    auto* userManager = authFeature->userManager();
+
+    // not authorized (missing user)
+    {
+      darbotdb::auth::UserMap userMap;  // empty map, no user -> no permissions
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_rename)
+              ->CallAsFunction(context, arangoView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+      auto view1 = vocbase.lookupView("testView1");
+      EXPECT_FALSE(view1);
+    }
+
+    // not authorized (RO user database)
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RO);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_rename)
+              ->CallAsFunction(context, arangoView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+      auto view1 = vocbase.lookupView("testView1");
+      EXPECT_FALSE(view1);
+    }
+
+    // not authorized (NONE user view with failing toVelocyPack()) as per
+    // https://github.com/darbotdb/backlog/issues/459
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RW);
+      user.grantCollection(vocbase.name(), "testView",
+                           darbotdb::auth::Level::NONE);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+      auto* testView = darbotdb::basics::downCast<TestView>(logicalView.get());
+      testView->_appendVelocyPackResult = darbotdb::Result(TRI_ERROR_FORBIDDEN);
+      auto resetAppendVelocyPackResult =
+          std::shared_ptr<TestView>(testView, [](TestView* p) -> void {
+            p->_appendVelocyPackResult = darbotdb::Result();
+          });
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_rename)
+              ->CallAsFunction(context, arangoView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+      auto view1 = vocbase.lookupView("testView1");
+      EXPECT_FALSE(view1);
+    }
+
+    // authorized (NONE user view) as per
+    // https://github.com/darbotdb/backlog/issues/459
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RW);
+      user.grantCollection(vocbase.name(), "testView",
+                           darbotdb::auth::Level::NONE);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      auto result =
+          v8::Function::Cast(*fn_rename)
+              ->CallAsFunction(context, arangoView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_FALSE(result.IsEmpty());
+      EXPECT_TRUE(result.ToLocalChecked()->IsUndefined());
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(view);
+      auto view1 = vocbase.lookupView("testView1");
+      EXPECT_FALSE(!view1);
+    }
+  }
+
+  // test modify
+  {
+    auto createViewJson = darbotdb::velocypack::Parser::fromJson(
+        "{ \"name\": \"testView\", \"type\": \"testViewType\" }");
+    TRI_vocbase_t vocbase(testDBInfo(server.server()));
+    auto logicalView = vocbase.createView(createViewJson->slice(), false);
+    ASSERT_FALSE(!logicalView);
+
+    v8::Isolate::CreateParams isolateParams;
+    auto arrayBufferAllocator = std::unique_ptr<v8::ArrayBuffer::Allocator>(
+        v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    isolateParams.array_buffer_allocator = arrayBufferAllocator.get();
+    auto isolate = std::shared_ptr<v8::Isolate>(
+        v8::Isolate::New(isolateParams),
+        [](v8::Isolate* p) -> void { p->Dispose(); });
+    ASSERT_NE(nullptr, isolate);
+    static_assert(sizeof(darbotdb::V8PlatformFeature::IsolateData) < 64);
+    char isolateData[64]{};
+    // required for TRI_VPackToV8(...) with nn-empty jSON
+    isolate->SetData(darbotdb::V8PlatformFeature::V8_INFO, isolateData);
+    // otherwise v8::Isolate::Logger() will fail (called from
+    // v8::Exception::Error)
+    v8::Isolate::Scope isolateScope(isolate.get());
+    // otherwise v8::Isolate::Logger() will fail (called from
+    // v8::Exception::Error)
+    // required for v8::Context::New(...), v8::ObjectTemplate::New(...) and
+    // TRI_AddMethodVocbase(...)
+    v8::HandleScope handleScope(isolate.get());
+    auto context = v8::Context::New(isolate.get());
+    // required for TRI_AddMethodVocbase(...)
+    v8::Context::Scope contextScope(context);
+    // create and set inside 'isolate' for use with 'TRI_GET_GLOBALS()'
+    std::unique_ptr<V8Global<darbotdb::ArangodServer>> v8g(
+        CreateV8Globals(server.server(), isolate.get(), 0));
+    // otherwise v8:-utils::CreateErrorObject(...) will fail
+    v8g->ArangoErrorTempl.Reset(isolate.get(),
+                                v8::ObjectTemplate::New(isolate.get()));
+    v8g->_vocbase = &vocbase;
+    auto arangoView = getViewInstance(v8g.get(), isolate.get());
+    auto fn_properties = getViewMethodFunction(v8g.get(), isolate.get(),
+                                               arangoView, "properties");
+
+    arangoView->SetInternalField(
+        SLOT_CLASS_TYPE,
+        v8::Integer::New(isolate.get(), WRP_VOCBASE_VIEW_TYPE));
+    arangoView->SetInternalField(
+        SLOT_CLASS, v8::External::New(isolate.get(), logicalView.get()));
+    std::vector<v8::Local<v8::Value>> args = {
+        TRI_VPackToV8(isolate.get(), darbotdb::velocypack::Parser::fromJson(
+                                         "{ \"key\": \"value\" }")
+                                         ->slice()),
+    };
+
+    struct ExecContext : public darbotdb::ExecContext {
+      ExecContext()
+          : darbotdb::ExecContext(darbotdb::ExecContext::ConstructorToken{},
+                                  darbotdb::ExecContext::Type::Default, "", "",
+                                  darbotdb::auth::Level::NONE,
+                                  darbotdb::auth::Level::NONE, false) {}
+    };
+    auto execContext = std::make_shared<ExecContext>();
+    darbotdb::ExecContextScope execContextScope(execContext);
+    auto* authFeature = darbotdb::AuthenticationFeature::instance();
+    auto* userManager = authFeature->userManager();
+
+    // not authorized (missing user)
+    {
+      darbotdb::auth::UserMap userMap;  // empty map, no user -> no permissions
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_properties)
+              ->CallAsFunction(context, arangoView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+
+    // not authorized (RO user database)
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RO);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_properties)
+              ->CallAsFunction(context, arangoView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+
+    // not authorized (NONE user view with failing toVelocyPack()) as per
+    // https://github.com/darbotdb/backlog/issues/459
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RW);
+      user.grantCollection(vocbase.name(), "testView",
+                           darbotdb::auth::Level::NONE);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+      auto* testView = darbotdb::basics::downCast<TestView>(logicalView.get());
+      testView->_appendVelocyPackResult = darbotdb::Result(TRI_ERROR_INTERNAL);
+      auto resetAppendVelocyPackResult =
+          std::shared_ptr<TestView>(testView, [](TestView* p) -> void {
+            p->_appendVelocyPackResult = darbotdb::Result();
+          });
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_properties)
+              ->CallAsFunction(context, arangoView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_INTERNAL ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+      slice = darbotdb::basics::downCast<TestView>(*view)._properties.slice();
+      EXPECT_FALSE(slice.isObject());
+    }
+
+    // authorized (NONE user view) as per
+    // https://github.com/darbotdb/backlog/issues/459
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RW);
+      user.grantCollection(vocbase.name(), "testView",
+                           darbotdb::auth::Level::NONE);
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      auto result =
+          v8::Function::Cast(*fn_properties)
+              ->CallAsFunction(context, arangoView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_FALSE(result.IsEmpty());
+      EXPECT_TRUE(result.ToLocalChecked()->IsObject());
+      TRI_V8ToVPack(isolate.get(), response, result.ToLocalChecked(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE((
+          slice.hasKey(darbotdb::StaticStrings::DataSourceName) &&
+          slice.get(darbotdb::StaticStrings::DataSourceName).isString() &&
+          std::string("testView") ==
+              slice.get(darbotdb::StaticStrings::DataSourceName).copyString()));
+      EXPECT_TRUE((slice.hasKey("properties") &&
+                   slice.get("properties").isObject() &&
+                   slice.get("properties").hasKey("key") &&
+                   slice.get("properties").get("key").isString() &&
+                   std::string("value") ==
+                       slice.get("properties").get("key").copyString()));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+      slice = darbotdb::basics::downCast<TestView>(*view)._properties.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE((slice.hasKey("key") && slice.get("key").isString() &&
+                   std::string("value") == slice.get("key").copyString()));
+    }
+  }
+
+  // test get view (basic)
+  {
+    auto createViewJson = darbotdb::velocypack::Parser::fromJson(
+        "{ \"name\": \"testView\", \"type\": \"testViewType\" }");
+    TRI_vocbase_t vocbase(testDBInfo(server.server()));
+    auto logicalView = vocbase.createView(createViewJson->slice(), false);
+    ASSERT_FALSE(!logicalView);
+
+    v8::Isolate::CreateParams isolateParams;
+    auto arrayBufferAllocator = std::unique_ptr<v8::ArrayBuffer::Allocator>(
+        v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    isolateParams.array_buffer_allocator = arrayBufferAllocator.get();
+    auto isolate = std::shared_ptr<v8::Isolate>(
+        v8::Isolate::New(isolateParams),
+        [](v8::Isolate* p) -> void { p->Dispose(); });
+    ASSERT_NE(nullptr, isolate);
+    // otherwise v8::Isolate::Logger() will fail (called from
+    // v8::Exception::Error)
+    v8::Isolate::Scope isolateScope(isolate.get());
+    // otherwise v8::Isolate::Logger() will fail (called from
+    // v8::Exception::Error)
+    // required for v8::Context::New(...), v8::ObjectTemplate::New(...) and
+    // TRI_AddMethodVocbase(...)
+    v8::HandleScope handleScope(isolate.get());
+    auto context = v8::Context::New(isolate.get());
+    // required for TRI_AddMethodVocbase(...)
+    v8::Context::Scope contextScope(context);
+    // create and set inside 'isolate' for use with 'TRI_GET_GLOBALS()'
+    std::unique_ptr<V8Global<darbotdb::ArangodServer>> v8g(
+        CreateV8Globals(server.server(), isolate.get(), 0));
+    // otherwise v8:-utils::CreateErrorObject(...) will fail
+    v8g->ArangoErrorTempl.Reset(isolate.get(),
+                                v8::ObjectTemplate::New(isolate.get()));
+    v8g->_vocbase = &vocbase;
+    auto db = getDbInstance(v8g.get(), isolate.get());
+    auto fn_view =
+        getViewDBMemberFunction(v8g.get(), isolate.get(), db, "_view");
+
+    std::vector<v8::Local<v8::Value>> args = {
+        TRI_V8_ASCII_STRING(isolate.get(), "testView"),
+    };
+
+    struct ExecContext : public darbotdb::ExecContext {
+      ExecContext()
+          : darbotdb::ExecContext(darbotdb::ExecContext::ConstructorToken{},
+                                  darbotdb::ExecContext::Type::Default, "", "",
+                                  darbotdb::auth::Level::NONE,
+                                  darbotdb::auth::Level::NONE, false) {}
+    };
+    auto execContext = std::make_shared<ExecContext>();
+    darbotdb::ExecContextScope execContextScope(execContext);
+    auto* authFeature = darbotdb::AuthenticationFeature::instance();
+    auto* userManager = authFeature->userManager();
+
+    // not authorized (missing user)
+    {
+      darbotdb::auth::UserMap userMap;  // empty map, no user -> no permissions
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result = v8::Function::Cast(*fn_view)->CallAsFunction(
+          context, fn_view, static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+
+    // not authorized (failed detailed toVelocyPack(...)) as per
+    // https://github.com/darbotdb/backlog/issues/459
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RO);
+      user.grantCollection(
+          vocbase.name(), "testView",
+          darbotdb::auth::Level::NONE);   // for missing collections
+                                          // User::collectionAuthLevel(...)
+                                          // returns database auth::Level
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+      auto* testView = darbotdb::basics::downCast<TestView>(logicalView.get());
+      testView->_appendVelocyPackResult = darbotdb::Result(TRI_ERROR_FORBIDDEN);
+      auto resetAppendVelocyPackResult =
+          std::shared_ptr<TestView>(testView, [](TestView* p) -> void {
+            p->_appendVelocyPackResult = darbotdb::Result();
+          });
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result = v8::Function::Cast(*fn_view)->CallAsFunction(
+          context, fn_view, static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+
+    // authorized (NONE view) as per
+    // https://github.com/darbotdb/backlog/issues/459
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RO);
+      user.grantCollection(
+          vocbase.name(), "testView",
+          darbotdb::auth::Level::NONE);   // for missing collections
+                                          // User::collectionAuthLevel(...)
+                                          // returns database auth::Level
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      auto result = v8::Function::Cast(*fn_view)->CallAsFunction(
+          context, fn_view, static_cast<int>(args.size()), args.data());
+      EXPECT_FALSE(result.IsEmpty());
+      EXPECT_TRUE(result.ToLocalChecked()->IsObject());
+      auto* v8View = TRI_UnwrapClass<darbotdb::LogicalView>(
+          result.ToLocalChecked()->ToObject(TRI_IGETC).FromMaybe(
+              v8::Local<v8::Object>()),
+          WRP_VOCBASE_VIEW_TYPE, TRI_IGETC);
+      EXPECT_FALSE(!v8View);
+      EXPECT_EQ(std::string("testView"), v8View->name());
+      EXPECT_EQ(TestView::typeInfo().first, v8View->type());
+      EXPECT_EQ(std::string("testViewType"), v8View->typeName());
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+  }
+
+  // test get view (detailed)
+  {
+    auto createViewJson = darbotdb::velocypack::Parser::fromJson(
+        "{ \"name\": \"testView\", \"type\": \"testViewType\" }");
+    TRI_vocbase_t vocbase(testDBInfo(server.server()));
+    auto logicalView = vocbase.createView(createViewJson->slice(), false);
+    ASSERT_FALSE(!logicalView);
+
+    v8::Isolate::CreateParams isolateParams;
+    auto arrayBufferAllocator = std::unique_ptr<v8::ArrayBuffer::Allocator>(
+        v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    isolateParams.array_buffer_allocator = arrayBufferAllocator.get();
+    auto isolate = std::shared_ptr<v8::Isolate>(
+        v8::Isolate::New(isolateParams),
+        [](v8::Isolate* p) -> void { p->Dispose(); });
+    ASSERT_NE(nullptr, isolate);
+    static_assert(sizeof(darbotdb::V8PlatformFeature::IsolateData) < 64);
+    char isolateData[64]{};
+    // required for TRI_VPackToV8(...) with nn-empty jSON
+    isolate->SetData(darbotdb::V8PlatformFeature::V8_INFO, isolateData);
+    // otherwise v8::Isolate::Logger() will fail (called
+    // from v8::Exception::Error)
+    v8::Isolate::Scope isolateScope(isolate.get());
+    // otherwise v8::Isolate::Logger() will fail (called from
+    // v8::Exception::Error)
+    // required for v8::Context::New(...), v8::ObjectTemplate::New(...) and
+    // TRI_AddMethodVocbase(...)
+    v8::HandleScope handleScope(isolate.get());
+    auto context = v8::Context::New(isolate.get());
+    // required for TRI_AddMethodVocbase(...)
+    v8::Context::Scope contextScope(context);
+    // create and set inside 'isolate' for use
+    // with 'TRI_GET_GLOBALS()'
+    std::unique_ptr<V8Global<darbotdb::ArangodServer>> v8g(
+        CreateV8Globals(server.server(), isolate.get(), 0));
+    // otherwise v8:-utils::CreateErrorObject(...) will fail
+    v8g->ArangoErrorTempl.Reset(isolate.get(),
+                                v8::ObjectTemplate::New(isolate.get()));
+    v8g->_vocbase = &vocbase;
+
+    auto arangoView = getViewInstance(v8g.get(), isolate.get());
+    auto fn_properties = getViewMethodFunction(v8g.get(), isolate.get(),
+                                               arangoView, "properties");
+
+    arangoView->SetInternalField(
+        SLOT_CLASS_TYPE,
+        v8::Integer::New(isolate.get(), WRP_VOCBASE_VIEW_TYPE));
+    arangoView->SetInternalField(
+        SLOT_CLASS, v8::External::New(isolate.get(), logicalView.get()));
+    std::vector<v8::Local<v8::Value>> args = {};
+
+    struct ExecContext : public darbotdb::ExecContext {
+      ExecContext()
+          : darbotdb::ExecContext(darbotdb::ExecContext::ConstructorToken{},
+                                  darbotdb::ExecContext::Type::Default, "", "",
+                                  darbotdb::auth::Level::NONE,
+                                  darbotdb::auth::Level::NONE, false) {}
+    };
+    auto execContext = std::make_shared<ExecContext>();
+    darbotdb::ExecContextScope execContextScope(execContext);
+    auto* authFeature = darbotdb::AuthenticationFeature::instance();
+    auto* userManager = authFeature->userManager();
+
+    // not authorized (missing user)
+    {
+      darbotdb::auth::UserMap userMap;  // empty map, no user -> no permissions
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_properties)
+              ->CallAsFunction(context, arangoView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+
+    // not authorized (failed detailed toVelocyPack(...))
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RO);
+      user.grantCollection(
+          vocbase.name(), "testView",
+          darbotdb::auth::Level::NONE);   // for missing collections
+                                          // User::collectionAuthLevel(...)
+                                          // returns database auth::Level
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+      auto* testView = darbotdb::basics::downCast<TestView>(logicalView.get());
+      testView->_appendVelocyPackResult = darbotdb::Result(TRI_ERROR_FORBIDDEN);
+      auto resetAppendVelocyPackResult =
+          std::shared_ptr<TestView>(testView, [](TestView* p) -> void {
+            p->_appendVelocyPackResult = darbotdb::Result();
+          });
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result =
+          v8::Function::Cast(*fn_properties)
+              ->CallAsFunction(context, arangoView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+
+    // authorized (NONE view) as per
+    // https://github.com/darbotdb/backlog/issues/459
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RO);
+      user.grantCollection(
+          vocbase.name(), "testView",
+          darbotdb::auth::Level::NONE);   // for missing collections
+                                          // User::collectionAuthLevel(...)
+                                          // returns database auth::Level
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      darbotdb::velocypack::Builder response;
+      auto result =
+          v8::Function::Cast(*fn_properties)
+              ->CallAsFunction(context, arangoView,
+                               static_cast<int>(args.size()), args.data());
+      EXPECT_FALSE(result.IsEmpty());
+      EXPECT_TRUE(result.ToLocalChecked()->IsObject());
+      TRI_V8ToVPack(isolate.get(), response, result.ToLocalChecked(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE((
+          slice.hasKey(darbotdb::StaticStrings::DataSourceName) &&
+          slice.get(darbotdb::StaticStrings::DataSourceName).isString() &&
+          std::string("testView") ==
+              slice.get(darbotdb::StaticStrings::DataSourceName).copyString()));
+      auto view = vocbase.lookupView("testView");
+      EXPECT_FALSE(!view);
+    }
+  }
+
+  // test get all views
+  {
+    auto createView1Json = darbotdb::velocypack::Parser::fromJson(
+        "{ \"name\": \"testView1\", \"type\": \"testViewType\" }");
+    auto createView2Json = darbotdb::velocypack::Parser::fromJson(
+        "{ \"name\": \"testView2\", \"type\": \"testViewType\" }");
+    TRI_vocbase_t vocbase(testDBInfo(server.server()));
+    auto logicalView1 = vocbase.createView(createView1Json->slice(), false);
+    ASSERT_FALSE(!logicalView1);
+    auto logicalView2 = vocbase.createView(createView2Json->slice(), false);
+    ASSERT_FALSE(!logicalView2);
+
+    v8::Isolate::CreateParams isolateParams;
+    auto arrayBufferAllocator = std::unique_ptr<v8::ArrayBuffer::Allocator>(
+        v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    isolateParams.array_buffer_allocator = arrayBufferAllocator.get();
+    auto isolate = std::shared_ptr<v8::Isolate>(
+        v8::Isolate::New(isolateParams),
+        [](v8::Isolate* p) -> void { p->Dispose(); });
+    ASSERT_NE(nullptr, isolate);
+    // otherwise v8::Isolate::Logger() will fail (called from
+    // v8::Exception::Error)
+    v8::Isolate::Scope isolateScope(isolate.get());
+    // otherwise v8::Isolate::Logger() will fail (called from
+    // v8::Exception::Error)
+    // required for v8::Context::New(...), v8::ObjectTemplate::New(...) and
+    // TRI_AddMethodVocbase(...)
+    v8::HandleScope handleScope(isolate.get());
+    auto context = v8::Context::New(isolate.get());
+    // required for TRI_AddMethodVocbase(...)
+    v8::Context::Scope contextScope(context);
+    // create and set inside 'isolate' for use with 'TRI_GET_GLOBALS()'
+    std::unique_ptr<V8Global<darbotdb::ArangodServer>> v8g(
+        CreateV8Globals(server.server(), isolate.get(), 0));
+    // otherwise v8:-utils::CreateErrorObject(...) will fail
+    v8g->ArangoErrorTempl.Reset(isolate.get(),
+                                v8::ObjectTemplate::New(isolate.get()));
+    v8g->_vocbase = &vocbase;
+    auto db = getDbInstance(v8g.get(), isolate.get());
+    auto fn_views =
+        getViewDBMemberFunction(v8g.get(), isolate.get(), db, "_views");
+
+    std::vector<v8::Local<v8::Value>> args = {};
+
+    struct ExecContext : public darbotdb::ExecContext {
+      ExecContext()
+          : darbotdb::ExecContext(darbotdb::ExecContext::ConstructorToken{},
+                                  darbotdb::ExecContext::Type::Default, "", "",
+                                  darbotdb::auth::Level::NONE,
+                                  darbotdb::auth::Level::NONE, false) {}
+    };
+    auto execContext = std::make_shared<ExecContext>();
+    darbotdb::ExecContextScope execContextScope(execContext);
+    auto* authFeature = darbotdb::AuthenticationFeature::instance();
+    auto* userManager = authFeature->userManager();
+
+    // not authorized (missing user)
+    {
+      darbotdb::auth::UserMap userMap;  // empty map, no user -> no permissions
+      // set user map to avoid loading configuration from system database
+      userManager->setAuthInfo(userMap);
+
+      darbotdb::velocypack::Builder response;
+      v8::TryCatch tryCatch(isolate.get());
+      auto result = v8::Function::Cast(*fn_views)->CallAsFunction(
+          context, fn_views, static_cast<int>(args.size()), args.data());
+      EXPECT_TRUE(result.IsEmpty());
+      EXPECT_TRUE(tryCatch.HasCaught());
+      TRI_V8ToVPack(isolate.get(), response, tryCatch.Exception(), false);
+      auto slice = response.slice();
+      EXPECT_TRUE(slice.isObject());
+      EXPECT_TRUE(
+          (slice.hasKey(darbotdb::StaticStrings::ErrorNum) &&
+           slice.get(darbotdb::StaticStrings::ErrorNum).isNumber<int>() &&
+           TRI_ERROR_FORBIDDEN ==
+               ErrorCode{slice.get(darbotdb::StaticStrings::ErrorNum)
+                             .getNumber<int>()}));
+      auto view1 = vocbase.lookupView("testView1");
+      EXPECT_FALSE(!view1);
+      auto view2 = vocbase.lookupView("testView2");
+      EXPECT_FALSE(!view2);
+    }
+
+    // not authorized (failed detailed toVelocyPack(...)) as per
+    // https://github.com/darbotdb/backlog/issues/459
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RO);
+      user.grantCollection(
+          vocbase.name(), "testView1",
+          darbotdb::auth::Level::NONE);  // for missing collections
+                                         // User::collectionAuthLevel(...)
+                                         // returns database auth::Level
+      user.grantCollection(
+          vocbase.name(), "testView2",
+          darbotdb::auth::Level::NONE);   // for missing collections
+                                          // User::collectionAuthLevel(...)
+                                          // returns database auth::Level
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+      auto* testView = darbotdb::basics::downCast<TestView>(logicalView2.get());
+      testView->_appendVelocyPackResult = darbotdb::Result(TRI_ERROR_FORBIDDEN);
+      auto resetAppendVelocyPackResult =
+          std::shared_ptr<TestView>(testView, [](TestView* p) -> void {
+            p->_appendVelocyPackResult = darbotdb::Result();
+          });
+
+      auto result = v8::Function::Cast(*fn_views)->CallAsFunction(
+          context, fn_views, static_cast<int>(args.size()), args.data());
+      EXPECT_FALSE(result.IsEmpty());
+      EXPECT_TRUE(result.ToLocalChecked()->IsArray());
+      auto* resultArray = v8::Array::Cast(*result.ToLocalChecked());
+      EXPECT_EQ(1U, resultArray->Length());
+      auto context = TRI_IGETC;
+      auto* v8View = TRI_UnwrapClass<darbotdb::LogicalView>(
+          resultArray->Get(context, 0)
+              .FromMaybe(v8::Local<v8::Value>())
+              .As<v8::Object>(),
+          WRP_VOCBASE_VIEW_TYPE, TRI_IGETC);
+      EXPECT_FALSE(!v8View);
+      EXPECT_EQ(std::string("testView1"), v8View->name());
+      EXPECT_EQ(TestView::typeInfo().first, v8View->type());
+      EXPECT_EQ(std::string("testViewType"), v8View->typeName());
+      auto view1 = vocbase.lookupView("testView1");
+      EXPECT_FALSE(!view1);
+    }
+
+    // authorized (NONE view) as per
+    // https://github.com/darbotdb/backlog/issues/459
+    {
+      darbotdb::auth::UserMap userMap;
+      auto& user = userMap.emplace("", darbotdb::auth::User::newUser("", ""))
+                       .first->second;
+      user.grantDatabase(vocbase.name(), darbotdb::auth::Level::RO);
+      user.grantCollection(
+          vocbase.name(), "testView1",
+          darbotdb::auth::Level::NONE);   // for missing collections
+                                          // User::collectionAuthLevel(...)
+                                          // returns database auth::Level
+      userManager->setAuthInfo(userMap);  // set user map to avoid loading
+                                          // configuration from system database
+
+      vocbase.dropView(
+          logicalView2->id(),
+          true);  // remove second view to make test result deterministic
+      auto result = v8::Function::Cast(*fn_views)->CallAsFunction(
+          context, fn_views, static_cast<int>(args.size()), args.data());
+      EXPECT_FALSE(result.IsEmpty());
+      EXPECT_TRUE(result.ToLocalChecked()->IsArray());
+      auto* resultArray = v8::Array::Cast(*result.ToLocalChecked());
+      EXPECT_EQ(1U, resultArray->Length());
+      auto context = TRI_IGETC;
+      auto* v8View = TRI_UnwrapClass<darbotdb::LogicalView>(
+          resultArray->Get(context, 0)
+              .FromMaybe(v8::Local<v8::Value>())
+              .As<v8::Object>(),
+          WRP_VOCBASE_VIEW_TYPE, TRI_IGETC);
+      EXPECT_FALSE(!v8View);
+      EXPECT_EQ(std::string("testView1"), v8View->name());
+      EXPECT_EQ(TestView::typeInfo().first, v8View->type());
+      EXPECT_EQ(std::string("testViewType"), v8View->typeName());
+      auto view1 = vocbase.lookupView("testView1");
+      EXPECT_FALSE(!view1);
+    }
+  }
+}

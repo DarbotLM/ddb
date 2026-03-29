@@ -1,0 +1,31 @@
+name: ddb-api
+
+on:
+  push:
+    paths:
+      - "ddb/**"
+      - ".github/workflows/ddb-api.yml"
+  pull_request:
+    paths:
+      - "ddb/**"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        working-directory: ddb
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest httpx
+      - name: Run unit tests
+        working-directory: ddb
+        run: pytest -q

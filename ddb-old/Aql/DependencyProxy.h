@@ -1,0 +1,103 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Tobias Gödderz
+////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include "Aql/AqlCallStack.h"
+#include "Aql/ExecutionBlock.h"
+#include "Aql/ExecutionState.h"
+#include "Aql/SharedAqlItemBlockPtr.h"
+#include "Aql/types.h"
+
+#include <memory>
+#include <queue>
+#include <utility>
+
+namespace darbotdb::aql {
+class ExecutionBlock;
+class AqlItemBlockManager;
+class SkipResult;
+
+/**
+ * @brief Thin interface to access the methods of ExecutionBlock that are
+ * necessary for the row Fetchers. Makes it easier to test the Fetchers.
+ */
+template<BlockPassthrough allowBlockPassthrough>
+class DependencyProxy {
+ public:
+  /**
+   * @brief Interface to fetch AqlItemBlocks from upstream with getSome.
+   * @param dependencies Dependencies of the current ExecutionBlock. Must
+   *                     contain EXACTLY ONE element. Otherwise, DependencyProxy
+   *                     may be instantiated, but never used. It is allowed to
+   *                     pass a reference to an empty vector, but as soon as
+   *                     the DependencyProxy is used, the condition must be
+   *                     satisfied.
+   * @param nrInputRegisters Total number of registers of the AqlItemBlocks
+   *                         here. Called nrInputRegisters to discern between
+   *                         the widths of input and output blocks.
+   *
+   * The constructor MAY NOT access the dependencies, nor the itemBlockManager.
+   * This is because the dependencies will be added to the ExecutionBlock only
+   * after construction, and to allow derived subclasses for testing (read
+   * DependencyProxyMock) to create them *after* the parent class was
+   * constructed.
+   */
+  DependencyProxy(std::vector<ExecutionBlock*> const& dependencies,
+                  RegisterCount nrInputRegisters);
+
+  TEST_VIRTUAL ~DependencyProxy() = default;
+
+  // TODO Implement and document properly!
+  TEST_VIRTUAL std::tuple<ExecutionState, SkipResult, SharedAqlItemBlockPtr>
+  execute(AqlCallStack const& stack);
+
+  TEST_VIRTUAL std::tuple<ExecutionState, SkipResult, SharedAqlItemBlockPtr>
+  executeForDependency(size_t dependency, AqlCallStack const& stack);
+
+  [[nodiscard]] RegisterCount getNrInputRegisters() const;
+
+  [[nodiscard]] TEST_VIRTUAL size_t numberDependencies() const;
+
+  void reset();
+
+  void setDistributeId(std::string const& distId) { _distributeId = distId; }
+
+ protected:
+  [[nodiscard]] ExecutionBlock& upstreamBlock() const;
+
+  [[nodiscard]] ExecutionBlock& upstreamBlockForDependency(size_t index) const;
+
+ private:
+  [[nodiscard]] bool advanceDependency() noexcept;
+
+  std::vector<ExecutionBlock*> const& _dependencies;
+  RegisterCount const _nrInputRegisters;
+  std::string _distributeId;
+
+  // only modified in case of multiple dependencies + Passthrough otherwise
+  // always 0
+  size_t _currentDependency;
+};
+
+}  // namespace darbotdb::aql

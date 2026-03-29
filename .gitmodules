@@ -1,0 +1,40 @@
+[submodule "iresearch"]
+	path = 3rdParty/iresearch
+	url = https://github.com/darbotdb/iresearch.git
+[submodule "velocypack"]
+	path = 3rdParty/velocypack
+	url = https://github.com/darbotdb/velocypack.git
+[submodule "3rdParty/fmt"]
+	path = 3rdParty/fmt
+	url = https://github.com/fmtlib/fmt
+[submodule "3rdParty/rocksdb"]
+	path = 3rdParty/rocksdb
+	url = https://github.com/darbotdb/rocksdb.git
+[submodule "3rdParty/gtest"]
+	path = 3rdParty/gtest
+	url = https://github.com/darbotdb/googletest.git
+[submodule "3rdParty/abseil-cpp"]
+	path = 3rdParty/abseil-cpp
+	url = https://github.com/darbotdb/abseil-cpp.git
+[submodule "3rdParty/immer"]
+	path = 3rdParty/immer
+	url = https://github.com/darbotdb/immer
+	branch = release-v0.8
+[submodule "3rdParty/rta-makedata"]
+	path = 3rdParty/rta-makedata
+	url = https://github.com/darbotdb/rta-makedata
+[submodule "scripts/toolbox/feed"]
+	path = scripts/toolbox/feed
+	url = https://github.com/darbotdb/feed.git
+[submodule "3rdParty/v8-build"]
+	path = 3rdParty/v8-build/v8
+	url = https://github.com/darbotdb/v8.git
+[submodule "3rdParty/nghttp2"]
+	path = 3rdParty/nghttp2-lib
+	url = https://github.com/darbotdb/nghttp2.git
+[submodule "3rdParty/faiss"]
+	path = 3rdParty/faiss
+	url = https://github.com/darbotdb/faiss.git
+[submodule "3rdParty/lz4"]
+	path = 3rdParty/lz4
+	url = https://github.com/lz4/lz4.git

@@ -1,0 +1,200 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 ArangoDB GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/arangodb/arangodb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is ArangoDB GmbH, Cologne, Germany
+///
+/// @author Simon Grätzer
+////////////////////////////////////////////////////////////////////////////////
+
+#include "GeneralCommTask.h"
+
+#include "ApplicationFeatures/ApplicationServer.h"
+#include "Basics/StringUtils.h"
+#include "GeneralServer/GeneralServer.h"
+#include "GeneralServer/GeneralServerFeature.h"
+#include "Logger/LogContext.h"
+#include "Logger/LogMacros.h"
+#include "Logger/Logger.h"
+#include "Logger/LoggerStream.h"
+
+using namespace arangodb;
+using namespace arangodb::rest;
+
+template<SocketType T>
+GeneralCommTask<T>::GeneralCommTask(GeneralServer& server, ConnectionInfo info,
+                                    std::shared_ptr<AsioSocket<T>> socket)
+    : CommTask(server, std::move(info)),
+      _protocol(std::move(socket)),
+      _reading(false),
+      _writing(false),
+      _stopped(false) {
+  if (AsioSocket<T>::supportsMixedIO()) {
+    _protocol->setNonBlocking(true);
+  }
+}
+
+template<SocketType T>
+void GeneralCommTask<T>::stop() {
+  _stopped.store(true, std::memory_order_release);
+  if (!_protocol) {
+    return;
+  }
+  asio_ns::dispatch(_protocol->context.io_context, [self = shared_from_this()] {
+    static_cast<GeneralCommTask<T>&>(*self).close(asio_ns::error_code());
+  });
+}
+
+template<SocketType T>
+void GeneralCommTask<T>::close(asio_ns::error_code const& ec) {
+  _stopped.store(true, std::memory_order_release);
+  if (ec && (ec != asio_ns::error::misc_errors::eof &&
+             ec != asio_ns::ssl::error::stream_truncated)) {
+    // stream_truncated will occur when a peer closes an SSL/TLS connection
+    // without performing a proper connection shutdown. unfortunately that
+    // can happen at any time, and we have no control over it.
+    LOG_TOPIC("2b6b3", WARN, arangodb::Logger::REQUESTS)
+        << "asio IO error: '" << ec.message() << "'";
+  }
+
+  if (_protocol) {
+    _protocol->timer.cancel();
+    _protocol->shutdown(
+        [this, self(shared_from_this())](asio_ns::error_code ec) {
+          if (ec) {
+            LOG_TOPIC("2c6b4", INFO, arangodb::Logger::REQUESTS)
+                << "error shutting down asio socket: '" << ec.message() << "'";
+          }
+          _server.unregisterTask(this);
+        });
+  } else {
+    _server.unregisterTask(this);  // will delete us
+  }
+}
+
+template<SocketType T>
+void GeneralCommTask<T>::asyncReadSome() try {
+  asio_ns::error_code ec;
+  // first try a sync read for performance
+  if (AsioSocket<T>::supportsMixedIO()) {
+    std::size_t available = _protocol->available(ec);
+
+    while (!ec && available > 8) {
+      auto mutableBuff = _protocol->buffer.prepare(available);
+      size_t nread = _protocol->socket.read_some(mutableBuff, ec);
+      _protocol->buffer.commit(nread);
+      if (ec) {
+        break;
+      }
+
+      if (!readCallback(ec)) {
+        return;
+      }
+      available = _protocol->available(ec);
+    }
+    if (ec == asio_ns::error::would_block) {
+      ec.clear();
+    }
+  }
+
+  // read pipelined requests / remaining data
+  if (_protocol->buffer.size() > 0 && !readCallback(ec)) {
+    return;
+  }
+
+  auto mutableBuff = _protocol->buffer.prepare(ReadBlockSize);
+
+  _reading = true;
+  setIOTimeout();
+  _protocol->socket.async_read_some(
+      mutableBuff,
+      withLogContext([self = shared_from_this()](asio_ns::error_code const& ec,
+                                                 size_t nread) {
+        auto& me = static_cast<GeneralCommTask<T>&>(*self);
+        me._reading = false;
+        me._protocol->buffer.commit(nread);
+
+        try {
+          if (me.readCallback(ec)) {
+            me.asyncReadSome();
+          }
+        } catch (...) {
+          LOG_TOPIC("2c6b6", ERR, arangodb::Logger::REQUESTS)
+              << "unhandled protocol exception, closing connection";
+          me.close(ec);
+        }
+      }));
+} catch (...) {
+  LOG_TOPIC("2c6b5", ERR, arangodb::Logger::REQUESTS)
+      << "unhandled protocol exception, closing connection";
+  close();
+}
+
+template<SocketType T>
+void GeneralCommTask<T>::logRequestHeaders(
+    std::string_view protocol,
+    std::unordered_map<std::string, std::string> const& headers) const {
+  std::string headersForLogging = basics::StringUtils::headersToString(headers);
+  LOG_TOPIC("b9e77", TRACE, Logger::REQUESTS)
+      << "\"" << protocol << "-request-headers\",\"" << (void*)this << "\",\""
+      << headersForLogging << "\"";
+}
+
+template<SocketType T>
+void GeneralCommTask<T>::logRequestBody(std::string_view protocol,
+                                        arangodb::rest::ContentType contentType,
+                                        std::string_view body,
+                                        bool isResponse) const {
+  std::string bodyForLogging;
+  if (contentType != ContentType::VPACK) {
+    bodyForLogging = basics::StringUtils::escapeUnicode(body);
+  } else {
+    try {
+      velocypack::Slice s{reinterpret_cast<uint8_t const*>(body.data())};
+      if (!s.isNone()) {
+        // "none" can happen if the content-type is neither JSON nor vpack
+        bodyForLogging = basics::StringUtils::escapeUnicode(s.toJson());
+      }
+    } catch (...) {
+      // cannot stringify request body
+    }
+
+    if (bodyForLogging.empty() && !body.empty()) {
+      bodyForLogging = "potential binary data";
+    }
+  }
+
+  LOG_TOPIC("8f554", TRACE, Logger::REQUESTS)
+      << "\"" << protocol << (isResponse ? "-response" : "-request")
+      << "-body\",\"" << (void*)this << "\",\""
+      << rest::contentTypeToString(contentType) << "\",\"" << body.size()
+      << "\",\"" << bodyForLogging << "\"";
+}
+
+template<SocketType T>
+void GeneralCommTask<T>::logResponseHeaders(
+    std::string_view protocol,
+    std::unordered_map<std::string, std::string> const& headers) const {
+  std::string headersForLogging = basics::StringUtils::headersToString(headers);
+  LOG_TOPIC("8f553", TRACE, Logger::REQUESTS)
+      << "\"" << protocol << "-response-headers\",\"" << (void*)this << "\",\""
+      << headersForLogging << "\"";
+}
+
+template class arangodb::rest::GeneralCommTask<SocketType::Tcp>;
+template class arangodb::rest::GeneralCommTask<SocketType::Ssl>;
+template class arangodb::rest::GeneralCommTask<SocketType::Unix>;

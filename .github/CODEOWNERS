@@ -1,0 +1,15 @@
+# please check the following Github page for documentation:
+#   https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# `documentation-team` ownership
+/Documentation/ @darbotdb/team-documentation
+/utils/*Documentation* @darbotdb/team-documentation
+
+# `qa-team` ownership
+/Installation/ @darbotdb/team-qa
+/scripts/ @darbotdb/team-qa
+/etc/ @darbotdb/team-qa
+/tests/test-definitions.txt @darbotdb/team-qa
+
+# `team-frontend` ownership
+/js/apps/system/_admin/aardvark/APP/ @darbotdb/team-frontend

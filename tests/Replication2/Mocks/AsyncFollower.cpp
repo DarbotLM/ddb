@@ -1,0 +1,143 @@
+////////////////////////////////////////////////////////////////////////////////
+/// DISCLAIMER
+///
+/// Copyright 2014-2024 darbotdb GmbH, Cologne, Germany
+/// Copyright 2004-2014 triAGENS GmbH, Cologne, Germany
+///
+/// Licensed under the Business Source License 1.1 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///     https://github.com/darbotdb/darbotdb/blob/devel/LICENSE
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+///
+/// Copyright holder is darbotdb GmbH, Cologne, Germany
+///
+/// @author Lars Maier
+////////////////////////////////////////////////////////////////////////////////
+#include "AsyncFollower.h"
+
+#include <utility>
+
+#include "Replication2/ReplicatedLog/ILogInterfaces.h"
+#include "Replication2/ReplicatedLog/LogCore.h"
+#include "Replication2/ReplicatedLog/LogStatus.h"
+
+using namespace darbotdb;
+using namespace darbotdb::replication2;
+using namespace darbotdb::replication2::replicated_log;
+using namespace darbotdb::replication2::test;
+
+auto AsyncFollower::getStatus() const -> LogStatus {
+  return _follower->getStatus();
+}
+
+auto AsyncFollower::getQuickStatus() const -> QuickLogStatus {
+  return _follower->getQuickStatus();
+}
+
+auto AsyncFollower::resign() && -> std::tuple<std::unique_ptr<LogCore>,
+                                              DeferredAction> {
+  return std::move(*_follower).resign();
+}
+
+auto AsyncFollower::waitFor(darbotdb::replication2::LogIndex index)
+    -> WaitForFuture {
+  return _follower->waitFor(index);
+}
+
+auto AsyncFollower::release(darbotdb::replication2::LogIndex doneWithIdx)
+    -> Result {
+  return _follower->release(doneWithIdx);
+}
+
+auto AsyncFollower::compact() -> Result { return _follower->compact(); }
+
+auto AsyncFollower::getParticipantId() const noexcept -> ParticipantId const& {
+  return _follower->getParticipantId();
+}
+
+auto AsyncFollower::waitForIterator(LogIndex index) -> WaitForIteratorFuture {
+  return _follower->waitForIterator(index);
+}
+
+auto AsyncFollower::getCommitIndex() const noexcept -> LogIndex {
+  return _follower->getCommitIndex();
+}
+
+auto AsyncFollower::waitForLeaderAcked() -> WaitForFuture {
+  return _follower->waitForLeaderAcked();
+}
+
+auto AsyncFollower::getLeader() const noexcept
+    -> std::optional<ParticipantId> const& {
+  return _follower->getLeader();
+}
+
+auto AsyncFollower::appendEntries(AppendEntriesRequest request)
+    -> futures::Future<AppendEntriesResult> {
+  std::unique_lock guard(_mutex);
+  _cv.notify_all();
+  return _requests.emplace_back(std::move(request)).promise.getFuture();
+}
+
+AsyncFollower::AsyncFollower(
+    std::shared_ptr<replicated_log::LogFollower> follower)
+    : _follower(std::move(follower)),
+      _asyncWorker([this] { this->runWorker(); }) {}
+
+AsyncFollower::~AsyncFollower() noexcept {
+  if (!_stopping) {
+    stop();
+  }
+}
+
+void AsyncFollower::runWorker() {
+  while (true) {
+    std::vector<AsyncRequest> requests;
+    {
+      std::unique_lock guard(_mutex);
+      if (_stopping) {
+        break;
+      }
+      if (!_requests.empty()) {
+        std::swap(requests, _requests);
+      } else {
+        _cv.wait(guard);
+      }
+    }
+
+    for (auto& req : requests) {
+      _follower->appendEntries(req.request)
+          .thenFinal([promise = std::move(req.promise)](auto&& res) mutable {
+            promise.setValue(std::forward<decltype(res)>(res));
+          });
+    }
+  }
+}
+
+void AsyncFollower::stop() noexcept {
+  {
+    std::unique_lock guard(_mutex);
+    _stopping = true;
+    _cv.notify_all();
+  }
+
+  TRI_ASSERT(_asyncWorker.joinable());
+  _asyncWorker.join();
+}
+
+auto AsyncFollower::waitForResign() -> futures::Future<futures::Unit> {
+  return _follower->waitForResign();
+}
+InMemoryLog AsyncFollower::copyInMemoryLog() const {
+  return _follower->copyInMemoryLog();
+}
+
+AsyncFollower::AsyncRequest::AsyncRequest(AppendEntriesRequest request)
+    : request(std::move(request)) {}
