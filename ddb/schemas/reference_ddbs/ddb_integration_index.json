@@ -1,0 +1,35 @@
+{
+  "$schema": "../kg_dv_schema.schema.json",
+  "manifestName": "ddb_integration_index",
+  "version": "1.0.0",
+  "kind": "integration-index",
+  "description": "Deployable reference integration index for graph, vector, Dataverse, AC3 card, MCP, and micro DB schema alignment.",
+  "indexes": [
+    {
+      "id": "dataverse-table-index",
+      "backend": "dataverse",
+      "indexType": "table",
+      "pathPattern": "solution->table->column->relationship"
+    },
+    {
+      "id": "ac3-card-index",
+      "backend": "adaptive-card",
+      "indexType": "schema",
+      "pathPattern": "agent->card->semanticAttributes->relatableEntities"
+    },
+    {
+      "id": "mcp-tool-index",
+      "backend": "mcp",
+      "indexType": "tool",
+      "pathPattern": "agent->tool->connector->capability"
+    },
+    {
+      "id": "micro-db-index",
+      "backend": "sqlite-ddb",
+      "indexType": "session",
+      "pathPattern": "session->card->triple->metadata"
+    }
+  ],
+  "deployableFromInstaller": true
+}
+

@@ -199,6 +199,24 @@ All 58 tools use complete Zod 4 schemas matching the OpenAPI spec exactly:
 - **Defaults** use `.default()` where the API specifies them
 - **Reusable schemas**: `AGUIMessageSchema`, `AGUIToolSchema`, `AGUIContextSchema` are defined once and shared
 
+### Packaged schema resources
+
+The MCP server is aligned with first-party DDB schema resources:
+
+| Schema | Location | Use |
+|---|---|---|
+| `kg_dv_schema` | `../schemas/kg_dv_schema.json` | Dataverse table/column/relationship/index contract for DDB knowledge graph metadata |
+| `ac3_adaptive_agent_card` | `../schemas/ac3_adaptive_agent_card.schema.json` | Adaptive Card 3.0-style YAML cards for adaptive agents, workflows, tools, connectors, and DDB metadata |
+
+These resources are intentionally kept outside `server.ts` so tools, docs, Dataverse generators, and card import scripts can share the same contracts.
+
+The schemas also define semantic metadata used by MCP tools and UI resources:
+
+- **Relatable attributes** for aliases, topics, capabilities, path patterns, vectors, and routing hints.
+- **Provenance** for source URI, observation timestamp, model, and hash.
+- **Lineage** for agent/tool/workflow steps that created or transformed a card.
+- **Relationship patterns** for consistent graph traversal and Dataverse projection.
+
 ## Development
 
 ```bash

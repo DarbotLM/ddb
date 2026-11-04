@@ -1,0 +1,48 @@
+{
+  "$schema": "../kg_dv_schema.schema.json",
+  "manifestName": "ddb_reference_kg",
+  "version": "1.0.0",
+  "kind": "knowledge-graph",
+  "description": "Deployable reference DDB knowledge graph manifest aligned to Dataverse, DDB graph collections, SQLite micro DBs, and vector indexes.",
+  "databaseTargets": [
+    {
+      "id": "dataverse",
+      "kind": "dataverse",
+      "schema": "kg_dv_schema",
+      "tables": [
+        "ddb_kgentity",
+        "ddb_kgrelationship",
+        "ddb_adaptivecard",
+        "ddb_agentconfig",
+        "ddb_memoryzone",
+        "ddb_session",
+        "ddb_manifest",
+        "ddb_connector",
+        "ddb_workflow",
+        "ddb_integrationindex"
+      ]
+    },
+    {
+      "id": "darbotdb",
+      "kind": "graph-document",
+      "collections": ["entities", "relationships", "cards", "agents", "sessions", "patterns", "memory_zones"],
+      "edgeCollections": ["relationships", "card_to_card", "card_to_agent", "card_to_zone"]
+    },
+    {
+      "id": "qdrant",
+      "kind": "vector-store",
+      "collections": ["entity-embeddings", "document-embeddings"],
+      "dimension": 5376,
+      "distance": "cosine"
+    }
+  ],
+  "semanticPathPatterns": [
+    "adaptive-card->evidence->entity",
+    "entity->relationship->entity",
+    "entity->embedding->nearest-entity",
+    "workflow->connector->integration-index",
+    "agent->session->adaptive-card->memory-zone"
+  ],
+  "metadataProfiles": ["provenance", "semantic-relatability", "lineage"]
+}
+

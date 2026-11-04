@@ -1,0 +1,42 @@
+{
+  "$schema": "../kg_dv_schema.schema.json",
+  "manifestName": "ddb_agent_memory",
+  "version": "1.0.0",
+  "kind": "sqlite-micro-db",
+  "description": "Deployable reference SQLite .ddb micro database manifest for agent/session memory cards and graph facts.",
+  "sqlite": {
+    "fileExtension": ".ddb",
+    "tables": [
+      {
+        "name": "cards",
+        "purpose": "Adaptive card payloads, metadata, and searchable memory facts."
+      },
+      {
+        "name": "triples",
+        "purpose": "Subject-predicate-object graph facts with confidence and provenance."
+      },
+      {
+        "name": "embeddings",
+        "purpose": "Vector references and embedding metadata."
+      },
+      {
+        "name": "metadata",
+        "purpose": "Session, zone, schema, and installer metadata."
+      }
+    ],
+    "indexes": [
+      "cards_fts",
+      "triples_subject_predicate",
+      "triples_object_predicate",
+      "metadata_key"
+    ]
+  },
+  "semanticAttributes": [
+    "ddb_confidence",
+    "ddb_provenancejson",
+    "ddb_lineagejson",
+    "ddb_semanticattributesjson",
+    "ddb_sensitivitylabel"
+  ]
+}
+

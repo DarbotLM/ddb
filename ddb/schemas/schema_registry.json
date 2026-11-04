@@ -1,0 +1,47 @@
+{
+  "$schema": "https://darbotlabs.com/schemas/ddb/schema_registry.schema.json",
+  "registryName": "ddb_reference_schema_registry",
+  "version": "1.0.0",
+  "description": "Reference schema registry for DDB semantic alignment, Dataverse knowledge graphs, AC3 adaptive agent cards, and deployable DDB manifests.",
+  "schemas": [
+    {
+      "id": "kg_dv_schema",
+      "title": "DDB Dataverse Knowledge Graph Schema",
+      "schemaPath": "kg_dv_schema.schema.json",
+      "referencePath": "kg_dv_schema.json",
+      "kind": "dataverse-knowledge-graph",
+      "deployable": true,
+      "description": "Dataverse-aligned solution/table/index contract for DDB knowledge graph metadata."
+    },
+    {
+      "id": "ac3_adaptive_agent_card",
+      "title": "AC3 Adaptive Agent Card",
+      "schemaPath": "ac3_adaptive_agent_card.schema.json",
+      "referencePath": "ac3_adaptive_agent_card.example.yaml",
+      "kind": "adaptive-agent-card",
+      "deployable": true,
+      "description": "Adaptive Card 3.0-style YAML contract for adaptive agents, workflows, tools, connectors, and DDB metadata."
+    }
+  ],
+  "referenceDdbs": [
+    {
+      "id": "ddb_reference_kg",
+      "manifestPath": "reference_ddbs/ddb_reference_kg.json",
+      "kind": "knowledge-graph",
+      "deployable": true
+    },
+    {
+      "id": "ddb_agent_memory",
+      "manifestPath": "reference_ddbs/ddb_agent_memory.json",
+      "kind": "sqlite-micro-db",
+      "deployable": true
+    },
+    {
+      "id": "ddb_integration_index",
+      "manifestPath": "reference_ddbs/ddb_integration_index.json",
+      "kind": "integration-index",
+      "deployable": true
+    }
+  ]
+}
+

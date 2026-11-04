@@ -11,6 +11,10 @@
 #   memory_zones    - ensure card zones exist
 #
 # Usage: bash scripts/import-agentcards.sh
+#
+# Schema note:
+#   Imported cards can be projected into ddb/schemas/ac3_adaptive_agent_card.schema.json.
+#   Dataverse table/index alignment is documented in ddb/schemas/kg_dv_schema.json.
 
 set -euo pipefail
 

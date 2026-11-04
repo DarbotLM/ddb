@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://darbotlabs.com/schemas/ddb/ac3_adaptive_agent_card.schema.json",
+  "title": "AC3 Adaptive Agent YAML Card",
+  "description": "YAML-friendly Adaptive Card 3.0 contract for DDB adaptive agent cards.",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": { "const": "adaptivecards.io/v3" },
+    "kind": { "const": "AdaptiveAgentCard" },
+    "metadata": {
+      "type": "object",
+      "required": ["name", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,120}$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "description": { "type": "string" },
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "labels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "required": ["agent", "card"],
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "object",
+          "required": ["id", "scope"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "type": "string" },
+            "role": { "enum": ["observer", "orchestrator", "synthesizer", "explorer", "reviewer", "assistant", "custom"] },
+            "scope": { "enum": ["agent", "session", "workspace", "zone", "memory"] },
+            "memoryZones": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "tools": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "connectors": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        },
+        "card": {
+          "type": "object",
+          "required": ["type", "version", "body"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "AdaptiveCard" },
+            "version": { "const": "3.0" },
+            "$schema": { "type": "string", "default": "https://adaptivecards.io/schemas/adaptive-card.json" },
+            "body": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/cardElement" }
+            },
+            "actions": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/action" }
+            },
+            "refresh": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "authentication": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        },
+        "ddb": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cardType": { "enum": ["memory", "task", "observation", "pattern", "index"] },
+            "zone": { "type": "string" },
+            "tags": { "type": "array", "items": { "type": "string" } },
+            "entityId": { "type": "string" },
+            "entityKind": { "type": "string" },
+            "manifestId": { "type": "string" },
+            "viewId": { "type": "string" },
+            "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+            "sensitivity": { "type": "string" },
+            "semanticAttributes": {
+              "type": "object",
+              "description": "Schema-first relatable attributes used for indexing, routing, and graph projection.",
+              "additionalProperties": true
+            },
+            "relatableEntities": {
+              "type": "array",
+              "description": "Entity references this card can be semantically related to.",
+              "items": {
+                "type": "object",
+                "required": ["id", "relationship"],
+                "additionalProperties": false,
+                "properties": {
+                  "id": { "type": "string" },
+                  "kind": { "type": "string" },
+                  "relationship": { "type": "string" },
+                  "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                  "metadata": { "type": "object", "additionalProperties": true }
+                }
+              }
+            },
+            "provenance": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "source": { "type": "string" },
+                "sourceType": { "type": "string" },
+                "sourceUri": { "type": "string" },
+                "observedAt": { "type": "string" },
+                "model": { "type": "string" },
+                "hash": { "type": "string" }
+              }
+            },
+            "lineage": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["step"],
+                "additionalProperties": false,
+                "properties": {
+                  "step": { "type": "string" },
+                  "agentId": { "type": "string" },
+                  "tool": { "type": "string" },
+                  "timestamp": { "type": "string" },
+                  "metadata": { "type": "object", "additionalProperties": true }
+                }
+              }
+            },
+            "links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["type", "uri"],
+                "additionalProperties": false,
+                "properties": {
+                  "type": { "enum": ["graph_node", "micro_db", "agent", "card", "external", "manifest", "scene", "dataverse"] },
+                  "uri": { "type": "string" },
+                  "metadata": { "type": "object", "additionalProperties": true }
+                }
+              }
+            }
+          }
+        },
+        "workflow": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "status": { "enum": ["draft", "active", "blocked", "complete", "archived"] },
+            "semanticPath": { "type": "string" },
+            "inputs": { "type": "object", "additionalProperties": true },
+            "outputs": { "type": "object", "additionalProperties": true },
+            "relates": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["from", "to", "relationship"],
+                "additionalProperties": false,
+                "properties": {
+                  "from": { "type": "string" },
+                  "to": { "type": "string" },
+                  "relationship": { "type": "string" },
+                  "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+                }
+              }
+            },
+            "nextActions": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "cardElement": {
+      "oneOf": [
+        { "$ref": "#/$defs/textBlock" },
+        { "$ref": "#/$defs/factSet" },
+        { "$ref": "#/$defs/container" },
+        { "$ref": "#/$defs/image" },
+        { "$ref": "#/$defs/table" }
+      ]
+    },
+    "textBlock": {
+      "type": "object",
+      "required": ["type", "text"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "const": "TextBlock" },
+        "text": { "type": "string" },
+        "wrap": { "type": "boolean" },
+        "weight": { "type": "string" },
+        "size": { "type": "string" },
+        "style": { "type": "string" }
+      }
+    },
+    "factSet": {
+      "type": "object",
+      "required": ["type", "facts"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "const": "FactSet" },
+        "facts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["title", "value"],
+            "additionalProperties": false,
+            "properties": {
+              "title": { "type": "string" },
+              "value": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "container": {
+      "type": "object",
+      "required": ["type", "items"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "const": "Container" },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/cardElement" }
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "required": ["type", "url"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "const": "Image" },
+        "url": { "type": "string" },
+        "altText": { "type": "string" }
+      }
+    },
+    "table": {
+      "type": "object",
+      "required": ["type", "columns", "rows"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "const": "Table" },
+        "columns": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "rows": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+      }
+    },
+    "action": {
+      "type": "object",
+      "required": ["type", "title"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "enum": ["Action.Execute", "Action.OpenUrl", "Action.Submit", "Action.ShowCard", "Action.ToggleVisibility"] },
+        "title": { "type": "string" },
+        "verb": { "type": "string" },
+        "data": { "type": "object", "additionalProperties": true },
+        "url": { "type": "string" }
+      }
+    }
+  }
+}
+

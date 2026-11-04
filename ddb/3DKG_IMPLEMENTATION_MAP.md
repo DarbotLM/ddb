@@ -48,6 +48,8 @@ This is a comprehensive 3D Knowledge Graph (3DKG) feature set implementation pla
 - builder.py: CardBuilder fluent API
 - templates.py: Card presets (memory, task, observation, pattern, index)
 - validator.py: Card validation, hash computation
+- schemas/ac3_adaptive_agent_card.schema.json: Adaptive Card 3.0-style YAML contract for adaptive agent cards
+- schemas/kg_dv_schema.json: Dataverse-aligned KG table, relationship, key, and index metadata
 
 **Triad Engine** (\./triad/\):
 - engine.py: TriadEngine (Observer/Orchestrator/Synthesizer)

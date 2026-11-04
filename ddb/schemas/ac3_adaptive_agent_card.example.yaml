@@ -1,0 +1,113 @@
+apiVersion: adaptivecards.io/v3
+kind: AdaptiveAgentCard
+metadata:
+  name: kg-ingestion-summary
+  title: Knowledge Graph Ingestion Summary
+  description: Summary card for a DDB agent workflow that ingests Dataverse-aligned knowledge graph data.
+  version: 1.0.0
+  labels:
+    ddb.zone: knowledge
+    ddb.cardType: observation
+spec:
+  agent:
+    id: ddb-kg-ingestor
+    role: observer
+    scope: session
+    memoryZones:
+      - knowledge
+      - dataverse
+    tools:
+      - ddb-card-render
+      - ddb-memory-store
+      - ddb-graph-link
+    connectors:
+      - dataverse
+      - darbotdb
+  ddb:
+    cardType: observation
+    zone: knowledge
+    tags:
+      - dataverse
+      - knowledge-graph
+      - ac3
+    entityId: ddb_kgentity/sample
+    entityKind: dataverse-table
+    confidence: 0.94
+    sensitivity: internal
+    semanticAttributes:
+      sourceSystem: dataverse
+      entityType: schema-table
+      pathPattern: adaptive-card->evidence->entity
+      integrationIndex: ddb_integrationindex
+    relatableEntities:
+      - id: ddb_kgentity/ddb_integrationindex
+        kind: dataverse-table
+        relationship: evidence_for
+        confidence: 0.9
+        metadata:
+          reason: Defines index-of-index metadata for graph integration.
+      - id: ddb_connector/dataverse
+        kind: connector
+        relationship: depends_on
+        confidence: 0.86
+    provenance:
+      source: kg_dv_schema
+      sourceType: schema
+      sourceUri: ddb://schemas/kg_dv_schema
+      observedAt: "2026-05-27T00:00:00Z"
+      model: human-authored
+    lineage:
+      - step: schema-authoring
+        agentId: ddb-kg-ingestor
+        tool: schema-resource
+        timestamp: "2026-05-27T00:00:00Z"
+    links:
+      - type: dataverse
+        uri: dataverse://ddb_kgentity
+      - type: manifest
+        uri: ddb://manifest/kg_dv_schema
+  workflow:
+    status: active
+    semanticPath: adaptive-card->evidence->entity->integration-index
+    inputs:
+      source: kg_dv_schema
+    outputs:
+      table: ddb_kgentity
+      index: ddb_integrationindex
+    relates:
+      - from: ddb_adaptivecard/kg-ingestion-summary
+        to: ddb_kgentity/sample
+        relationship: evidence_for
+        confidence: 0.94
+    nextActions:
+      - Validate Dataverse table mappings
+      - Store adaptive card in the session micro DB
+  card:
+    $schema: https://adaptivecards.io/schemas/adaptive-card.json
+    type: AdaptiveCard
+    version: "3.0"
+    body:
+      - type: TextBlock
+        text: Knowledge Graph Ingestion Summary
+        weight: Bolder
+        size: Large
+        wrap: true
+      - type: FactSet
+        facts:
+          - title: Solution
+            value: ddb_knowledge_graph
+          - title: Primary table
+            value: ddb_kgentity
+          - title: Index table
+            value: ddb_integrationindex
+      - type: TextBlock
+        text: Dataverse-aligned schema metadata is ready for graph, adaptive card, connector, workflow, and integration-index projections.
+        wrap: true
+    actions:
+      - type: Action.Execute
+        title: Store Memory
+        verb: ddb.memory.store
+        data:
+          zone: knowledge
+          cardType: observation
+

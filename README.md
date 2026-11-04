@@ -5,13 +5,33 @@ darbotdb
 faster. Native graphs, an integrated search engine, and JSON support, via a
 single query language.
 
-DDB will combine sqlite3 portability "micro dbs" that can be agent compostable, verifiable, persistent, isolate or shared, indentified or anonymous, authenticated or unauthenticated. 
+DDB combines SQLite3 portability through micro DBs with graph storage, adaptive cards, MCP tools, and agent-first indexing. Micro DBs can be composable, verifiable, persistent, isolated or shared, identified or anonymous, and authenticated or unauthenticated.
 
-DDB is ideal for agent database and neural net with compostable adaptive flash cards and semantic first architectural patterns. 
+DDB is designed for agent databases, adaptive flash cards, and semantic-first architectural patterns.
 
-Agent to agent, human to agent, agent to agent swarm, swarm to human in the loop, compostable "memory" files for relevant radial data zones. DDB is ideal for parallel observer/orchestrator/synthesizer (three in one in parallel behind the scenes) to identify early patterns and "remember forward" by accessing and sharing the adaptive memory card file. 
+DDB supports agent-to-agent, human-to-agent, swarm-to-agent, and swarm-to-human-in-the-loop workflows with composable memory files for relevant radial data zones. The observer/orchestrator/synthesizer triad can run in parallel to identify early patterns and "remember forward" through adaptive memory cards.
 
-Adaptive cards that are Model Context Protocol (MCP) apps, but care also generative, and the adaptive card is UI friendly for humans while being and adaptive flash card presenting data in a schema-first method for agents (adaptive card json), perfect for subclase querry and semantic indexing- index of index, cross index, deep relationship patterns while still separating the personal details from the task/action/output since it schema driven. 
+Adaptive cards can be MCP apps, generative agent payloads, and UI-friendly human views at the same time. They present data in a schema-first format for agents, enabling subclass queries, semantic indexes, index-of-index patterns, cross-index traversal, and deep relationship discovery while keeping personal details separate from task, action, and output metadata.
+
+### Schema Contracts
+
+DDB ships first-party schema resources in [`ddb/schemas`](ddb/schemas):
+
+- **`kg_dv_schema`** — Dataverse-aligned knowledge graph metadata for entities, relationships, adaptive cards, agent configs, and integration indexes.
+- **`ac3_adaptive_agent_card`** — Adaptive Card 3.0-style YAML contract for adaptive agent cards with DDB metadata, workflow state, memory zones, tools, and connectors.
+
+These schemas keep Dataverse storage, SQLite `.ddb` micro DBs, MCP tools, and adaptive cards aligned around stable names and professional presentation-ready path patterns.
+
+The schema contracts also include semantic relatability metadata: confidence, provenance, lineage, sensitivity, semantic attributes, relatable entities, and relationship path patterns. This allows DDB to preserve flexible agent context while still projecting cleanly into Dataverse tables, graph indexes, micro DBs, and adaptive cards.
+
+Install and validate the reference schema bundle:
+
+```bash
+python scripts/validate-schemas.py
+python scripts/install-ddb-reference-schemas.py --target ~/.ddb/schemas --create-reference-microdb
+```
+
+The installer copies the full schema registry and deployable reference DDB manifests, and can seed a SQLite `.ddb` micro database at `~/.ddb/reference/ddb_agent_memory.ddb`.
 
 ### What's New in darbotdb
 
@@ -25,6 +45,7 @@ darbotdb extends ArangoDB with powerful modern integrations and platform support
 - **3D Knowledge Graph (3DKG)**: Spatial graph engine with nearest-neighbor, bounding-box, shortest-path, and layout algorithms
 - **Txt2KG Pipeline**: LLM-powered triple extraction, RAG search, and bidirectional bridge between micro DBs and knowledge graphs
 - **AG-UI Protocol**: Agent-to-UI conversation threading with replay and ingestion
+- **Dataverse + AC3 Schemas**: Packaged `kg_dv_schema` and `ac3_adaptive_agent_card` contracts for Dataverse, adaptive card, agent, workflow, and integration-index interoperability
 
 ### MCP Server
 
@@ -45,9 +66,9 @@ Getting Started with darbotdb
 
 Start darbotdb in a Docker container (with Arm64 support):
 
-    docker run -e DDB_ROOT_PASSWORD=test123 -p 8529:8529 -d darbotdb
+    docker run -e DDB_ROOT_PASSWORD=test123 -p 8008:8529 -d darbotdb
 
-Then point your browser to `http://127.0.0.1:8529/`.
+Then point your browser to `http://127.0.0.1:8008/`.
 
 ### Upstream Resources
 

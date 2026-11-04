@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://darbotlabs.com/schemas/ddb/kg_dv_schema.schema.json",
+  "title": "DDB Dataverse Knowledge Graph Schema",
+  "description": "Dataverse-aligned schema contract for DDB knowledge graph tables, columns, relationships, keys, and indexes.",
+  "type": "object",
+  "required": ["schemaName", "publisher", "solution", "tables"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaName": { "const": "kg_dv_schema" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "description": { "type": "string" },
+    "publisher": {
+      "type": "object",
+      "required": ["prefix", "uniqueName", "displayName"],
+      "additionalProperties": false,
+      "properties": {
+        "prefix": { "type": "string", "pattern": "^[a-z][a-z0-9]{1,7}$" },
+        "uniqueName": { "type": "string" },
+        "displayName": { "type": "string" }
+      }
+    },
+    "solution": {
+      "type": "object",
+      "required": ["uniqueName", "displayName", "version", "managed"],
+      "additionalProperties": false,
+      "properties": {
+        "uniqueName": { "type": "string" },
+        "displayName": { "type": "string" },
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+\\.\\d+$" },
+        "managed": { "type": "boolean" }
+      }
+    },
+    "tables": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/table" }
+    },
+    "choices": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/choice" }
+    },
+    "semanticAttributes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/semanticAttribute" }
+    },
+    "relationshipPatterns": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/relationshipPattern" }
+    },
+    "metadataProfiles": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/metadataProfile" }
+    }
+  },
+  "$defs": {
+    "localizedLabel": {
+      "type": "object",
+      "required": ["label"],
+      "additionalProperties": false,
+      "properties": {
+        "label": { "type": "string" },
+        "languageCode": { "type": "integer", "default": 1033 }
+      }
+    },
+    "table": {
+      "type": "object",
+      "required": [
+        "logicalName",
+        "schemaName",
+        "displayName",
+        "displayCollectionName",
+        "ownershipType",
+        "primaryIdAttribute",
+        "primaryNameAttribute",
+        "columns"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "logicalName": { "type": "string", "pattern": "^[a-z][a-z0-9]*_[a-z][a-z0-9_]*$" },
+        "schemaName": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$" },
+        "displayName": { "$ref": "#/$defs/localizedLabel" },
+        "displayCollectionName": { "$ref": "#/$defs/localizedLabel" },
+        "description": { "$ref": "#/$defs/localizedLabel" },
+        "ownershipType": { "enum": ["UserOwned", "OrganizationOwned"] },
+        "primaryIdAttribute": { "type": "string" },
+        "primaryNameAttribute": { "type": "string" },
+        "tableType": { "enum": ["Standard", "Activity", "Elastic"], "default": "Standard" },
+        "isAuditEnabled": { "type": "boolean", "default": true },
+        "isSearchable": { "type": "boolean", "default": true },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/column" }
+        },
+        "relationships": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/relationship" }
+        },
+        "alternateKeys": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/alternateKey" }
+        },
+        "indexes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/index" }
+        }
+      }
+    },
+    "column": {
+      "type": "object",
+      "required": ["logicalName", "schemaName", "displayName", "type", "requiredLevel"],
+      "additionalProperties": false,
+      "properties": {
+        "logicalName": { "type": "string" },
+        "schemaName": { "type": "string" },
+        "displayName": { "$ref": "#/$defs/localizedLabel" },
+        "description": { "$ref": "#/$defs/localizedLabel" },
+        "type": {
+          "enum": [
+            "Uniqueidentifier",
+            "String",
+            "Memo",
+            "Integer",
+            "BigInt",
+            "Decimal",
+            "Double",
+            "Boolean",
+            "DateTime",
+            "Picklist",
+            "MultiSelectPicklist",
+            "Lookup",
+            "Customer",
+            "Owner",
+            "Virtual"
+          ]
+        },
+        "requiredLevel": { "enum": ["None", "SystemRequired", "ApplicationRequired", "Recommended"] },
+        "maxLength": { "type": "integer", "minimum": 1 },
+        "precision": { "type": "integer", "minimum": 0 },
+        "targets": { "type": "array", "items": { "type": "string" } },
+        "choice": { "type": "string" },
+        "format": { "type": "string" },
+        "isSearchable": { "type": "boolean", "default": true },
+        "isSecured": { "type": "boolean", "default": false }
+      }
+    },
+    "relationship": {
+      "type": "object",
+      "required": ["schemaName", "type", "referencedTable", "referencingColumn"],
+      "additionalProperties": false,
+      "properties": {
+        "schemaName": { "type": "string" },
+        "type": { "enum": ["OneToMany", "ManyToOne", "ManyToMany"] },
+        "referencedTable": { "type": "string" },
+        "referencingColumn": { "type": "string" },
+        "cascadeConfiguration": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "assign": { "type": "string" },
+            "delete": { "type": "string" },
+            "merge": { "type": "string" },
+            "reparent": { "type": "string" },
+            "share": { "type": "string" },
+            "unshare": { "type": "string" }
+          }
+        }
+      }
+    },
+    "alternateKey": {
+      "type": "object",
+      "required": ["schemaName", "columns"],
+      "additionalProperties": false,
+      "properties": {
+        "schemaName": { "type": "string" },
+        "columns": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+      }
+    },
+    "index": {
+      "type": "object",
+      "required": ["name", "type", "columns"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "enum": ["dataverse-search", "alternate-key", "lookup", "semantic", "vector", "fts", "manifest", "external"] },
+        "columns": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "notes": { "type": "string" }
+      }
+    },
+    "choice": {
+      "type": "object",
+      "required": ["name", "options"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["value", "label"],
+            "additionalProperties": false,
+            "properties": {
+              "value": { "type": "integer" },
+              "label": { "$ref": "#/$defs/localizedLabel" }
+            }
+          }
+        }
+      }
+    },
+    "semanticAttribute": {
+      "type": "object",
+      "required": ["name", "category", "dataType", "appliesTo"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "displayName": { "$ref": "#/$defs/localizedLabel" },
+        "description": { "type": "string" },
+        "category": {
+          "enum": [
+            "identity",
+            "provenance",
+            "lineage",
+            "confidence",
+            "classification",
+            "vector",
+            "spatial",
+            "temporal",
+            "relationship",
+            "agent",
+            "workflow",
+            "integration"
+          ]
+        },
+        "dataType": {
+          "enum": ["string", "number", "boolean", "datetime", "json", "lookup", "picklist", "vector"]
+        },
+        "appliesTo": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "required": { "type": "boolean", "default": false },
+        "indexed": { "type": "boolean", "default": false },
+        "metadataPath": { "type": "string" }
+      }
+    },
+    "relationshipPattern": {
+      "type": "object",
+      "required": ["name", "sourceTable", "targetTable", "relationshipType", "pathPattern"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "displayName": { "$ref": "#/$defs/localizedLabel" },
+        "sourceTable": { "type": "string" },
+        "targetTable": { "type": "string" },
+        "relationshipType": { "type": "string" },
+        "pathPattern": { "type": "string" },
+        "reciprocalName": { "type": "string" },
+        "confidenceColumn": { "type": "string" },
+        "metadataColumns": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "metadataProfile": {
+      "type": "object",
+      "required": ["name", "appliesTo", "fields"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "appliesTo": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}
+

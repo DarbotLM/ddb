@@ -2,6 +2,8 @@
 /**
  * DarbotDB AgentCard Importer
  * Reads all AgentCards from OneDrive and imports them into the DDB graph.
+ * Imported cards should be treated as DDB adaptive card records and can be
+ * projected into the packaged AC3 schema at ddb/schemas/ac3_adaptive_agent_card.schema.json.
  *
  * Usage: node scripts/import-agentcards.mjs [cards-dir]
  */

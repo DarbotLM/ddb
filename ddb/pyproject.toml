@@ -25,7 +25,10 @@ darbotdb-api = "darbotdb.api.main:run"
 ddb-api = "darbotdb.api.main:run"
 
 [tool.setuptools]
-packages = ["darbotdb", "darango", "cards", "graph", "graph3d", "micro", "session", "triad", "agui", "txt2kg"]
+packages = ["darbotdb", "darango", "cards", "graph", "graph3d", "micro", "session", "triad", "agui", "txt2kg", "schemas"]
+
+[tool.setuptools.package-data]
+schemas = ["*.json", "*.yaml", "README.md", "reference_ddbs/*.json"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

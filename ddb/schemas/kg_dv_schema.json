@@ -1,0 +1,440 @@
+{
+  "$schema": "./kg_dv_schema.schema.json",
+  "schemaName": "kg_dv_schema",
+  "version": "1.0.0",
+  "description": "Dataverse-aligned DDB knowledge graph schema for entities, relationships, adaptive cards, agents, sessions, zones, manifests, connectors, workflows, and integration indexes.",
+  "publisher": {
+    "prefix": "ddb",
+    "uniqueName": "DarbotDB",
+    "displayName": "DarbotDB"
+  },
+  "solution": {
+    "uniqueName": "ddb_knowledge_graph",
+    "displayName": "DDB Knowledge Graph",
+    "version": "1.0.0.0",
+    "managed": false
+  },
+  "choices": [
+    {
+      "name": "ddb_kgcardtype",
+      "options": [
+        { "value": 100000000, "label": { "label": "Memory" } },
+        { "value": 100000001, "label": { "label": "Task" } },
+        { "value": 100000002, "label": { "label": "Observation" } },
+        { "value": 100000003, "label": { "label": "Pattern" } },
+        { "value": 100000004, "label": { "label": "Index" } }
+      ]
+    },
+    {
+      "name": "ddb_kgrelationshiptype",
+      "options": [
+        { "value": 100000000, "label": { "label": "Related To" } },
+        { "value": 100000001, "label": { "label": "Derived From" } },
+        { "value": 100000002, "label": { "label": "Depends On" } },
+        { "value": 100000003, "label": { "label": "Member Of" } },
+        { "value": 100000004, "label": { "label": "Routed To" } },
+        { "value": 100000005, "label": { "label": "Evidence For" } },
+        { "value": 100000006, "label": { "label": "Semantically Similar To" } },
+        { "value": 100000007, "label": { "label": "Conflicts With" } },
+        { "value": 100000008, "label": { "label": "Supersedes" } }
+      ]
+    }
+  ],
+  "semanticAttributes": [
+    {
+      "name": "ddb_confidence",
+      "displayName": { "label": "Confidence" },
+      "description": "Normalized confidence score used by agents, relationships, cards, and workflows.",
+      "category": "confidence",
+      "dataType": "number",
+      "appliesTo": ["ddb_kgentity", "ddb_kgrelationship", "ddb_adaptivecard", "ddb_workflow"],
+      "indexed": true,
+      "metadataPath": "$.confidence"
+    },
+    {
+      "name": "ddb_provenancejson",
+      "displayName": { "label": "Provenance JSON" },
+      "description": "Source, model, timestamp, observation, and hash metadata for traceable graph facts.",
+      "category": "provenance",
+      "dataType": "json",
+      "appliesTo": ["ddb_kgentity", "ddb_kgrelationship", "ddb_adaptivecard", "ddb_session", "ddb_workflow"],
+      "metadataPath": "$.provenance"
+    },
+    {
+      "name": "ddb_lineagejson",
+      "displayName": { "label": "Lineage JSON" },
+      "description": "Transformation and agent/tool step history for graph records.",
+      "category": "lineage",
+      "dataType": "json",
+      "appliesTo": ["ddb_kgentity", "ddb_kgrelationship", "ddb_adaptivecard", "ddb_integrationindex"],
+      "metadataPath": "$.lineage"
+    },
+    {
+      "name": "ddb_semanticattributesjson",
+      "displayName": { "label": "Semantic Attributes JSON" },
+      "description": "Relatable attributes for semantic lookup, graph projection, and adaptive agent routing.",
+      "category": "relationship",
+      "dataType": "json",
+      "appliesTo": ["ddb_kgentity", "ddb_adaptivecard", "ddb_agentconfig", "ddb_connector"],
+      "indexed": true,
+      "metadataPath": "$.semanticAttributes"
+    },
+    {
+      "name": "ddb_sensitivitylabel",
+      "displayName": { "label": "Sensitivity Label" },
+      "description": "Optional information protection or governance label.",
+      "category": "classification",
+      "dataType": "string",
+      "appliesTo": ["ddb_kgentity", "ddb_adaptivecard", "ddb_session"],
+      "indexed": true,
+      "metadataPath": "$.sensitivity"
+    }
+  ],
+  "relationshipPatterns": [
+    {
+      "name": "document_to_entity_evidence",
+      "displayName": { "label": "Document to Entity Evidence" },
+      "sourceTable": "ddb_adaptivecard",
+      "targetTable": "ddb_kgentity",
+      "relationshipType": "Evidence For",
+      "pathPattern": "adaptive-card->evidence->entity",
+      "confidenceColumn": "ddb_confidence",
+      "metadataColumns": ["ddb_provenancejson", "ddb_semanticattributesjson"]
+    },
+    {
+      "name": "entity_semantic_similarity",
+      "displayName": { "label": "Entity Semantic Similarity" },
+      "sourceTable": "ddb_kgentity",
+      "targetTable": "ddb_kgentity",
+      "relationshipType": "Semantically Similar To",
+      "pathPattern": "entity->embedding->nearest-entity",
+      "reciprocalName": "entity_semantic_similarity",
+      "confidenceColumn": "ddb_confidence",
+      "metadataColumns": ["ddb_vectorref", "ddb_lineagejson"]
+    },
+    {
+      "name": "workflow_connector_index",
+      "displayName": { "label": "Workflow Connector Index" },
+      "sourceTable": "ddb_workflow",
+      "targetTable": "ddb_integrationindex",
+      "relationshipType": "Depends On",
+      "pathPattern": "workflow->connector->integration-index",
+      "metadataColumns": ["ddb_definitionjson", "ddb_indexjson"]
+    }
+  ],
+  "metadataProfiles": [
+    {
+      "name": "provenance",
+      "description": "Source and observation metadata for auditable graph facts.",
+      "appliesTo": ["ddb_kgentity", "ddb_kgrelationship", "ddb_adaptivecard"],
+      "fields": ["source", "sourceType", "sourceUri", "observedAt", "model", "hash"]
+    },
+    {
+      "name": "semantic-relatability",
+      "description": "Attributes that make graph records easy to relate, index, and project across systems.",
+      "appliesTo": ["ddb_kgentity", "ddb_adaptivecard", "ddb_connector", "ddb_workflow"],
+      "fields": ["aliases", "tags", "topics", "capabilities", "pathPattern", "embeddingRef"]
+    },
+    {
+      "name": "lineage",
+      "description": "Agent, tool, workflow, and transformation history.",
+      "appliesTo": ["ddb_session", "ddb_workflow", "ddb_integrationindex"],
+      "fields": ["agentId", "tool", "workflowKey", "step", "timestamp", "inputHash", "outputHash"]
+    }
+  ],
+  "tables": [
+    {
+      "logicalName": "ddb_kgentity",
+      "schemaName": "ddb_KGEntity",
+      "displayName": { "label": "Knowledge Graph Entity" },
+      "displayCollectionName": { "label": "Knowledge Graph Entities" },
+      "description": { "label": "Canonical entity node for DDB knowledge graphs." },
+      "ownershipType": "UserOwned",
+      "primaryIdAttribute": "ddb_kgentityid",
+      "primaryNameAttribute": "ddb_name",
+      "columns": [
+        { "logicalName": "ddb_kgentityid", "schemaName": "ddb_KGEntityId", "displayName": { "label": "Knowledge Graph Entity" }, "type": "Uniqueidentifier", "requiredLevel": "SystemRequired" },
+        { "logicalName": "ddb_name", "schemaName": "ddb_Name", "displayName": { "label": "Name" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 300 },
+        { "logicalName": "ddb_entitykey", "schemaName": "ddb_EntityKey", "displayName": { "label": "Entity Key" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 200 },
+        { "logicalName": "ddb_entitytype", "schemaName": "ddb_EntityType", "displayName": { "label": "Entity Type" }, "type": "String", "requiredLevel": "Recommended", "maxLength": 100 },
+        { "logicalName": "ddb_description", "schemaName": "ddb_Description", "displayName": { "label": "Description" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_aliasesjson", "schemaName": "ddb_AliasesJson", "displayName": { "label": "Aliases JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_zone", "schemaName": "ddb_Zone", "displayName": { "label": "Memory Zone" }, "type": "String", "requiredLevel": "None", "maxLength": 200 },
+        { "logicalName": "ddb_confidence", "schemaName": "ddb_Confidence", "displayName": { "label": "Confidence" }, "type": "Decimal", "requiredLevel": "None", "precision": 5 },
+        { "logicalName": "ddb_sensitivitylabel", "schemaName": "ddb_SensitivityLabel", "displayName": { "label": "Sensitivity Label" }, "type": "String", "requiredLevel": "None", "maxLength": 200 },
+        { "logicalName": "ddb_semanticattributesjson", "schemaName": "ddb_SemanticAttributesJson", "displayName": { "label": "Semantic Attributes JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_provenancejson", "schemaName": "ddb_ProvenanceJson", "displayName": { "label": "Provenance JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_lineagejson", "schemaName": "ddb_LineageJson", "displayName": { "label": "Lineage JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_lastobservedon", "schemaName": "ddb_LastObservedOn", "displayName": { "label": "Last Observed On" }, "type": "DateTime", "requiredLevel": "None", "format": "DateAndTime" },
+        { "logicalName": "ddb_embeddingmodel", "schemaName": "ddb_EmbeddingModel", "displayName": { "label": "Embedding Model" }, "type": "String", "requiredLevel": "None", "maxLength": 300 },
+        { "logicalName": "ddb_vectorref", "schemaName": "ddb_VectorRef", "displayName": { "label": "Vector Reference" }, "type": "String", "requiredLevel": "None", "maxLength": 500 },
+        { "logicalName": "ddb_sourcejson", "schemaName": "ddb_SourceJson", "displayName": { "label": "Source JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 }
+      ],
+      "alternateKeys": [
+        { "schemaName": "ddb_KGEntity_EntityKey", "columns": ["ddb_entitykey"] }
+      ],
+      "indexes": [
+        { "name": "ddb_kgentity_name_search", "type": "dataverse-search", "columns": ["ddb_name", "ddb_description", "ddb_zone", "ddb_aliasesjson"] },
+        { "name": "ddb_kgentity_semantic_attributes", "type": "semantic", "columns": ["ddb_entitytype", "ddb_semanticattributesjson", "ddb_confidence", "ddb_sensitivitylabel"] },
+        { "name": "ddb_kgentity_vector_ref", "type": "vector", "columns": ["ddb_vectorref"], "notes": "External vector reference for Qdrant or DDB vector stores." }
+      ]
+    },
+    {
+      "logicalName": "ddb_kgrelationship",
+      "schemaName": "ddb_KGRelationship",
+      "displayName": { "label": "Knowledge Graph Relationship" },
+      "displayCollectionName": { "label": "Knowledge Graph Relationships" },
+      "description": { "label": "Relationship edge between two knowledge graph entities or cards." },
+      "ownershipType": "UserOwned",
+      "primaryIdAttribute": "ddb_kgrelationshipid",
+      "primaryNameAttribute": "ddb_name",
+      "columns": [
+        { "logicalName": "ddb_kgrelationshipid", "schemaName": "ddb_KGRelationshipId", "displayName": { "label": "Knowledge Graph Relationship" }, "type": "Uniqueidentifier", "requiredLevel": "SystemRequired" },
+        { "logicalName": "ddb_name", "schemaName": "ddb_Name", "displayName": { "label": "Name" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 300 },
+        { "logicalName": "ddb_relationshipkey", "schemaName": "ddb_RelationshipKey", "displayName": { "label": "Relationship Key" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 300 },
+        { "logicalName": "ddb_relationshiptype", "schemaName": "ddb_RelationshipType", "displayName": { "label": "Relationship Type" }, "type": "Picklist", "requiredLevel": "ApplicationRequired", "choice": "ddb_kgrelationshiptype" },
+        { "logicalName": "ddb_predicate", "schemaName": "ddb_Predicate", "displayName": { "label": "Predicate" }, "type": "String", "requiredLevel": "Recommended", "maxLength": 200 },
+        { "logicalName": "ddb_sourceentityid", "schemaName": "ddb_SourceEntityId", "displayName": { "label": "Source Entity" }, "type": "Lookup", "requiredLevel": "ApplicationRequired", "targets": ["ddb_kgentity"] },
+        { "logicalName": "ddb_targetentityid", "schemaName": "ddb_TargetEntityId", "displayName": { "label": "Target Entity" }, "type": "Lookup", "requiredLevel": "ApplicationRequired", "targets": ["ddb_kgentity"] },
+        { "logicalName": "ddb_weight", "schemaName": "ddb_Weight", "displayName": { "label": "Weight" }, "type": "Decimal", "requiredLevel": "None", "precision": 5 },
+        { "logicalName": "ddb_confidence", "schemaName": "ddb_Confidence", "displayName": { "label": "Confidence" }, "type": "Decimal", "requiredLevel": "None", "precision": 5 },
+        { "logicalName": "ddb_validfrom", "schemaName": "ddb_ValidFrom", "displayName": { "label": "Valid From" }, "type": "DateTime", "requiredLevel": "None", "format": "DateAndTime" },
+        { "logicalName": "ddb_validto", "schemaName": "ddb_ValidTo", "displayName": { "label": "Valid To" }, "type": "DateTime", "requiredLevel": "None", "format": "DateAndTime" },
+        { "logicalName": "ddb_semanticsjson", "schemaName": "ddb_SemanticsJson", "displayName": { "label": "Semantics JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_provenancejson", "schemaName": "ddb_ProvenanceJson", "displayName": { "label": "Provenance JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_lineagejson", "schemaName": "ddb_LineageJson", "displayName": { "label": "Lineage JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_evidencejson", "schemaName": "ddb_EvidenceJson", "displayName": { "label": "Evidence JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 }
+      ],
+      "relationships": [
+        { "schemaName": "ddb_kgentity_kgrelationship_source", "type": "ManyToOne", "referencedTable": "ddb_kgentity", "referencingColumn": "ddb_sourceentityid" },
+        { "schemaName": "ddb_kgentity_kgrelationship_target", "type": "ManyToOne", "referencedTable": "ddb_kgentity", "referencingColumn": "ddb_targetentityid" }
+      ],
+      "alternateKeys": [
+        { "schemaName": "ddb_KGRelationship_RelationshipKey", "columns": ["ddb_relationshipkey"] }
+      ],
+      "indexes": [
+        { "name": "ddb_kgrelationship_type_lookup", "type": "lookup", "columns": ["ddb_relationshiptype", "ddb_sourceentityid", "ddb_targetentityid"] },
+        { "name": "ddb_kgrelationship_semantic_path", "type": "semantic", "columns": ["ddb_predicate", "ddb_confidence", "ddb_validfrom", "ddb_validto"] }
+      ]
+    },
+    {
+      "logicalName": "ddb_adaptivecard",
+      "schemaName": "ddb_AdaptiveCard",
+      "displayName": { "label": "Adaptive Card" },
+      "displayCollectionName": { "label": "Adaptive Cards" },
+      "description": { "label": "DDB adaptive card payload and metadata for agent and human views." },
+      "ownershipType": "UserOwned",
+      "primaryIdAttribute": "ddb_adaptivecardid",
+      "primaryNameAttribute": "ddb_title",
+      "columns": [
+        { "logicalName": "ddb_adaptivecardid", "schemaName": "ddb_AdaptiveCardId", "displayName": { "label": "Adaptive Card" }, "type": "Uniqueidentifier", "requiredLevel": "SystemRequired" },
+        { "logicalName": "ddb_title", "schemaName": "ddb_Title", "displayName": { "label": "Title" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 300 },
+        { "logicalName": "ddb_cardkey", "schemaName": "ddb_CardKey", "displayName": { "label": "Card Key" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 200 },
+        { "logicalName": "ddb_cardtype", "schemaName": "ddb_CardType", "displayName": { "label": "Card Type" }, "type": "Picklist", "requiredLevel": "ApplicationRequired", "choice": "ddb_kgcardtype" },
+        { "logicalName": "ddb_zone", "schemaName": "ddb_Zone", "displayName": { "label": "Zone" }, "type": "String", "requiredLevel": "None", "maxLength": 200 },
+        { "logicalName": "ddb_agentid", "schemaName": "ddb_AgentId", "displayName": { "label": "Agent ID" }, "type": "String", "requiredLevel": "None", "maxLength": 200 },
+        { "logicalName": "ddb_confidence", "schemaName": "ddb_Confidence", "displayName": { "label": "Confidence" }, "type": "Decimal", "requiredLevel": "None", "precision": 5 },
+        { "logicalName": "ddb_sensitivitylabel", "schemaName": "ddb_SensitivityLabel", "displayName": { "label": "Sensitivity Label" }, "type": "String", "requiredLevel": "None", "maxLength": 200 },
+        { "logicalName": "ddb_cardjson", "schemaName": "ddb_CardJson", "displayName": { "label": "Card JSON" }, "type": "Memo", "requiredLevel": "ApplicationRequired", "maxLength": 1048576 },
+        { "logicalName": "ddb_contentmarkdown", "schemaName": "ddb_ContentMarkdown", "displayName": { "label": "Content Markdown" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_semanticattributesjson", "schemaName": "ddb_SemanticAttributesJson", "displayName": { "label": "Semantic Attributes JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_relatableentitiesjson", "schemaName": "ddb_RelatableEntitiesJson", "displayName": { "label": "Relatable Entities JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_provenancejson", "schemaName": "ddb_ProvenanceJson", "displayName": { "label": "Provenance JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_lineagejson", "schemaName": "ddb_LineageJson", "displayName": { "label": "Lineage JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_hash", "schemaName": "ddb_Hash", "displayName": { "label": "Hash" }, "type": "String", "requiredLevel": "None", "maxLength": 128 }
+      ],
+      "alternateKeys": [
+        { "schemaName": "ddb_AdaptiveCard_CardKey", "columns": ["ddb_cardkey"] }
+      ],
+      "indexes": [
+        { "name": "ddb_adaptivecard_fts", "type": "fts", "columns": ["ddb_title", "ddb_contentmarkdown", "ddb_zone", "ddb_agentid"] },
+        { "name": "ddb_adaptivecard_relatability", "type": "semantic", "columns": ["ddb_cardtype", "ddb_semanticattributesjson", "ddb_relatableentitiesjson", "ddb_confidence"] }
+      ]
+    },
+    {
+      "logicalName": "ddb_agentconfig",
+      "schemaName": "ddb_AgentConfig",
+      "displayName": { "label": "Agent Config" },
+      "displayCollectionName": { "label": "Agent Configs" },
+      "description": { "label": "Graph-addressable agent configuration, scope, tools, connectors, and policies." },
+      "ownershipType": "UserOwned",
+      "primaryIdAttribute": "ddb_agentconfigid",
+      "primaryNameAttribute": "ddb_name",
+      "columns": [
+        { "logicalName": "ddb_agentconfigid", "schemaName": "ddb_AgentConfigId", "displayName": { "label": "Agent Config" }, "type": "Uniqueidentifier", "requiredLevel": "SystemRequired" },
+        { "logicalName": "ddb_name", "schemaName": "ddb_Name", "displayName": { "label": "Name" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 300 },
+        { "logicalName": "ddb_agentid", "schemaName": "ddb_AgentId", "displayName": { "label": "Agent ID" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 200 },
+        { "logicalName": "ddb_scope", "schemaName": "ddb_Scope", "displayName": { "label": "Scope" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 100 },
+        { "logicalName": "ddb_toolsjson", "schemaName": "ddb_ToolsJson", "displayName": { "label": "Tools JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_connectorsjson", "schemaName": "ddb_ConnectorsJson", "displayName": { "label": "Connectors JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_memoryzonesjson", "schemaName": "ddb_MemoryZonesJson", "displayName": { "label": "Memory Zones JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_policyjson", "schemaName": "ddb_PolicyJson", "displayName": { "label": "Policy JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_semanticattributesjson", "schemaName": "ddb_SemanticAttributesJson", "displayName": { "label": "Semantic Attributes JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_configyaml", "schemaName": "ddb_ConfigYaml", "displayName": { "label": "Config YAML" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_configjson", "schemaName": "ddb_ConfigJson", "displayName": { "label": "Config JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 }
+      ],
+      "alternateKeys": [
+        { "schemaName": "ddb_AgentConfig_AgentScope", "columns": ["ddb_agentid", "ddb_scope"] }
+      ],
+      "indexes": [
+        { "name": "ddb_agentconfig_scope", "type": "semantic", "columns": ["ddb_agentid", "ddb_scope", "ddb_toolsjson", "ddb_connectorsjson"] }
+      ]
+    },
+    {
+      "logicalName": "ddb_memoryzone",
+      "schemaName": "ddb_MemoryZone",
+      "displayName": { "label": "Memory Zone" },
+      "displayCollectionName": { "label": "Memory Zones" },
+      "description": { "label": "Scoped radial data zone for agent, session, workspace, or memory isolation." },
+      "ownershipType": "UserOwned",
+      "primaryIdAttribute": "ddb_memoryzoneid",
+      "primaryNameAttribute": "ddb_name",
+      "columns": [
+        { "logicalName": "ddb_memoryzoneid", "schemaName": "ddb_MemoryZoneId", "displayName": { "label": "Memory Zone" }, "type": "Uniqueidentifier", "requiredLevel": "SystemRequired" },
+        { "logicalName": "ddb_name", "schemaName": "ddb_Name", "displayName": { "label": "Name" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 200 },
+        { "logicalName": "ddb_scope", "schemaName": "ddb_Scope", "displayName": { "label": "Scope" }, "type": "String", "requiredLevel": "Recommended", "maxLength": 100 },
+        { "logicalName": "ddb_description", "schemaName": "ddb_Description", "displayName": { "label": "Description" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_metadatajson", "schemaName": "ddb_MetadataJson", "displayName": { "label": "Metadata JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 }
+      ],
+      "alternateKeys": [
+        { "schemaName": "ddb_MemoryZone_Name", "columns": ["ddb_name"] }
+      ],
+      "indexes": [
+        { "name": "ddb_memoryzone_scope", "type": "semantic", "columns": ["ddb_name", "ddb_scope"] }
+      ]
+    },
+    {
+      "logicalName": "ddb_session",
+      "schemaName": "ddb_Session",
+      "displayName": { "label": "DDB Session" },
+      "displayCollectionName": { "label": "DDB Sessions" },
+      "description": { "label": "Portable micro DB or graph-backed session context." },
+      "ownershipType": "UserOwned",
+      "primaryIdAttribute": "ddb_sessionid",
+      "primaryNameAttribute": "ddb_name",
+      "columns": [
+        { "logicalName": "ddb_sessionid", "schemaName": "ddb_SessionId", "displayName": { "label": "DDB Session" }, "type": "Uniqueidentifier", "requiredLevel": "SystemRequired" },
+        { "logicalName": "ddb_name", "schemaName": "ddb_Name", "displayName": { "label": "Name" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 300 },
+        { "logicalName": "ddb_sessionkey", "schemaName": "ddb_SessionKey", "displayName": { "label": "Session Key" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 200 },
+        { "logicalName": "ddb_agentid", "schemaName": "ddb_AgentId", "displayName": { "label": "Agent ID" }, "type": "String", "requiredLevel": "None", "maxLength": 200 },
+        { "logicalName": "ddb_microdbpath", "schemaName": "ddb_MicroDbPath", "displayName": { "label": "Micro DB Path" }, "type": "String", "requiredLevel": "None", "maxLength": 500 },
+        { "logicalName": "ddb_sensitivitylabel", "schemaName": "ddb_SensitivityLabel", "displayName": { "label": "Sensitivity Label" }, "type": "String", "requiredLevel": "None", "maxLength": 200 },
+        { "logicalName": "ddb_provenancejson", "schemaName": "ddb_ProvenanceJson", "displayName": { "label": "Provenance JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_statusjson", "schemaName": "ddb_StatusJson", "displayName": { "label": "Status JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 }
+      ],
+      "alternateKeys": [
+        { "schemaName": "ddb_Session_SessionKey", "columns": ["ddb_sessionkey"] }
+      ],
+      "indexes": [
+        { "name": "ddb_session_agent", "type": "semantic", "columns": ["ddb_agentid", "ddb_sessionkey"] }
+      ]
+    },
+    {
+      "logicalName": "ddb_manifest",
+      "schemaName": "ddb_Manifest",
+      "displayName": { "label": "Graph Manifest" },
+      "displayCollectionName": { "label": "Graph Manifests" },
+      "description": { "label": "Declarative graph topology, projection, and 3DKG scene manifest." },
+      "ownershipType": "UserOwned",
+      "primaryIdAttribute": "ddb_manifestid",
+      "primaryNameAttribute": "ddb_title",
+      "columns": [
+        { "logicalName": "ddb_manifestid", "schemaName": "ddb_ManifestId", "displayName": { "label": "Graph Manifest" }, "type": "Uniqueidentifier", "requiredLevel": "SystemRequired" },
+        { "logicalName": "ddb_title", "schemaName": "ddb_Title", "displayName": { "label": "Title" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 300 },
+        { "logicalName": "ddb_manifestkey", "schemaName": "ddb_ManifestKey", "displayName": { "label": "Manifest Key" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 200 },
+        { "logicalName": "ddb_sourcekind", "schemaName": "ddb_SourceKind", "displayName": { "label": "Source Kind" }, "type": "String", "requiredLevel": "None", "maxLength": 100 },
+        { "logicalName": "ddb_semanticpathsjson", "schemaName": "ddb_SemanticPathsJson", "displayName": { "label": "Semantic Paths JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_metadatajson", "schemaName": "ddb_MetadataJson", "displayName": { "label": "Metadata JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_manifestjson", "schemaName": "ddb_ManifestJson", "displayName": { "label": "Manifest JSON" }, "type": "Memo", "requiredLevel": "ApplicationRequired", "maxLength": 1048576 }
+      ],
+      "alternateKeys": [
+        { "schemaName": "ddb_Manifest_ManifestKey", "columns": ["ddb_manifestkey"] }
+      ],
+      "indexes": [
+        { "name": "ddb_manifest_source", "type": "manifest", "columns": ["ddb_manifestkey", "ddb_sourcekind", "ddb_semanticpathsjson"] }
+      ]
+    },
+    {
+      "logicalName": "ddb_connector",
+      "schemaName": "ddb_Connector",
+      "displayName": { "label": "Connector" },
+      "displayCollectionName": { "label": "Connectors" },
+      "description": { "label": "Connector knowledge graph node for APIs, databases, MCP tools, vectors, filesystems, and agent channels." },
+      "ownershipType": "OrganizationOwned",
+      "primaryIdAttribute": "ddb_connectorid",
+      "primaryNameAttribute": "ddb_name",
+      "columns": [
+        { "logicalName": "ddb_connectorid", "schemaName": "ddb_ConnectorId", "displayName": { "label": "Connector" }, "type": "Uniqueidentifier", "requiredLevel": "SystemRequired" },
+        { "logicalName": "ddb_name", "schemaName": "ddb_Name", "displayName": { "label": "Name" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 300 },
+        { "logicalName": "ddb_connectorkey", "schemaName": "ddb_ConnectorKey", "displayName": { "label": "Connector Key" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 200 },
+        { "logicalName": "ddb_connectortype", "schemaName": "ddb_ConnectorType", "displayName": { "label": "Connector Type" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 100 },
+        { "logicalName": "ddb_endpoint", "schemaName": "ddb_Endpoint", "displayName": { "label": "Endpoint" }, "type": "String", "requiredLevel": "None", "maxLength": 500 },
+        { "logicalName": "ddb_capabilitiesjson", "schemaName": "ddb_CapabilitiesJson", "displayName": { "label": "Capabilities JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_semanticattributesjson", "schemaName": "ddb_SemanticAttributesJson", "displayName": { "label": "Semantic Attributes JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_metadatajson", "schemaName": "ddb_MetadataJson", "displayName": { "label": "Metadata JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 }
+      ],
+      "alternateKeys": [
+        { "schemaName": "ddb_Connector_ConnectorKey", "columns": ["ddb_connectorkey"] }
+      ],
+      "indexes": [
+        { "name": "ddb_connector_type", "type": "semantic", "columns": ["ddb_connectortype", "ddb_name", "ddb_capabilitiesjson", "ddb_semanticattributesjson"] }
+      ]
+    },
+    {
+      "logicalName": "ddb_workflow",
+      "schemaName": "ddb_Workflow",
+      "displayName": { "label": "Agent Workflow" },
+      "displayCollectionName": { "label": "Agent Workflows" },
+      "description": { "label": "Adaptive agent workflow definition and runtime state for DDB graph operations." },
+      "ownershipType": "UserOwned",
+      "primaryIdAttribute": "ddb_workflowid",
+      "primaryNameAttribute": "ddb_name",
+      "columns": [
+        { "logicalName": "ddb_workflowid", "schemaName": "ddb_WorkflowId", "displayName": { "label": "Agent Workflow" }, "type": "Uniqueidentifier", "requiredLevel": "SystemRequired" },
+        { "logicalName": "ddb_name", "schemaName": "ddb_Name", "displayName": { "label": "Name" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 300 },
+        { "logicalName": "ddb_workflowkey", "schemaName": "ddb_WorkflowKey", "displayName": { "label": "Workflow Key" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 200 },
+        { "logicalName": "ddb_status", "schemaName": "ddb_Status", "displayName": { "label": "Status" }, "type": "String", "requiredLevel": "Recommended", "maxLength": 100 },
+        { "logicalName": "ddb_inputpattern", "schemaName": "ddb_InputPattern", "displayName": { "label": "Input Pattern" }, "type": "String", "requiredLevel": "None", "maxLength": 500 },
+        { "logicalName": "ddb_outputpattern", "schemaName": "ddb_OutputPattern", "displayName": { "label": "Output Pattern" }, "type": "String", "requiredLevel": "None", "maxLength": 500 },
+        { "logicalName": "ddb_provenancejson", "schemaName": "ddb_ProvenanceJson", "displayName": { "label": "Provenance JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_definitionyaml", "schemaName": "ddb_DefinitionYaml", "displayName": { "label": "Definition YAML" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_definitionjson", "schemaName": "ddb_DefinitionJson", "displayName": { "label": "Definition JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 }
+      ],
+      "alternateKeys": [
+        { "schemaName": "ddb_Workflow_WorkflowKey", "columns": ["ddb_workflowkey"] }
+      ],
+      "indexes": [
+        { "name": "ddb_workflow_status", "type": "semantic", "columns": ["ddb_status", "ddb_workflowkey", "ddb_inputpattern", "ddb_outputpattern"] }
+      ]
+    },
+    {
+      "logicalName": "ddb_integrationindex",
+      "schemaName": "ddb_IntegrationIndex",
+      "displayName": { "label": "Integration Index" },
+      "displayCollectionName": { "label": "Integration Indexes" },
+      "description": { "label": "Index-of-index record for graph, vector, search, session, connector, and manifest integrations." },
+      "ownershipType": "OrganizationOwned",
+      "primaryIdAttribute": "ddb_integrationindexid",
+      "primaryNameAttribute": "ddb_name",
+      "columns": [
+        { "logicalName": "ddb_integrationindexid", "schemaName": "ddb_IntegrationIndexId", "displayName": { "label": "Integration Index" }, "type": "Uniqueidentifier", "requiredLevel": "SystemRequired" },
+        { "logicalName": "ddb_name", "schemaName": "ddb_Name", "displayName": { "label": "Name" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 300 },
+        { "logicalName": "ddb_backend", "schemaName": "ddb_Backend", "displayName": { "label": "Backend" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 100 },
+        { "logicalName": "ddb_indextype", "schemaName": "ddb_IndexType", "displayName": { "label": "Index Type" }, "type": "String", "requiredLevel": "ApplicationRequired", "maxLength": 100 },
+        { "logicalName": "ddb_collection", "schemaName": "ddb_Collection", "displayName": { "label": "Collection" }, "type": "String", "requiredLevel": "None", "maxLength": 200 },
+        { "logicalName": "ddb_pathpattern", "schemaName": "ddb_PathPattern", "displayName": { "label": "Path Pattern" }, "type": "String", "requiredLevel": "None", "maxLength": 500 },
+        { "logicalName": "ddb_confidence", "schemaName": "ddb_Confidence", "displayName": { "label": "Confidence" }, "type": "Decimal", "requiredLevel": "None", "precision": 5 },
+        { "logicalName": "ddb_lineagejson", "schemaName": "ddb_LineageJson", "displayName": { "label": "Lineage JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_metadatajson", "schemaName": "ddb_MetadataJson", "displayName": { "label": "Metadata JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 },
+        { "logicalName": "ddb_indexjson", "schemaName": "ddb_IndexJson", "displayName": { "label": "Index JSON" }, "type": "Memo", "requiredLevel": "None", "maxLength": 1048576 }
+      ],
+      "alternateKeys": [
+        { "schemaName": "ddb_IntegrationIndex_NameBackend", "columns": ["ddb_name", "ddb_backend"] }
+      ],
+      "indexes": [
+        { "name": "ddb_integrationindex_backend_type", "type": "semantic", "columns": ["ddb_backend", "ddb_indextype", "ddb_pathpattern", "ddb_confidence"] }
+      ]
+    }
+  ]
+}
+

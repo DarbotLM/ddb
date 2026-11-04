@@ -15,8 +15,8 @@ uvicorn darbotdb.api.main:app --reload --port 8080
 
 ## Standard topology
 
-- Raw darbotdb engine: `8529`
-- DarbotDB API wrapper: `8530`
+- Raw darbotdb engine: `8008` on the host (`8529` inside Docker)
+- DarbotDB API wrapper: `8008` by default
 - Default database: `txt2kg`
 - MCP server: `3001`
 - Optional 3DKG viewer dev host: `http://localhost:5000`
@@ -115,6 +115,22 @@ Shared graph state now includes:
 - `session_to_manifest`
 - `view_to_manifest`
 
+### Dataverse and adaptive agent schemas (`schemas/`)
+
+DDB includes two first-party schema contracts:
+
+- `schemas/kg_dv_schema.json` and `schemas/kg_dv_schema.schema.json` define a Dataverse-aligned knowledge graph solution with logical names, schema names, display labels, columns, alternate keys, relationships, and indexes.
+- `schemas/ac3_adaptive_agent_card.schema.json` defines Adaptive Card 3.0-style YAML cards for adaptive agents, including DDB metadata, memory zones, workflow state, tools, connectors, and Adaptive Card body/actions.
+
+These schemas are packaged with the Python distribution and are intended to be used by importers, MCP tools, Dataverse solution generators, and adaptive card authoring workflows.
+
+The schema metadata model adds first-class semantic relatability:
+
+- `semanticAttributes` catalog reusable confidence, provenance, lineage, classification, vector, spatial, workflow, and integration fields.
+- `relationshipPatterns` describe paths such as `adaptive-card->evidence->entity`, `entity->embedding->nearest-entity`, and `workflow->connector->integration-index`.
+- `metadataProfiles` group auditable provenance, semantic-relatability, and lineage fields for consistent projection into Dataverse, micro DBs, cards, and graph indexes.
+- Dataverse tables include JSON metadata columns such as `ddb_semanticattributesjson`, `ddb_relatableentitiesjson`, `ddb_provenancejson`, and `ddb_lineagejson` so records remain schema-first without losing flexible agent context.
+
 ## API surface
 
 ### Core endpoints
@@ -206,6 +222,8 @@ Shared graph state now includes:
 Organized by domain: Micro DB (5), Cards (3), Memory (4), Graph (6), Triad (4), Sessions (3), Manifests (4), Scene (1), 3DKG Spatial (8), AQL & Collections (2), AG-UI (3), Txt2KG (7), Txt2KG Bridge (4).
 
 All tools use complete Zod 4 schemas with proper types — no JSON-stringified workarounds. Enums, arrays, records, defaults, and nullable optionals match the OpenAPI spec exactly.
+
+The MCP/card resource model is aligned with `schemas/ac3_adaptive_agent_card.schema.json` for adaptive agent YAML cards and `schemas/kg_dv_schema.json` for Dataverse-backed knowledge graph metadata.
 
 ```bash
 # Start in HTTP mode (port 3001)
