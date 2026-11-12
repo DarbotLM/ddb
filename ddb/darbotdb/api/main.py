@@ -3,10 +3,10 @@ from uvicorn import run as uvicorn_run
 from darbotdb.config import settings
 from darbotdb.api.routers import health, aql, collections
 from darbotdb.api.routers import micro, cards_router, memory, graph_router, triad_router
-from darbotdb.api.routers import agui_router, txt2kg_router
+from darbotdb.api.routers import agui_router, manifests, scene, sessions, txt2kg_router
 from darbotdb.api.routers import graph3d_router
 
-app = FastAPI(title="DarbotDB API", version="0.4.0")
+app = FastAPI(title="DarbotDB API", version="0.6.0")
 
 # Core DarbotDB routers backed by the DDB graph engine
 app.include_router(health.router, prefix="/health", tags=["health"])
@@ -19,6 +19,11 @@ app.include_router(cards_router.router, prefix="/v1/cards", tags=["cards"])
 app.include_router(memory.router, prefix="/v1/memory", tags=["memory"])
 app.include_router(graph_router.router, prefix="/v1/graph", tags=["graph"])
 app.include_router(triad_router.router, prefix="/v1/triad", tags=["triad"])
+
+# Native session, manifest, and scene APIs
+app.include_router(sessions.router, prefix="/v1/sessions", tags=["sessions"])
+app.include_router(manifests.router, prefix="/v1/manifests", tags=["manifests"])
+app.include_router(scene.router, prefix="/v1/scenes", tags=["scenes"])
 
 # 3D knowledge graph
 app.include_router(graph3d_router.router, prefix="/v1/3dkg", tags=["3dkg"])

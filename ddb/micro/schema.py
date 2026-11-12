@@ -1,6 +1,6 @@
 """SQLite schema definitions for DDB micro databases (.ddb files)."""
 
-SCHEMA_VERSION = "v1.2.0"
+SCHEMA_VERSION = "v1.4.0"
 
 CREATE_META = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -273,6 +273,105 @@ CREATE TABLE IF NOT EXISTS node_positions (
 CREATE_NODE_POSITIONS_IDX_TYPE = "CREATE INDEX IF NOT EXISTS idx_node_positions_type ON node_positions(node_type);"
 
 CREATE_NODE_POSITIONS_IDX_XYZ = "CREATE INDEX IF NOT EXISTS idx_node_positions_xyz ON node_positions(x, y, z);"
+
+
+# ---------------------------------------------------------------------------
+# Durable visualization jobs (v1.3.0)
+# ---------------------------------------------------------------------------
+CREATE_VISUALIZATION_JOBS = """
+CREATE TABLE IF NOT EXISTS ddb_visualization_jobs (
+    id             TEXT PRIMARY KEY,
+    renderer       TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    request_json   TEXT NOT NULL,
+    graph_revision TEXT NOT NULL,
+    progress       REAL NOT NULL DEFAULT 0,
+    snapshot_uri   TEXT,
+    result_uri     TEXT,
+    result_sha256  TEXT,
+    error_json     TEXT,
+    created_at     TEXT NOT NULL,
+    started_at     TEXT,
+    completed_at   TEXT,
+    expires_at     TEXT
+);
+"""
+CREATE_VISUALIZATION_JOBS_IDX_STATUS = (
+    "CREATE INDEX IF NOT EXISTS idx_visualization_jobs_status "
+    "ON ddb_visualization_jobs(status, created_at);"
+)
+CREATE_VISUALIZATION_JOBS_IDX_EXPIRY = (
+    "CREATE INDEX IF NOT EXISTS idx_visualization_jobs_expiry "
+    "ON ddb_visualization_jobs(expires_at);"
+)
+
+CREATE_VISUALIZATION_JOB_EVENTS = """
+CREATE TABLE IF NOT EXISTS ddb_visualization_job_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id     TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    data_json  TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES ddb_visualization_jobs(id) ON DELETE CASCADE
+);
+"""
+CREATE_VISUALIZATION_JOB_EVENTS_IDX_JOB = (
+    "CREATE INDEX IF NOT EXISTS idx_visualization_job_events_job "
+    "ON ddb_visualization_job_events(job_id, id);"
+)
+
+
+# ---------------------------------------------------------------------------
+# Extensible schema plugin registry (v1.4.0)
+# ---------------------------------------------------------------------------
+CREATE_SCHEMA_PLUGINS = """
+CREATE TABLE IF NOT EXISTS ddb_schema_plugins (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    vendor        TEXT NOT NULL,
+    version       TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'active',
+    description   TEXT NOT NULL DEFAULT '',
+    manifest_json TEXT NOT NULL DEFAULT '{}',
+    builtin       INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+"""
+CREATE_SCHEMA_PLUGINS_IDX_VENDOR = (
+    "CREATE INDEX IF NOT EXISTS idx_schema_plugins_vendor "
+    "ON ddb_schema_plugins(vendor, name);"
+)
+CREATE_SCHEMA_PLUGINS_IDX_STATUS = (
+    "CREATE INDEX IF NOT EXISTS idx_schema_plugins_status "
+    "ON ddb_schema_plugins(status, updated_at);"
+)
+
+CREATE_SCHEMA_DEFINITIONS = """
+CREATE TABLE IF NOT EXISTS ddb_schema_definitions (
+    id            TEXT PRIMARY KEY,
+    plugin_id     TEXT NOT NULL,
+    namespace     TEXT NOT NULL,
+    object_type   TEXT NOT NULL,
+    logical_name  TEXT NOT NULL,
+    display_name  TEXT NOT NULL,
+    schema_json   TEXT NOT NULL DEFAULT '{}',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    UNIQUE(plugin_id, namespace, object_type, logical_name),
+    FOREIGN KEY(plugin_id) REFERENCES ddb_schema_plugins(id) ON DELETE CASCADE
+);
+"""
+CREATE_SCHEMA_DEFINITIONS_IDX_PLUGIN = (
+    "CREATE INDEX IF NOT EXISTS idx_schema_definitions_plugin "
+    "ON ddb_schema_definitions(plugin_id, namespace);"
+)
+CREATE_SCHEMA_DEFINITIONS_IDX_LOOKUP = (
+    "CREATE INDEX IF NOT EXISTS idx_schema_definitions_lookup "
+    "ON ddb_schema_definitions(namespace, object_type, logical_name);"
+)
+
 ALL_DDL: list[str] = [
     CREATE_META,
     CREATE_TURNS,
@@ -325,6 +424,19 @@ ALL_DDL: list[str] = [
     CREATE_NODE_POSITIONS,
     CREATE_NODE_POSITIONS_IDX_TYPE,
     CREATE_NODE_POSITIONS_IDX_XYZ,
+    # v1.3.0 additions
+    CREATE_VISUALIZATION_JOBS,
+    CREATE_VISUALIZATION_JOBS_IDX_STATUS,
+    CREATE_VISUALIZATION_JOBS_IDX_EXPIRY,
+    CREATE_VISUALIZATION_JOB_EVENTS,
+    CREATE_VISUALIZATION_JOB_EVENTS_IDX_JOB,
+    # v1.4.0 additions
+    CREATE_SCHEMA_PLUGINS,
+    CREATE_SCHEMA_PLUGINS_IDX_VENDOR,
+    CREATE_SCHEMA_PLUGINS_IDX_STATUS,
+    CREATE_SCHEMA_DEFINITIONS,
+    CREATE_SCHEMA_DEFINITIONS_IDX_PLUGIN,
+    CREATE_SCHEMA_DEFINITIONS_IDX_LOOKUP,
 ]
 
 MIGRATIONS: dict[str, list[str]] = {
@@ -356,10 +468,23 @@ MIGRATIONS: dict[str, list[str]] = {
         CREATE_MANIFEST_EDGES_IDX_SOURCE_TARGET,
         CREATE_SESSION_VIEWS,
         CREATE_SESSION_VIEWS_IDX_MANIFEST,
-    ],
-    "v1.2.0": [
         CREATE_NODE_POSITIONS,
         CREATE_NODE_POSITIONS_IDX_TYPE,
         CREATE_NODE_POSITIONS_IDX_XYZ,
+    ],
+    "v1.3.0": [
+        CREATE_VISUALIZATION_JOBS,
+        CREATE_VISUALIZATION_JOBS_IDX_STATUS,
+        CREATE_VISUALIZATION_JOBS_IDX_EXPIRY,
+        CREATE_VISUALIZATION_JOB_EVENTS,
+        CREATE_VISUALIZATION_JOB_EVENTS_IDX_JOB,
+    ],
+    "v1.4.0": [
+        CREATE_SCHEMA_PLUGINS,
+        CREATE_SCHEMA_PLUGINS_IDX_VENDOR,
+        CREATE_SCHEMA_PLUGINS_IDX_STATUS,
+        CREATE_SCHEMA_DEFINITIONS,
+        CREATE_SCHEMA_DEFINITIONS_IDX_PLUGIN,
+        CREATE_SCHEMA_DEFINITIONS_IDX_LOOKUP,
     ],
 }

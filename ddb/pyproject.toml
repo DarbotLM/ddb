@@ -1,6 +1,6 @@
 [project]
 name = "darbotdb"
-version = "0.4.0"
+version = "0.6.0"
 description = "DarbotDB (DDB) — composable agent database with graph storage, SQLite micro DBs, AG-UI sessions, and MCP apps"
 requires-python = ">=3.10"
 dependencies = [
