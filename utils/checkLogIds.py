@@ -81,8 +81,8 @@ if __name__ == "__main__":
     my_id_database, my_invalid_logid_database = check_log_ids_main(my_root,
                        ["arangod", "client-tools", "enterprise", "lib"],
                        [".", "lib/Logger/LogMacros.h",
-                        "arangod/StorageEngine/TransactionState.h",
-                        "arangod/Replication2/LoggerContext.h"])
+                        "engine/StorageEngine/TransactionState.h",
+                        "engine/Replication2/LoggerContext.h"])
 
     return_value = 0
 

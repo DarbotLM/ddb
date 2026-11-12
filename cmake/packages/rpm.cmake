@@ -9,7 +9,7 @@ else()
 endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_X ${PROJECT_BINARY_DIR}/bin)
 include(client-tools/dbg.cmake)
-include(arangod/dbg.cmake)
+include(engine/dbg.cmake)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/Installation/rpm/arangodb.spec.in" "${CMAKE_CURRENT_BINARY_DIR}/arangodb.spec" @ONLY IMMEDIATE)
 set(CPACK_RPM_USER_BINARY_SPECFILE "${CMAKE_CURRENT_BINARY_DIR}/arangodb.spec")
 

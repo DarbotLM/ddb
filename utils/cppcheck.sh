@@ -12,7 +12,7 @@ fi
 if [[ -n $* ]]; then
   files=( "$@" )
 else
-  files=( arangod/ client-tools/ lib/ enterprise/ )
+  files=( engine/ client-tools/ lib/ enterprise/ )
 fi
   
 echo "cppcheck version: $(cppcheck --version)"

@@ -161,7 +161,7 @@ printf " start-delays: %s," "$START_DELAYS"
 printf " random-delays: %s," "$RANDOM_DELAYS"
 printf " gossip-mode: %s\n" "$GOSSIP_MODE"
 
-if [ ! -d arangod ] || [ ! -d client-tools ] ; then
+if [ ! -d engine ] || [ ! -d client-tools ] ; then
   echo Must be started in the main ArangoDB source directory.
   exit 1
 fi

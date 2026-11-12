@@ -1,4 +1,4 @@
-target_sources(DDB_tests_replication2_pure PRIVATE
+target_sources(ddb_tests_replication2_pure PRIVATE
 LogPersistorTest.cpp
 RecordTest.cpp
 )

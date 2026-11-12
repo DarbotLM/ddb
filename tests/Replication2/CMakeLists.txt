@@ -49,24 +49,24 @@ set(darbotdb_REPLICATION2_TEST_SOURCES
 
   CollectionGroups/CollectionGroupsSupervision.cpp)
 
-add_library(DDB_tests_replication2 OBJECT
+add_library(ddb_tests_replication2 OBJECT
   ${darbotdb_REPLICATION2_TEST_SOURCES}
   ${darbotdb_REPLICATION2_TEST_HELPER_SOURCES}
   )
 
-target_include_directories(DDB_tests_replication2 PUBLIC
-  ${PROJECT_SOURCE_DIR}/arangod
+target_include_directories(ddb_tests_replication2 PUBLIC
+  ${PROJECT_SOURCE_DIR}/engine
   ${PROJECT_SOURCE_DIR}/lib
   # TODO: The below can be removed if Replication2 tests don't include relative to Replication2 anymore
   ${PROJECT_SOURCE_DIR}/tests
   ${PROJECT_SOURCE_DIR}/tests/Mocks/)
 
-target_link_libraries(DDB_tests_replication2 PRIVATE
+target_link_libraries(ddb_tests_replication2 PRIVATE
   gtest
   gmock
   arango
-  DDB_replication2
-  DDB_futures
+  ddb_replication2
+  ddb_futures
   velocypack
   fmt)
 
@@ -81,25 +81,25 @@ endif ()
 
 target_link_libraries(darbotdbtests_replication2 PRIVATE
   gtest
-  DDB_tests_basics
-  DDB_tests_replication2
-  DDB_tests_replication2_pure
-  DDB_agency
-  DDB_cluster_engine
-  DDB_rocksdb
-  arangoserver
+  ddb_tests_basics
+  ddb_tests_replication2
+  ddb_tests_replication2_pure
+  ddb_agency
+  ddb_cluster_engine
+  ddb_rocksdb
+  ddbserver
   boost_boost
   fmt)
 
 if (USE_V8)
-  target_link_libraries(darbotdbtests_replication2 PRIVATE DDB_v8server)
+  target_link_libraries(darbotdbtests_replication2 PRIVATE ddb_v8server)
 endif()
 
 add_test(NAME replication2
   COMMAND darbotdbtests_replication2)
 
 
-add_library(DDB_tests_replication2_pure OBJECT
+add_library(ddb_tests_replication2_pure OBJECT
   ReplicatedLog/Algorithms/CalcCommitIndexTest.cpp
   ReplicatedLog/Algorithms/DetectConflictTest.cpp
   ReplicatedLog/Algorithms/LogCommonTest.cpp
@@ -123,7 +123,7 @@ add_library(DDB_tests_replication2_pure OBJECT
   )
 
 
-target_sources(DDB_tests_replication2_pure PRIVATE
+target_sources(ddb_tests_replication2_pure PRIVATE
   Mocks/ReplicatedLogMetricsMock.cpp
   Mocks/FakeStorageEngineMethods.cpp
   Mocks/FakeAsyncExecutor.cpp
@@ -134,11 +134,11 @@ target_sources(DDB_tests_replication2_pure PRIVATE
   ModelChecker/Tests/ModelCheckerTest.cpp
   )
 
-target_link_libraries(DDB_tests_replication2_pure PUBLIC
-  DDB_replication2_pure
-  DDB_lightweight
-  DDB_crashhandler_light
-  DDB_futures
+target_link_libraries(ddb_tests_replication2_pure PUBLIC
+  ddb_replication2_pure
+  ddb_lightweight
+  ddb_crashhandler_light
+  ddb_futures
   gtest
   gmock
   immer
@@ -146,7 +146,7 @@ target_link_libraries(DDB_tests_replication2_pure PUBLIC
   boost_boost
   )
 
-target_include_directories(DDB_tests_replication2_pure PRIVATE "${PROJECT_SOURCE_DIR}/tests")
+target_include_directories(ddb_tests_replication2_pure PRIVATE "${PROJECT_SOURCE_DIR}/tests")
 
 # This binary currently can't be linked (and couldn't be for a while). We should
 # decide whether to fix it or remove it. [tobias, 2023-08-10]
@@ -154,10 +154,10 @@ add_executable(darbotdbtests_replication2_pure
   EXCLUDE_FROM_ALL main-replication2.cpp)
 
 target_link_libraries(darbotdbtests_replication2_pure PRIVATE
-  DDB_tests_replication2_pure DDB_lightweight)
+  ddb_tests_replication2_pure ddb_lightweight)
 
 add_test(NAME replication2_pure
   COMMAND darbotdbtests_replication2_pure)
-target_link_libraries(darbotdbtests_replication2 PUBLIC DDB_tests_replication2_pure)
+target_link_libraries(darbotdbtests_replication2 PUBLIC ddb_tests_replication2_pure)
 
 add_subdirectory(Storage)

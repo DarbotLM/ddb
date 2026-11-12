@@ -3,16 +3,16 @@ target_sources(arangodbtests
   ThreadOwnedListTest.cpp
   ListOfNonOwnedListsTest.cpp)
 target_link_libraries(arangodbtests
-  DDB_thread_owning_list)
+  ddb_thread_owning_list)
 
-add_library(DDB_test_shared OBJECT
+add_library(ddb_test_shared OBJECT
   SharedTest.cpp)
-target_link_libraries(DDB_test_shared PRIVATE
-  DDB_shared
-  DDB_inspection
+target_link_libraries(ddb_test_shared PRIVATE
+  ddb_shared
+  ddb_inspection
   velocypack
   gtest)
 add_executable(arangodbtests_shared EXCLUDE_FROM_ALL)
 target_link_libraries(arangodbtests_shared
-  DDB_test_shared
+  ddb_test_shared
   gtest_main)

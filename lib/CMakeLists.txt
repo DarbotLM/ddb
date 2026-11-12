@@ -31,38 +31,38 @@ include_directories(BEFORE SYSTEM ${ICU64_INCLUDE_DIR})
 ## LIB_ARANGO
 ################################################################################
 
-add_library(arango_static_strings STATIC
+add_library(ddb_static_strings STATIC
   Basics/StaticStrings.cpp
 )
 
 set(FROZEN_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/3rdParty/iresearch/external/frozen/include")
 set(FUNCTION2_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/3rdParty/iresearch/external/function2")
 
-add_library(arango_basic_errors STATIC
+add_library(ddb_basic_errors STATIC
         ApplicationFeatures/ShellColorsFeature.cpp
         Basics/ErrorCode.cpp
         Basics/application-exit.cpp
         Basics/error.cpp
 )
 
-target_include_directories(arango_basic_errors PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ddb_basic_errors PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # some auto-generated headers live here, like "Basics/build.h"
-target_include_directories(arango_basic_errors PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
-target_include_directories(arango_basic_errors PUBLIC
+target_include_directories(ddb_basic_errors PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(ddb_basic_errors PUBLIC
         ${FROZEN_INCLUDE_DIR}
 )
 
-target_link_libraries(arango_basic_errors
+target_link_libraries(ddb_basic_errors
   PUBLIC velocypack
-         arango_inspection
+         ddb_inspection
          absl::flat_hash_set
 )
 
-add_dependencies(arango_basic_errors errorfiles)
-add_dependencies(arango_basic_errors exitcodefiles)
+add_dependencies(ddb_basic_errors errorfiles)
+add_dependencies(ddb_basic_errors exitcodefiles)
 
 
-add_library(arango_basic_utils STATIC
+add_library(ddb_basic_utils STATIC
         # arango
         Basics/AttributeNameParser.cpp
         Basics/CpuUsageSnapshot.cpp
@@ -92,7 +92,7 @@ add_library(arango_basic_utils STATIC
         Basics/terminal-utils.cpp
         Basics/tri-zip.cpp
 
-        # arango_lightweight
+        # ddb_lightweight
         Basics/ArangoGlobalContext.cpp
         Basics/CleanupFunctions.cpp
         Basics/Exceptions.cpp Basics/Exceptions.tpp Basics/Exceptions.h
@@ -149,11 +149,11 @@ add_library(arango_basic_utils STATIC
         Zip/unzip.cpp
         Zip/zip.cpp
 )
-target_link_libraries(arango_basic_utils
+target_link_libraries(ddb_basic_utils
   PUBLIC velocypack
-         arango_inspection
-         arango_futures
-         arango_basic_errors
+         ddb_inspection
+         ddb_futures
+         ddb_basic_errors
          absl::flat_hash_set
          fuerte
          s2
@@ -164,21 +164,21 @@ target_link_libraries(arango_basic_utils
 
 # Enterprise
 if (USE_ENTERPRISE)
-  target_include_directories(arango_basic_utils PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
+  target_include_directories(ddb_basic_utils PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
 endif()
 
-add_dependencies(arango_basic_utils snappy)
-target_include_directories(arango_basic_utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(arango_basic_utils PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
-target_include_directories(arango_basic_utils PUBLIC
+add_dependencies(ddb_basic_utils snappy)
+target_include_directories(ddb_basic_utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ddb_basic_utils PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(ddb_basic_utils PUBLIC
         ${FUNCTION2_INCLUDE_DIR}
         ${FROZEN_INCLUDE_DIR}
 )
 
-target_include_directories(arango_basic_utils PUBLIC ${BUILD_DIR})
-target_include_directories(arango_basic_utils SYSTEM PUBLIC ${Lz4_INCLUDE_DIR})
+target_include_directories(ddb_basic_utils PUBLIC ${BUILD_DIR})
+target_include_directories(ddb_basic_utils SYSTEM PUBLIC ${Lz4_INCLUDE_DIR})
 
-add_library(arango_basic_features STATIC
+add_library(ddb_basic_features STATIC
         ApplicationFeatures/ApplicationFeature.cpp
         ApplicationFeatures/ApplicationServer.cpp
         ApplicationFeatures/LazyApplicationFeatureReference.h
@@ -196,21 +196,21 @@ add_library(arango_basic_features STATIC
         ApplicationFeatures/VersionFeature.cpp
         ApplicationFeatures/ProcessEnvironmentFeature.cpp
 )
-target_link_libraries(arango_basic_features
+target_link_libraries(ddb_basic_features
   PUBLIC velocypack
-         arango_inspection
-         arango_basic_errors
-         arango_futures
+         ddb_inspection
+         ddb_basic_errors
+         ddb_futures
          absl::flat_hash_set
          fuerte
          s2
 )
-target_include_directories(arango_basic_features PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ddb_basic_features PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if (USE_ENTERPRISE)
-  target_include_directories(arango_basic_utils PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
+  target_include_directories(ddb_basic_utils PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
 endif()
 
-add_library(arango_basic_logger STATIC
+add_library(ddb_basic_logger STATIC
         Logger/Appenders.cpp
         Logger/Escaper.cpp
         Logger/LogAppender.cpp
@@ -227,18 +227,18 @@ add_library(arango_basic_logger STATIC
         Logger/LoggerStream.cpp
         Logger/LogTimeFormat.cpp
 )
-target_link_libraries(arango_basic_logger
+target_link_libraries(ddb_basic_logger
   PUBLIC velocypack
-         arango_inspection
-         arango_basic_errors
+         ddb_inspection
+         ddb_basic_errors
          boost_boost
 )
-target_include_directories(arango_basic_logger PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ddb_basic_logger PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if (USE_ENTERPRISE)
-  target_include_directories(arango_basic_logger PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
+  target_include_directories(ddb_basic_logger PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
 endif()
 
-add_library(arango_basic_http_client STATIC
+add_library(ddb_basic_http_client STATIC
         Rest/CommonDefines.cpp
         Rest/GeneralRequest.cpp
         Rest/GeneralResponse.cpp
@@ -265,22 +265,22 @@ add_library(arango_basic_http_client STATIC
         Endpoint/EndpointSrv.cpp
         Endpoint/EndpointUnixDomain.cpp
 )
-target_link_libraries(arango_basic_http_client
+target_link_libraries(ddb_basic_http_client
   PUBLIC velocypack
-         arango_inspection
-         arango_basic_errors
-         arango_build_id
+         ddb_inspection
+         ddb_basic_errors
+         ddb_build_id
          boost_boost
          rocksdb
          fuerte
          faiss_interface
 )
-target_include_directories(arango_basic_http_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ddb_basic_http_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if (USE_ENTERPRISE)
-  target_include_directories(arango_basic_http_client PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
+  target_include_directories(ddb_basic_http_client PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
 endif()
 
-add_library(arango_basic_maskings STATIC
+add_library(ddb_basic_maskings STATIC
       Maskings/AttributeMasking.cpp
       Maskings/Collection.cpp
       Maskings/MaskingFunction.cpp
@@ -289,14 +289,14 @@ add_library(arango_basic_maskings STATIC
       Maskings/RandomMask.cpp
       Maskings/RandomStringMask.cpp
 )
-target_link_libraries(arango_basic_maskings
+target_link_libraries(ddb_basic_maskings
   PUBLIC velocypack
-         arango_basic_errors
+         ddb_basic_errors
 )
-target_include_directories(arango_basic_maskings PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ddb_basic_maskings PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 
-add_library(arango_lightweight STATIC
+add_library(ddb_lightweight STATIC
         ApplicationFeatures/ApplicationFeature.cpp
         ApplicationFeatures/ApplicationServer.cpp
         ApplicationFeatures/LazyApplicationFeatureReference.h
@@ -312,40 +312,40 @@ add_library(arango_lightweight STATIC
         Random/RandomGenerator.cpp
 )
 
-target_include_directories(arango_lightweight PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ddb_lightweight PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # some auto-generated headers live here, like "Basics/build.h"
-target_include_directories(arango_lightweight PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
-target_include_directories(arango_lightweight PUBLIC
+target_include_directories(ddb_lightweight PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(ddb_lightweight PUBLIC
         ${FROZEN_INCLUDE_DIR}
         ${FUNCTION2_INCLUDE_DIR}
         )
 # Rebuild generated error files so they are up-to-date when all
 # dependent stuff is built
-add_dependencies(arango_lightweight errorfiles)
-add_dependencies(arango_lightweight exitcodefiles)
-add_dependencies(arango_lightweight iculegacy_build)
+add_dependencies(ddb_lightweight errorfiles)
+add_dependencies(ddb_lightweight exitcodefiles)
+add_dependencies(ddb_lightweight iculegacy_build)
 
-target_link_libraries(arango_lightweight
+target_link_libraries(ddb_lightweight
   PUBLIC velocypack
-         arango_inspection
+         ddb_inspection
          absl::flat_hash_set
          absl::synchronization
-         arango_async
-         arango_task_registry_global
+         ddb_async
+         ddb_task_registry_global
   PRIVATE date_interface
           fmt
-          arango_assertions
-          arango_static_strings
-          arango_futures
-          arango_utils
-          arango_basic_utils
-          arango_basic_logger
+          ddb_assertions
+          ddb_static_strings
+          ddb_futures
+          ddb_utils
+          ddb_basic_utils
+          ddb_basic_logger
           boost_boost
           boost_system
 )
 
 if (USE_ENTERPRISE)
-  target_include_directories(arango_lightweight PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
+  target_include_directories(ddb_lightweight PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
 endif()
 
 add_library(arango STATIC
@@ -372,13 +372,13 @@ add_library(arango STATIC
 
 target_link_libraries(arango
   PUBLIC s2
-         arango_build_id
+         ddb_build_id
          boost_system
          boost_boost
-         arango_futures
-         arango_static_strings
-         arango_crashhandler
-         arango_basic_http_client
+         ddb_futures
+         ddb_static_strings
+         ddb_crashhandler
+         ddb_basic_http_client
          velocypack
          fuerte
          linenoise-ng
@@ -392,7 +392,7 @@ target_link_libraries(arango
          absl::node_hash_map
          absl::synchronization
          absl::strings
-         arango_lightweight)
+         ddb_lightweight)
 
 if (USE_V8)
   target_link_libraries(arango PUBLIC ${V8_LIBS})

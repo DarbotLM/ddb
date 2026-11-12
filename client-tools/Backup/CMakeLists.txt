@@ -6,13 +6,13 @@ if (USE_ENTERPRISE)
     arangobackup.cpp
   )
   target_include_directories(${BIN_ARANGOBACKUP} PRIVATE ${PROJECT_SOURCE_DIR}/client-tools)
-  target_include_directories(${BIN_ARANGOBACKUP} PRIVATE ${PROJECT_SOURCE_DIR}/arangod)
+  target_include_directories(${BIN_ARANGOBACKUP} PRIVATE ${PROJECT_SOURCE_DIR}/engine)
 
   target_link_libraries(${BIN_ARANGOBACKUP}
     ${SYSTEM_LIBRARIES}
     boost_system
     boost_boost
-    arango_shell
+    ddb_shell
     clienttools_utils
     fuerte
   )

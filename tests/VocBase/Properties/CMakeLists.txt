@@ -10,7 +10,7 @@ set(darbotdb_VOCBASE_PROPERTIES_TEST_SOURCES
         CreateCollectionBodyTest.cpp
         KeyGeneratorPropertiesTest.cpp
 
-        ${PROJECT_SOURCE_DIR}/arangod/VocBase/Identifiers/DataSourceId.cpp
+        ${PROJECT_SOURCE_DIR}/engine/VocBase/Identifiers/DataSourceId.cpp
 )
 
 target_sources(
@@ -25,13 +25,13 @@ add_executable(
 )
 
 target_include_directories(darbotdb_vocbase_properties_test PRIVATE
-    ${PROJECT_SOURCE_DIR}/arangod
+    ${PROJECT_SOURCE_DIR}/engine
     ${PROJECT_SOURCE_DIR}/lib
     ${PROJECT_BINARY_DIR}/lib
 )
 
 target_link_libraries(
   darbotdb_vocbase_properties_test
-  DDB_vocbase_api
+  ddb_vocbase_api
   gtest
 )

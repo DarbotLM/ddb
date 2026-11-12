@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-PATHS="client-tools lib arangod tests enterprise/Enterprise enterprise/tests"
+PATHS="client-tools lib engine tests enterprise/Enterprise enterprise/tests"
 
 echo "running clang-format -i for all files in $PATHS"
 

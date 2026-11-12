@@ -90,20 +90,20 @@ endif()
 
 target_link_libraries(darbotdbtests-iresearch
   gtest
-  DDB_tests_basics
-  DDB_agency
-  DDB_cluster_engine
-  DDB_rocksdb
-  arangoserver
+  ddb_tests_basics
+  ddb_agency
+  ddb_cluster_engine
+  ddb_rocksdb
+  ddbserver
   boost_boost
 )
 
 if (USE_V8)
-  target_link_libraries(darbotdbtests-iresearch DDB_v8server)
+  target_link_libraries(darbotdbtests-iresearch ddb_v8server)
 endif ()
 
 target_include_directories(darbotdbtests-iresearch PRIVATE
-  ${PROJECT_SOURCE_DIR}/arangod
+  ${PROJECT_SOURCE_DIR}/engine
   ${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}
   ${PROJECT_SOURCE_DIR}/tests
 )

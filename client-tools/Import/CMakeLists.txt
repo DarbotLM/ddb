@@ -5,9 +5,9 @@ add_library(arangoimport_utils OBJECT
   SenderThread.cpp)
 target_include_directories(arangoimport_utils PRIVATE ${PROJECT_SOURCE_DIR}/client-tools)
 target_link_libraries(arangoimport_utils 
-    arango_basic_utils
-    arango_basic_errors
-    arango_basic_logger
+    ddb_basic_utils
+    ddb_basic_errors
+    ddb_basic_logger
 )
 
 add_executable(${BIN_ARANGOIMPORT}
@@ -21,7 +21,7 @@ target_link_libraries(${BIN_ARANGOIMPORT}
   ${SYSTEM_LIBRARIES}
   boost_system
   boost_boost
-  arango_shell
+  ddb_shell
   arangoimport_utils
   clienttools_utils
 )

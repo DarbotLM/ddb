@@ -1249,7 +1249,7 @@ list(INSERT SYSTEM_LIBRARIES 0
 
 add_subdirectory(lib)
 add_subdirectory(client-tools)
-add_subdirectory(arangod)
+add_subdirectory(engine)
 
 if(USE_GOOGLE_TESTS)
   add_subdirectory(tests)

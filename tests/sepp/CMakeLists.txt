@@ -18,11 +18,11 @@ if (BUILD_SEPP)
 
   target_include_directories(sepp PRIVATE
     .
-    ${PROJECT_SOURCE_DIR}/arangod)
+    ${PROJECT_SOURCE_DIR}/engine)
 
   target_link_libraries(sepp
-    DDB_rocksdb
-    arangoserver
+    ddb_rocksdb
+    ddbserver
     rocksdb
     snappy
     boost_boost)

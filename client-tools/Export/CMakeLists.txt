@@ -9,7 +9,7 @@ target_link_libraries(${BIN_ARANGOEXPORT}
   ${SYSTEM_LIBRARIES}
   boost_system
   boost_boost
-  arango_shell
+  ddb_shell
   clienttools_utils
 )
 

@@ -1,4 +1,4 @@
-target_sources(arango_geo PRIVATE
+target_sources(ddb_geo PRIVATE
   S2MultiPointRegion.cpp
   S2MultiPolylineRegion.cpp
   )

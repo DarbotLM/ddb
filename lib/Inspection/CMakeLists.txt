@@ -1,11 +1,11 @@
-add_library(arango_inspection INTERFACE)
+add_library(ddb_inspection INTERFACE)
 
-target_link_libraries(arango_inspection
+target_link_libraries(ddb_inspection
   INTERFACE
     velocypack
     date_interface
     fmt::fmt)
 
-target_include_directories(arango_inspection
+target_include_directories(ddb_inspection
   INTERFACE
   include)

@@ -121,6 +121,6 @@ set(INSTALL_MACROS_NO_TARGET_INSTALL TRUE)
 include(${ORIGINAL_SOURCE_DIR}/cmake/debugInformation.cmake)
 include(${ORIGINAL_SOURCE_DIR}/cmake/InstallMacros.cmake)
 include(${ORIGINAL_SOURCE_DIR}/client-tools/dbg.cmake)
-include(${ORIGINAL_SOURCE_DIR}/arangod/dbg.cmake)
+include(${ORIGINAL_SOURCE_DIR}/engine/dbg.cmake)
 
 include(CPack)

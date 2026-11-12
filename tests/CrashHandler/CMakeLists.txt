@@ -6,7 +6,7 @@ add_executable(arangodbtests_crashhandler_light
   CrashHandlerLightTest.cpp)
 
 target_link_libraries(arangodbtests_crashhandler_light
-  DDB_crashhandler_light
+  ddb_crashhandler_light
   gtest
   gtest_main)
 

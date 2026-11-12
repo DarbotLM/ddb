@@ -1,4 +1,4 @@
-add_library(DDB_tests_graph OBJECT
+add_library(ddb_tests_graph OBJECT
         DBServerEdgeCursorTest.cpp
         TraverserCacheTest.cpp
         GenericGraphProviderTest.cpp
@@ -17,10 +17,10 @@ add_library(DDB_tests_graph OBJECT
         SingleServerProviderTest.cpp
         SingleServerNeighbourCacheTest.cpp)
 
-target_link_libraries(DDB_tests_graph
+target_link_libraries(ddb_tests_graph
         PRIVATE
-        DDB_lightweight
-        DDB_tests_basics
+        ddb_lightweight
+        ddb_tests_basics
         velocypack
         fmt)
 
@@ -28,10 +28,10 @@ add_executable(arangodbtests_graph
         EXCLUDE_FROM_ALL)
 
 target_link_libraries(arangodbtests_graph
-        DDB_tests_graph
-        DDB_tests_basics)
+        ddb_tests_graph
+        ddb_tests_basics)
 
-add_test(test_all_graphs DDB_tests_graph)
+add_test(test_all_graphs ddb_tests_graph)
 
 add_test(NAME graph
         COMMAND arangodbtests_graph)

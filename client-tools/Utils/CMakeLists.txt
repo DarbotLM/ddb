@@ -5,13 +5,13 @@ add_library(clienttools_utils STATIC
 
 target_link_libraries(clienttools_utils
   ${SYSTEM_LIBRARIES}
-  DDB_basic_errors
-  DDB_static_strings
-  DDB_basic_utils
-  DDB_basic_features
-  DDB_basic_logger
-  DDB_basic_http_client
-  DDB_scheduler
+  ddb_basic_errors
+  ddb_static_strings
+  ddb_basic_utils
+  ddb_basic_features
+  ddb_basic_logger
+  ddb_basic_http_client
+  ddb_scheduler
   boost_system
   boost_boost
   fuerte

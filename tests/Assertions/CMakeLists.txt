@@ -3,8 +3,8 @@ add_executable(arangodbtests_assertions
   AssertionsTests.cpp)
 
 target_link_libraries(arangodbtests_assertions
-  DDB_crashhandler_light
-  DDB_assertions
+  ddb_crashhandler_light
+  ddb_assertions
   gtest
   gtest_main)
 

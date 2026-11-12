@@ -1,16 +1,16 @@
-add_library(arango_futures STATIC
+add_library(ddb_futures STATIC
   src/Future.cpp)
 
-target_include_directories(arango_futures
+target_include_directories(ddb_futures
   PUBLIC
-  ${PROJECT_SOURCE_DIR}/arangod
+  ${PROJECT_SOURCE_DIR}/engine
   ${PROJECT_SOURCE_DIR}/3rdParty/iresearch/external/function2
   include)
 
-target_link_libraries(arango_futures
+target_link_libraries(ddb_futures
   PUBLIC
-  arango_inspection
-  arango_assertions
-  arango_async_interface 
+  ddb_inspection
+  ddb_assertions
+  ddb_async_interface 
   velocypack
 )

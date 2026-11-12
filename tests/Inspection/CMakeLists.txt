@@ -1,10 +1,10 @@
-add_library(DDB_inspection_test_helper INTERFACE)
+add_library(ddb_inspection_test_helper INTERFACE)
 
-target_include_directories(DDB_inspection_test_helper
+target_include_directories(ddb_inspection_test_helper
   INTERFACE
   include)
 
-add_library(DDB_tests_inspection OBJECT
+add_library(ddb_tests_inspection OBJECT
   InspectionTest.cpp
   JsonPrintTest.cpp
   TransformerTest.cpp
@@ -13,19 +13,19 @@ add_library(DDB_tests_inspection OBJECT
   VPackLoadTest.cpp
   VPackSaveTest.cpp)
 
-target_link_libraries(DDB_tests_inspection
+target_link_libraries(ddb_tests_inspection
   PRIVATE gtest
           velocypack
-          DDB_lightweight # jezas.
-          DDB_inspection
-          DDB_inspection_test_helper)
+          ddb_lightweight # jezas.
+          ddb_inspection
+          ddb_inspection_test_helper)
 
 add_executable(arangodbtests_inspection
   EXCLUDE_FROM_ALL)
 
 target_link_libraries(arangodbtests_inspection
-    DDB_tests_inspection
-    DDB_crashhandler_light
+    ddb_tests_inspection
+    ddb_crashhandler_light
     velocypack_utils
     gtest_main)
 

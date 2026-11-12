@@ -1,19 +1,19 @@
-add_library(arango_shell STATIC
+add_library(ddb_shell STATIC
   ClientFeature.cpp
   ShellConsoleFeature.cpp
 )
 
-target_link_libraries(arango_shell
-  arango_basic_utils
+target_link_libraries(ddb_shell
+  ddb_basic_utils
   ${SYSTEM_LIBRARIES}
   boost_system
   boost_boost
   fuerte
 )
 
-target_link_libraries(arango_shell v8_interface)
+target_link_libraries(ddb_shell v8_interface)
 
-target_include_directories(arango_shell PRIVATE ${CMAKE_SOURCE_DIR}/client-tools)
+target_include_directories(ddb_shell PRIVATE ${CMAKE_SOURCE_DIR}/client-tools)
 
 add_executable(${BIN_ARANGOSH}
   ${ProductVersionFiles_arangosh}
@@ -34,14 +34,14 @@ endif()
 target_include_directories(${BIN_ARANGOSH} PRIVATE ${PROJECT_SOURCE_DIR}/client-tools)
 
 target_link_libraries(${BIN_ARANGOSH}
-  arango_v8
+  ddb_v8
   v8_interface
-  arango_basic_http_client
+  ddb_basic_http_client
   fuerte
   ${SYSTEM_LIBRARIES}
   boost_system
   boost_boost
-  arango_shell
+  ddb_shell
   arangoimport_utils
   clienttools_utils
   ${ICU64_LIBS}

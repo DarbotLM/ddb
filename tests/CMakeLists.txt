@@ -43,7 +43,7 @@ if (USE_V8)
   endforeach()
 endif ()
 
-add_library(DDB_tests_basics OBJECT
+add_library(ddb_tests_basics OBJECT
   ${CMAKE_CURRENT_SOURCE_DIR}/Mocks/ClusterInfoMock.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/Mocks/FakeScheduler.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/Mocks/FakeScheduler.h
@@ -64,15 +64,15 @@ add_library(DDB_tests_basics OBJECT
   ${CMAKE_CURRENT_SOURCE_DIR}/Aql/VelocyPackHelper.cpp
   main.cpp)
 
-target_include_directories(DDB_tests_basics
+target_include_directories(ddb_tests_basics
   PUBLIC
-    ${PROJECT_SOURCE_DIR}/arangod/
+    ${PROJECT_SOURCE_DIR}/engine/
     ${PROJECT_SOURCE_DIR}/lib/
     ${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}
     ${PROJECT_SOURCE_DIR}/tests
     ${PROJECT_SOURCE_DIR}/tests/Mocks/)
 
-target_link_libraries(DDB_tests_basics gtest gmock velocypack fmt fuerte DDB_iresearch)
+target_link_libraries(ddb_tests_basics gtest gmock velocypack fmt fuerte ddb_iresearch)
 
 add_subdirectory(IResearch)
 
@@ -328,23 +328,23 @@ endif()
 
 target_link_libraries(arangodbtests
   arango
-  DDB_tests_basics
-  DDB_tests_forest
-  DDB_tests_replication2
-  DDB_tests_replication2_pure
-  DDB_tests_task_registry
-  DDB_tests_graph
-  DDB_tests_futures
-  DDB_tests_zkd
-  DDB_tests_actor
-  DDB_tests_inspection
-  DDB_tests_internal_rest_handler
-  DDB_inspection_test_helper
-  DDB_agency
-  DDB_cluster_engine
-  DDB_rocksdb
-  arangoserver
-  DDB_restore
+  ddb_tests_basics
+  ddb_tests_forest
+  ddb_tests_replication2
+  ddb_tests_replication2_pure
+  ddb_tests_task_registry
+  ddb_tests_graph
+  ddb_tests_futures
+  ddb_tests_zkd
+  ddb_tests_actor
+  ddb_tests_inspection
+  ddb_tests_internal_rest_handler
+  ddb_inspection_test_helper
+  ddb_agency
+  ddb_cluster_engine
+  ddb_rocksdb
+  ddbserver
+  ddb_restore
   clienttools_utils
   fuerte
   rocksdb
@@ -356,11 +356,11 @@ target_link_libraries(arangodbtests
 )
 
 if (USE_V8)
-  target_link_libraries(arangodbtests DDB_v8server)
+  target_link_libraries(arangodbtests ddb_v8server)
 endif ()
 
 if (USE_ENTERPRISE)
-  target_link_libraries(arangodbtests DDB_rclone)
+  target_link_libraries(arangodbtests ddb_rclone)
 endif ()
 
 add_dependencies(arangodbtests iculegacy_build)
@@ -373,7 +373,7 @@ if (USE_JEMALLOC)
 endif ()
 
 target_include_directories(arangodbtests PRIVATE
-  ${PROJECT_SOURCE_DIR}/arangod
+  ${PROJECT_SOURCE_DIR}/engine
   ${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/Mocks/

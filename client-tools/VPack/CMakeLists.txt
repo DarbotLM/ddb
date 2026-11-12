@@ -9,7 +9,7 @@ target_link_libraries(${BIN_ARANGOVPACK}
   ${SYSTEM_LIBRARIES}
   boost_system
   boost_boost
-  DDB_shell
+  ddb_shell
   clienttools_utils
 )
 

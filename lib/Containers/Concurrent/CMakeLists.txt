@@ -1,12 +1,12 @@
-add_library(arango_thread_owning_list STATIC
+add_library(ddb_thread_owning_list STATIC
   thread.cpp)
-target_include_directories(arango_thread_owning_list PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(arango_thread_owning_list
+target_include_directories(ddb_thread_owning_list PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ddb_thread_owning_list
   PRIVATE
-  arango_basic_utils
-  arango_inspection)
+  ddb_basic_utils
+  ddb_inspection)
 
-add_library(arango_shared INTERFACE
+add_library(ddb_shared INTERFACE
   shared.h)
 # TODO need to have include dir and include ${CMAKE_CURRENT_SOURCE_DIR}/include
-target_include_directories(arango_shared INTERFACE ${PROJECT_SOURCE_DIR}/lib)
+target_include_directories(ddb_shared INTERFACE ${PROJECT_SOURCE_DIR}/lib)

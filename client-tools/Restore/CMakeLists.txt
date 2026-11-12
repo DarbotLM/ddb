@@ -1,11 +1,11 @@
-add_library(arango_restore
+add_library(ddb_restore
   RestoreFeature.cpp
 )
-target_include_directories(arango_restore PUBLIC ${PROJECT_SOURCE_DIR}/client-tools)
+target_include_directories(ddb_restore PUBLIC ${PROJECT_SOURCE_DIR}/client-tools)
 if (USE_ENTERPRISE)
-  target_include_directories(arango_restore PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
+  target_include_directories(ddb_restore PUBLIC "${PROJECT_SOURCE_DIR}/${ENTERPRISE_INCLUDE_DIR}")
 endif()
-target_link_libraries(arango_restore arango_shell)
+target_link_libraries(ddb_restore ddb_shell)
 
 add_executable(${BIN_ARANGORESTORE}
   ${ProductVersionFiles_arangorestore}
@@ -13,11 +13,11 @@ add_executable(${BIN_ARANGORESTORE}
 )
 
 target_link_libraries(${BIN_ARANGORESTORE}
-  arango_restore
+  ddb_restore
   ${SYSTEM_LIBRARIES}
   boost_system
   boost_boost
-  arango_shell
+  ddb_shell
   clienttools_utils
 )
 
