@@ -55,19 +55,21 @@ async def micro_status(db_id: str):
     if not match:
         raise HTTPException(status_code=404, detail=f"Micro DB '{db_id}' not found")
     db = MicroDB(match[0])
-    await db.open()
-    cards = await db.execute("SELECT COUNT(*) as cnt FROM cards")
-    turns = await db.execute("SELECT COUNT(*) as cnt FROM turns")
-    thoughts = await db.execute("SELECT COUNT(*) as cnt FROM thoughts")
-    schema_ver = await db.get_meta("schema_version")
-    await db.close()
-    return {
-        "path": str(match[0]),
-        "schema_version": schema_ver,
-        "cards": cards[0]["cnt"] if cards else 0,
-        "turns": turns[0]["cnt"] if turns else 0,
-        "thoughts": thoughts[0]["cnt"] if thoughts else 0,
-    }
+    try:
+        await db.open()
+        cards = await db.execute("SELECT COUNT(*) as cnt FROM cards")
+        turns = await db.execute("SELECT COUNT(*) as cnt FROM turns")
+        thoughts = await db.execute("SELECT COUNT(*) as cnt FROM thoughts")
+        schema_ver = await db.get_meta("schema_version")
+        return {
+            "path": str(match[0]),
+            "schema_version": schema_ver,
+            "cards": cards[0]["cnt"] if cards else 0,
+            "turns": turns[0]["cnt"] if turns else 0,
+            "thoughts": thoughts[0]["cnt"] if thoughts else 0,
+        }
+    finally:
+        await db.close()
 
 
 @router.post("/{db_id}/query")

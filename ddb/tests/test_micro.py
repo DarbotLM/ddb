@@ -261,13 +261,15 @@ async def test_api_query_persists_writes(manager: MicroDBManager, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_api_query_closes_database_on_error(manager: MicroDBManager, monkeypatch):
+@pytest.mark.parametrize("endpoint", ["query", "status"])
+async def test_api_reader_closes_database_on_open_error(manager: MicroDBManager, monkeypatch, endpoint):
     from fastapi import HTTPException
 
     from darbotdb.api.routers import micro
 
     monkeypatch.setattr(micro, "_manager", manager)
     db = await manager.create_agent_db("api-agent")
+    await db.set_meta("schema_version", "999.0")
     await db.close()
     opened = []
 
@@ -277,7 +279,15 @@ async def test_api_query_closes_database_on_error(manager: MicroDBManager, monke
         return connection
 
     monkeypatch.setattr(micro, "MicroDB", track_db)
-    with pytest.raises(HTTPException) as exc:
-        await micro.micro_query("api-agent", micro.MicroQueryRequest(sql="SELECT * FROM missing_table"))
-    assert exc.value.status_code == 400
-    assert opened[0]._conn is None
+    try:
+        if endpoint == "query":
+            with pytest.raises(HTTPException) as exc:
+                await micro.micro_query("api-agent", micro.MicroQueryRequest(sql="SELECT 1"))
+            assert exc.value.status_code == 400
+        else:
+            with pytest.raises(ValueError, match="Schema mismatch"):
+                await micro.micro_status("api-agent")
+        assert opened[0]._conn is None
+    finally:
+        for connection in opened:
+            await connection.close()
