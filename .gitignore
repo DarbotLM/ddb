@@ -14,6 +14,7 @@ build-presets
 __pycache__/
 *.egg-info/
 .pytest_cache/
+ddb/mcp/node_modules/
 *.sdf
 *.suo
 *.log
