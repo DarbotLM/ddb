@@ -8,13 +8,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from darbotdb.config import settings
 from micro.engine import MicroDB
 from micro.manager import MicroDBManager
 
 router = APIRouter()
 
-# Default data root — override via env / settings if needed
-_manager = MicroDBManager(Path("data"))
+_manager = MicroDBManager(Path(settings.MICRO_DATA_ROOT))
 
 
 class CreateMicroRequest(BaseModel):
@@ -77,14 +77,15 @@ async def micro_query(db_id: str, body: MicroQueryRequest):
     if not match:
         raise HTTPException(status_code=404, detail=f"Micro DB '{db_id}' not found")
     db = MicroDB(match[0])
-    await db.open()
     try:
+        await db.open()
         rows = await db.execute(body.sql, tuple(body.params))
-        await db.close()
+        await db.conn.commit()
         return {"results": rows}
     except Exception as e:
-        await db.close()
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        await db.close()
 
 
 @router.delete("/{db_id}")

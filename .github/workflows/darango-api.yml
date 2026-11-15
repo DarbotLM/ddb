@@ -4,10 +4,11 @@ on:
   push:
     paths:
       - "ddb/**"
-      - ".github/workflows/ddb-api.yml"
+      - ".github/workflows/darango-api.yml"
   pull_request:
     paths:
       - "ddb/**"
+      - ".github/workflows/darango-api.yml"
 
 jobs:
   test:
@@ -24,8 +25,25 @@ jobs:
         working-directory: ddb
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
-          pip install pytest httpx
+          pip install -e ".[dev]"
       - name: Run unit tests
         working-directory: ddb
         run: pytest -q
+  mcp:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ddb/mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ddb/mcp/package-lock.json
+      - name: Install MCP dependencies
+        run: npm ci
+      - name: Build MCP views and type-check server
+        run: npm run build

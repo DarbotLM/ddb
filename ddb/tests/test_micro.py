@@ -239,3 +239,45 @@ async def test_manager_lifecycle(manager: MicroDBManager):
 
     await manager.delete_db(db.path)
     assert not db.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_api_query_persists_writes(manager: MicroDBManager, monkeypatch):
+    from darbotdb.api.routers import micro
+
+    monkeypatch.setattr(micro, "_manager", manager)
+    db = await manager.create_agent_db("api-agent")
+    await db.close()
+
+    await micro.micro_query(
+        "api-agent",
+        micro.MicroQueryRequest(
+            sql="INSERT INTO meta(key, value) VALUES (?, ?)",
+            params=["api-write", "persisted"],
+        ),
+    )
+    async with MicroDB(db.path) as reopened:
+        assert await reopened.get_meta("api-write") == "persisted"
+
+
+@pytest.mark.asyncio
+async def test_api_query_closes_database_on_error(manager: MicroDBManager, monkeypatch):
+    from fastapi import HTTPException
+
+    from darbotdb.api.routers import micro
+
+    monkeypatch.setattr(micro, "_manager", manager)
+    db = await manager.create_agent_db("api-agent")
+    await db.close()
+    opened = []
+
+    def track_db(path):
+        connection = MicroDB(path)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(micro, "MicroDB", track_db)
+    with pytest.raises(HTTPException) as exc:
+        await micro.micro_query("api-agent", micro.MicroQueryRequest(sql="SELECT * FROM missing_table"))
+    assert exc.value.status_code == 400
+    assert opened[0]._conn is None
